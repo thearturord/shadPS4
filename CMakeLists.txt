@@ -1102,6 +1102,7 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
                src/video_core/buffer_cache/buffer_cache.h
+               src/video_core/buffer_cache/readback_batch.h
                src/video_core/buffer_cache/fault_manager.cpp
                src/video_core/buffer_cache/fault_manager.h
                src/video_core/buffer_cache/memory_tracker.h
@@ -1167,6 +1168,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/cache_storage.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
+               src/video_core/readback_stats.cpp
+               src/video_core/readback_stats.h
                src/video_core/multi_level_page_table.h
                src/video_core/renderdoc.cpp
                src/video_core/renderdoc.h

@@ -3,8 +3,13 @@
 
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
+#include "common/unique_function.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -31,6 +36,7 @@ using BufferId = Common::SlotId;
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+class ReadbackBatch;
 
 class BufferCache {
 public:
@@ -155,6 +161,16 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// Records downloads of recently read back ranges that are GPU modified again.
+    /// With deferred_unmark the write backs may run outside the GPU thread.
+    void PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark = false);
+
+    /// Advances the frame counter used to expire hot ranges.
+    void AdvanceHotEpoch();
+
+    /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
+    void ApplyPendingUnmarks();
+
 private:
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
@@ -169,8 +185,29 @@ private:
         return !buffer_id || slot_buffers[buffer_id].is_deleted;
     }
 
+    struct DownloadResult {
+        u64 bytes{};
+        u64 finish_ns{};
+    };
+
+    struct HotRange {
+        VAddr end;
+        u64 last_fault_epoch;
+    };
+
+    using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
+
     template <bool async>
-    void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
+    DownloadResult DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
+
+    /// Gathers GPU modified ranges to download and clears them from the modified range set.
+    u64 CollectDownloadCopies(Buffer& buffer, VAddr device_addr, u64 size, DownloadCopies& copies);
+
+    /// Records the copy into download memory. The returned function writes the data back to
+    /// guest memory and must only run once the GPU has executed the copy.
+    Common::UniqueFunction<void> RecordDownloadCopies(Buffer& buffer, VAddr device_addr, u64 size,
+                                                      DownloadCopies&& copies,
+                                                      u64 total_size_bytes, bool deferred_unmark);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -219,6 +256,10 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
+    std::unordered_map<VAddr, HotRange> hot_ranges;
+    std::mutex pending_unmarks_mutex;
+    std::vector<std::pair<VAddr, u64>> pending_unmarks;
+    u64 hot_epoch{};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };

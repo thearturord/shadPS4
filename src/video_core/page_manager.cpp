@@ -10,6 +10,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -204,17 +205,25 @@ struct PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        const bool stats = ReadbackStats::IsEnabled();
+        const u64 start = stats ? ReadbackStats::NowNs() : 0;
         impl.Protect(address, size, perms);
+        if (stats) {
+            ReadbackStats::OnProtect(ReadbackStats::NowNs() - start);
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
-        } else {
-            return rasterizer->ReadMemory(addr, 8);
+        const bool is_write = Common::IsWriteError(context);
+        const bool stats = ReadbackStats::IsEnabled();
+        const u64 start = stats ? ReadbackStats::NowNs() : 0;
+        const bool handled =
+            is_write ? rasterizer->InvalidateMemory(addr, 8) : rasterizer->ReadMemory(addr, 8);
+        if (stats && handled) {
+            ReadbackStats::OnFault(is_write, ReadbackStats::NowNs() - start);
         }
-        return false;
+        return handled;
     }
 #endif
 

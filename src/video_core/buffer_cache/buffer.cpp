@@ -4,6 +4,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -245,10 +246,14 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
     }
     while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
         auto& watch = previous_watches[wait_cursor];
-        if (!scheduler->IsFree(watch.tick) && !allow_wait) {
-            return false;
+        if (!scheduler->IsFree(watch.tick)) {
+            if (!allow_wait) {
+                return false;
+            }
+            const u64 start = ReadbackStats::NowNs();
+            scheduler->Wait(watch.tick);
+            ReadbackStats::OnStreamWait(ReadbackStats::NowNs() - start);
         }
-        scheduler->Wait(watch.tick);
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

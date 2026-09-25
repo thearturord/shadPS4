@@ -29,6 +29,7 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+class ReadbackBatch;
 
 class TextureCache {
     // Default values for garbage collection
@@ -95,6 +96,9 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+
+    /// Records downloads of all pending images into a batch instead of waiting per image.
+    void RecordImageDownloads(ReadbackBatch& batch);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -280,6 +284,13 @@ private:
 
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
+
+    /// Size in bytes of the data downloaded for an image.
+    static u32 ImageDownloadSize(const Image& image);
+
+    /// Records a copy of the image into download memory and returns a pointer to it. The data
+    /// is valid once the GPU has executed the copy.
+    u8* RecordImageCopy(Image& image, u32 download_size);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);

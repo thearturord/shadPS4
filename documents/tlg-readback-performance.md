@@ -1,0 +1,132 @@
+<!--
+SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
+# The Last Guardian (CUSA03627): readback performance work
+
+These notes cover how GPU readbacks were made cheaper for The Last Guardian (TLG) while keeping
+them fully accurate. The game needs Precise readbacks plus linear image readbacks: without them
+Trico's feathers, climbing, the spear and outdoor lighting break (see upstream issue #4725).
+Every change is opt-in per game and is off by default.
+
+Test system: Ryzen 7 5700X3D, RTX 4090, 64 GB RAM, 60 FPS patch and native 4K patch.
+
+## Results (outdoor area near the gates, walking with Trico)
+
+| Metric (gameplay, per second) | Baseline | Current |
+| :--- | :--- | :--- |
+| FPS | ~18 | ~29 average (median 27, range 14-61) |
+| Buffer readbacks that fault and stall | ~350 | ~6 |
+| GPU thread time blocked in `Scheduler::Finish` | ~430 ms | ~9 ms |
+| Guest threads blocked on readbacks | ~380 ms | ~11 ms |
+
+## How to enable
+
+The settings live in `user/custom_configs/<serial>.readback.json`. Only the emulator reads this
+file: launchers rewrite `<serial>.json` and drop keys they don't know.
+
+```json
+{
+  "GPU": {
+    "readback_async_fences_enabled": true,
+    "readback_batching_enabled": true,
+    "readback_fence_wait_shortcut": 1,
+    "readback_stats_enabled": true
+  }
+}
+```
+
+`readbacks_mode` (2 = Precise) and `readback_linear_images_enabled` stay in `<serial>.json`.
+
+| Setting | Meaning |
+| :--- | :--- |
+| `readback_stats_enabled` | Writes `log/readback_stats.csv` (one line per second) and `log/readback_top.txt` (buffers, writer shaders and images ranked by stall time). |
+| `readback_batching_enabled` | Completes image readbacks and recently read back buffers with one GPU wait per fence. |
+| `readback_async_fences_enabled` | Fences are signaled from a background thread once their readbacks are in guest memory, instead of the GPU thread blocking. |
+| `readback_fence_wait_shortcut` | With async fences: 0 = off, 1 = graphics queue `WaitRegMem` may pass for fence values still held back, 2 = graphics and compute. |
+
+## Steps taken
+
+### 0. First attempt (discarded)
+A plan based on reading the code alone (async image downloads, `HOST_CACHED` download memory,
+a bigger download buffer, mid-frame submits) made no measurable difference and was reverted.
+It was built without data. Changing settings helped more: turning off
+`direct_memory_access_enabled` and `neo_mode` took the game from ~15 to ~20 FPS.
+
+### 1. Measure first: readback statistics
+`src/video_core/readback_stats.*` counts per second: presented frames, draws and dispatches,
+page faults (read and write) and time spent handling them, protect calls, buffer and image
+readbacks, bytes read back, time guest threads were blocked, `Finish` calls and time, and how
+busy the GPU command thread is. It also records which shader, fill or copy last wrote each
+range, so readbacks can be traced to their writer.
+
+Finding: the GPU command thread was 100% busy, and about 45% of that time was spent waiting in
+~42 `Finish` calls per frame (~20 buffer readbacks and ~24 linear image readbacks). The same
+buffers and images were read back every frame.
+
+### 2. A + B: batching (`readback_batching_enabled`)
+- **A:** image readbacks queued at a fence are copied together and completed with one wait.
+- **B:** buffer ranges that faulted recently ("hot ranges") are downloaded at the next fence
+  whenever the GPU has written them again, so the CPU finds the data already in memory instead
+  of faulting. Ranges expire after 600 submits and are relearned on the next fault.
+
+Result: buffer faults went from ~350/s to ~0-10/s, but FPS stayed the same. The game signals
+~25 fences per frame with about one image each, so there was nothing to merge. And each wait
+blocks until the GPU finishes everything submitted so far, so the wait time was really the GPU's
+own frame time: the CPU and GPU were taking turns instead of running in parallel.
+
+### 3. C: asynchronous fences (`readback_async_fences_enabled`)
+At EOP/EOS/ReleaseMem, the readback copies are recorded and submitted without waiting. The
+scheduler's priority thread waits for the GPU, writes the data to guest memory, and only then
+writes the fence value and raises the interrupt. A real PS4 behaves the same way: the fence
+fires when the GPU is done. Accuracy rules (the RFC in #4316 and yuzu's async downloads work
+the same way):
+- Fences are signaled in the order they were issued (the priority thread is FIFO).
+- `Scheduler::Finish` also waits for pending write backs, so every synchronous path is ordered
+  after the asynchronous ones.
+- A background write back never unprotects a range the GPU has written again since
+  (`ApplyPendingUnmarks` runs on the GPU thread and checks `gpu_modified_ranges`).
+- A guest access to a range whose download is still in flight waits for it.
+- GDS based fences (`GdsStore`, `GdsMemStore`) stay synchronous.
+
+Bugs found and fixed along the way:
+- **`Protect` assertion (write-only permission):** a CPU write hit a range whose async readback
+  had not landed. The page ended up marked both CPU- and GPU-modified. Fix: unprotects are
+  applied immediately on the GPU thread during faults and fences.
+- **Fence writes and faults:** fence writes from the background thread go through the memory
+  backing, or are written directly when the memory has no GPU mapping and so cannot be
+  protected. They only fall back to the GPU thread in the remaining rare case.
+
+Result: GPU-thread waiting dropped from ~430 ms/s to ~5-50 ms/s, but FPS still didn't move.
+New counters showed why: the game's own command streams wait on those fences with `WaitRegMem`,
+so the wait simply moved there.
+
+### 4. Command stream wait shortcut (`readback_fence_wait_shortcut`)
+When a `WaitRegMem` waits for a value that a held-back fence will write, it may pass right away.
+That is how it behaved before step 3, and the GPU executes commands in order. Only the
+CPU-visible fence and its readback data stay deferred.
+- Allowing it on compute queues broke the game's `JsComputeContext::StallUntilSignaled`
+  (timeout, then crash), so the default is graphics queues only (1).
+- A limit of one prefetch per range per frame was tried and reverted: rewrites later in the
+  frame fell back to synchronous faults and cost ~150-270 ms/s.
+
+### 5. Robustness
+- **Launcher-proof settings:** the new keys moved to `<serial>.readback.json` after the
+  launcher stripped them from `<serial>.json` several times.
+- **Hang diagnostics:** waits longer than 2 s log a `Hang check:` warning describing what they
+  wait on. This covers command stream `WaitRegMem` (with value, reference and pending fence
+  writes), priority operations waiting on a GPU tick (and whether it was ever submitted), the GPU
+  thread waiting on priority operations, and flip label waits. One intermittent hang was seen
+  once and not reproduced since.
+
+## Known limits and next steps
+- The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
+  (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of
+  page protection calls remain.
+- **Next:** real shared memory for the hot ranges the CPU reads. Back those guest ranges with
+  memory both the CPU and GPU can access, so GPU writes land in guest memory directly: no copy,
+  no fault, and the fence alone orders the access.
+- The long-term fix is moving GPU-internal waits (`WaitRegMem` on fences) onto the GPU timeline,
+  so the command processor thread never blocks on them. That is an architectural change for
+  upstream.

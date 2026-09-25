@@ -10,6 +10,8 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/readback_batch.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -76,7 +78,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
-    liverpool->SendCommand<true>([this, device_addr, size, is_write] {
+    const bool stats = ReadbackStats::IsEnabled();
+    const u64 start = stats ? ReadbackStats::NowNs() : 0;
+    DownloadResult result{};
+    liverpool->SendCommand<true>([this, device_addr, size, is_write, &result] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
@@ -87,16 +92,104 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), buf_start);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), buf_end);
-        DownloadBufferMemory<false>(buffer, window_start, window_end - window_start);
+        const u64 window_size = window_end - window_start;
+        ApplyPendingUnmarks();
+        result = DownloadBufferMemory<false>(buffer, window_start, window_size);
+        if (result.bytes == 0 && scheduler.HasPriorityOperations() &&
+            memory_tracker->IsRegionGpuModified(window_start, window_size)) {
+            // The range is still protected but has nothing left to download: an asynchronous
+            // readback for it is in flight. Wait for it to land (Finish also waits for the
+            // write backs), then apply its unprotect here instead of after this command.
+            scheduler.Finish();
+            ApplyPendingUnmarks();
+        }
+        if (is_write && !gpu_modified_ranges.Intersects(window_start, window_size) &&
+            memory_tracker->IsRegionGpuModified(window_start, window_size)) {
+            // Everything in the window is in guest memory, drop any stale GPU mark before
+            // marking the CPU write: a page can't be both, it would need write-only protection.
+            memory_tracker->UnmarkRegionAsGpuModified(window_start, window_size);
+        }
+        if (result.bytes != 0) {
+            // Remember ranges the CPU reads back so they can be prefetched at the next fence.
+            auto& hot_range = hot_ranges[window_start];
+            hot_range.end = window_end;
+            hot_range.last_fault_epoch = hot_epoch;
+        }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
     });
+    if (stats) {
+        ReadbackStats::OnBufferReadback(device_addr, result.bytes, result.finish_ns,
+                                        ReadbackStats::NowNs() - start, is_write);
+    }
 }
 
 template <bool async>
-void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
-    boost::container::small_vector<vk::BufferCopy, 1> copies;
+BufferCache::DownloadResult BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr,
+                                                              u64 size) {
+    DownloadCopies copies;
+    const u64 total_size_bytes = CollectDownloadCopies(buffer, device_addr, size, copies);
+    if (total_size_bytes == 0) {
+        return {};
+    }
+    auto write_data = RecordDownloadCopies(buffer, device_addr, size, std::move(copies),
+                                           total_size_bytes, false);
+    DownloadResult result{.bytes = total_size_bytes};
+    if constexpr (async) {
+        scheduler.DeferOperation(std::move(write_data));
+    } else {
+        const u64 start = ReadbackStats::NowNs();
+        scheduler.Finish();
+        result.finish_ns = ReadbackStats::NowNs() - start;
+        write_data();
+    }
+    return result;
+}
+
+void BufferCache::AdvanceHotEpoch() {
+    ++hot_epoch;
+}
+
+void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark) {
+    // Ranges that stop faulting are prefetched until they expire, then re-learned on the next
+    // fault. Expiry keeps ranges the game no longer reads from costing downloads forever.
+    constexpr u64 HotRangeLifetime = 600;
+    ApplyPendingUnmarks();
+    for (auto it = hot_ranges.begin(); it != hot_ranges.end();) {
+        if (hot_epoch - it->second.last_fault_epoch > HotRangeLifetime) {
+            it = hot_ranges.erase(it);
+            continue;
+        }
+        const VAddr range_start = it->first;
+        const VAddr range_end = it->second.end;
+        ++it;
+        // Prefetched at every fence where the range is GPU modified again. Limiting this to once
+        // per frame made later writes in the frame fault, each costing a synchronous GPU wait.
+        if (!IsRegionGpuModified(range_start, range_end - range_start)) {
+            continue;
+        }
+        ForEachBufferInRange(range_start, range_end - range_start, [&](BufferId, Buffer& buffer) {
+            const VAddr start = std::max(buffer.CpuAddr(), range_start);
+            const VAddr end = std::min(buffer.CpuAddr() + buffer.SizeBytes(), range_end);
+            if (start >= end) {
+                return;
+            }
+            DownloadCopies copies;
+            const u64 total_size_bytes = CollectDownloadCopies(buffer, start, end - start, copies);
+            if (total_size_bytes == 0) {
+                return;
+            }
+            batch.Reserve(total_size_bytes);
+            batch.Add(total_size_bytes, false,
+                      RecordDownloadCopies(buffer, start, end - start, std::move(copies),
+                                           total_size_bytes, deferred_unmark));
+        });
+    }
+}
+
+u64 BufferCache::CollectDownloadCopies(Buffer& buffer, VAddr device_addr, u64 size,
+                                       DownloadCopies& copies) {
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
@@ -117,9 +210,13 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             gpu_modified_ranges.ForEachInRange(device_addr_out, range_size, add_download);
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
-    if (total_size_bytes == 0) {
-        return;
-    }
+    return total_size_bytes;
+}
+
+Common::UniqueFunction<void> BufferCache::RecordDownloadCopies(Buffer& buffer, VAddr device_addr,
+                                                               u64 size, DownloadCopies&& copies,
+                                                               u64 total_size_bytes,
+                                                               bool deferred_unmark) {
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
     for (auto& copy : copies) {
         // Modify copies to have the staging offset in mind
@@ -144,21 +241,41 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
-    const auto write_data = [&]() {
+    return [this, copies = std::move(copies), download = download, offset = offset,
+            buffer_addr = buffer.CpuAddr(), device_addr, size, deferred_unmark] {
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
-            const VAddr copy_device_addr = buffer.CpuAddr() + copy.srcOffset;
+            const VAddr copy_device_addr = buffer_addr + copy.srcOffset;
             const u64 dst_offset = copy.dstOffset - offset;
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        if (!deferred_unmark) {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+            return;
+        }
+        // Running outside the GPU thread. The GPU may have written the range again after the
+        // copy was recorded, so the unprotect is applied on the GPU thread, where writes are
+        // tracked (see ApplyPendingUnmarks). Until then the range stays protected.
+        std::scoped_lock lk{pending_unmarks_mutex};
+        pending_unmarks.emplace_back(device_addr, size);
     };
-    if constexpr (async) {
-        scheduler.DeferOperation(write_data);
-    } else {
-        scheduler.Finish();
-        write_data();
+}
+
+void BufferCache::ApplyPendingUnmarks() {
+    std::vector<std::pair<VAddr, u64>> unmarks;
+    {
+        std::scoped_lock lk{pending_unmarks_mutex};
+        if (pending_unmarks.empty()) {
+            return;
+        }
+        unmarks.swap(pending_unmarks);
+    }
+    for (const auto& [device_addr, size] : unmarks) {
+        // If the GPU wrote the range again, keep it protected so the CPU reads the new data.
+        if (!gpu_modified_ranges.Intersects(device_addr, size)) {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        }
     }
 }
 
@@ -308,6 +425,9 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
             return &gds_buffer;
         }
         const auto [buffer, offset] = ObtainBuffer(address, num_bytes, true);
+        if (ReadbackStats::IsEnabled()) {
+            ReadbackStats::RecordWriter(address, num_bytes, 0, ReadbackStats::WriterFill);
+        }
         return buffer;
     }();
     buffer->Fill(buffer->Offset(address), num_bytes, value);
@@ -342,6 +462,9 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
         auto& buffer = slot_buffers[buffer_id];
         SynchronizeBuffer(buffer, dst, num_bytes, true, true);
         gpu_modified_ranges.Add(dst, num_bytes);
+        if (ReadbackStats::IsEnabled()) {
+            ReadbackStats::RecordWriter(dst, num_bytes, 0, ReadbackStats::WriterCopy);
+        }
         return buffer;
     }();
     const vk::BufferCopy region = {

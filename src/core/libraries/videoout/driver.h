@@ -4,9 +4,11 @@
 #pragma once
 
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -52,7 +54,15 @@ struct VideoOutPort {
 
     void WaitVoLabel(auto&& pred) {
         std::unique_lock lk{vo_mutex};
-        vo_cv.wait(lk, pred);
+        // Wait in slices so a flip that never completes gets reported (hang diagnostics).
+        bool reported = false;
+        while (!vo_cv.wait_for(lk, std::chrono::seconds{2}, pred)) {
+            if (!reported) {
+                reported = true;
+                LOG_WARNING(Lib_VideoOut, "Hang check: GPU thread waiting >2s for a flip to "
+                                          "complete (video out label)");
+            }
+        }
     }
 
     void SignalVoLabel() {

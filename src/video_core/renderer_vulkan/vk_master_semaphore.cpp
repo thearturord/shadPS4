@@ -67,4 +67,23 @@ void MasterSemaphore::Wait(u64 tick) {
     Refresh();
 }
 
+bool MasterSemaphore::WaitFor(u64 tick, u64 timeout_ns) {
+    if (IsFree(tick)) {
+        return true;
+    }
+    Refresh();
+    if (IsFree(tick)) {
+        return true;
+    }
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &semaphore.get(),
+        .pValues = &tick,
+    };
+    const bool done =
+        instance.GetDevice().waitSemaphores(&wait_info, timeout_ns) == vk::Result::eSuccess;
+    Refresh();
+    return done;
+}
+
 } // namespace Vulkan

@@ -30,6 +30,8 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+struct PM4CmdWaitRegMem;
+
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
     static constexpr u32 NumGfxRings = 1u;     // actually 2, but HP is reserved by system software
@@ -186,6 +188,28 @@ private:
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
+    /// Fence writes that were deferred until their readbacks complete (async readback fences).
+    /// The GPU executes commands in order, so a wait in the command stream for one of these
+    /// values may pass right away, like it did when fences were written immediately.
+    struct PendingFenceWrite {
+        VAddr address;
+        u64 value;
+        u32 num_bytes;
+        u64 id;
+    };
+    u64 AddPendingFenceWrite(VAddr address, u64 value, u32 num_bytes);
+    void RemovePendingFenceWrite(u64 id);
+    bool IsSatisfiedByPendingFence(const PM4CmdWaitRegMem& wait_reg_mem, bool is_compute);
+
+    /// Runs `signal` once the readbacks before this fence are in guest memory, registering the
+    /// fence write (if known) so that command stream waits on it don't block meanwhile.
+    /// Logs a command stream wait that has been blocked for more than 2 seconds.
+    void ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue, u64 wait_start,
+                        bool& reported);
+
+    void SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
+                                   VAddr address, u64 value, u32 num_bytes);
+
     struct GpuQueue {
         std::mutex m_access{};
         std::atomic<u32> dcb_buffer_offset;
@@ -232,6 +256,10 @@ private:
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
     s32 curr_qid{-1};
+    const u32 fence_wait_shortcut;
+    std::mutex pending_fence_mutex;
+    std::vector<PendingFenceWrite> pending_fence_writes;
+    u64 next_pending_fence_id{};
 };
 
 } // namespace AmdGpu

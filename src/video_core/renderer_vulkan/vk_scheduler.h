@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -417,12 +418,28 @@ public:
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
+        DeferPriorityOperation(std::move(func), CurrentTick());
+    }
+
+    /// Defers an operation until the gpu has reached the given tick.
+    /// Operations run in the order they were deferred, in another thread.
+    void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
+        num_priority_ops.fetch_add(1, std::memory_order_acq_rel);
         {
             std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
+            priority_pending_ops.emplace(std::move(func), tick);
         }
         priority_pending_ops_cv.notify_one();
     }
+
+    /// Returns true when deferred priority operations have not finished running.
+    [[nodiscard]] bool HasPriorityOperations() const noexcept {
+        return num_priority_ops.load(std::memory_order_acquire) != 0;
+    }
+
+    /// Waits until all deferred priority operations have run. The ticks they wait on must
+    /// already be submitted.
+    void WaitPriorityOperations();
 
     static std::mutex submit_mutex;
 
@@ -449,6 +466,7 @@ private:
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
+    std::atomic<u32> num_priority_ops{};
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;

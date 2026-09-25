@@ -12,6 +12,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/buffer_cache/readback_batch.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -41,14 +43,19 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
       pipeline_cache{instance, scheduler, liverpool},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
-      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      readback_batching{EmulatorSettings.IsReadbackBatchingEnabled()},
+      async_fences{EmulatorSettings.IsReadbackAsyncFencesEnabled()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    VideoCore::ReadbackStats::Start();
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    VideoCore::ReadbackStats::Stop();
+}
 
 void Rasterizer::CpSync() {
     scheduler.EndRendering();
@@ -234,6 +241,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     DebugState.IncDrawCall();
+    VideoCore::ReadbackStats::OnDraw();
 
     ResetBindings();
 }
@@ -309,6 +317,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+    VideoCore::ReadbackStats::OnDraw();
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
@@ -319,6 +328,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+    VideoCore::ReadbackStats::OnDraw();
     }
 
     ResetBindings();
@@ -351,6 +361,7 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    VideoCore::ReadbackStats::OnDispatch();
 
     ResetBindings();
 }
@@ -384,6 +395,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
+    VideoCore::ReadbackStats::OnDispatch();
 
     ResetBindings();
 }
@@ -400,11 +412,13 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    VideoCore::ReadbackStats::OnSubmit();
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
     }
-    texture_cache.ProcessDownloadImages();
+    ProcessDownloadImages();
+    buffer_cache.AdvanceHotEpoch();
     texture_cache.RunGarbageCollector();
     buffer_cache.RunGarbageCollector();
 }
@@ -682,6 +696,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         } else {
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
+            if (desc.is_written && VideoCore::ReadbackStats::IsEnabled()) {
+                VideoCore::ReadbackStats::RecordWriter(vsharp.base_address, size, stage.pgm_hash,
+                                                       static_cast<u32>(stage.sw_stage));
+            }
             const u32 offset_aligned = Common::AlignDown(offset, alignment);
             const u32 adjust = offset - offset_aligned;
             if (adjust % 4 != 0) {
@@ -1106,8 +1124,77 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
     return true;
 }
 
+void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) {
+    if (!async_fences || must_sync) {
+        // Synchronous path: readbacks complete (and earlier async fences drain, via Finish)
+        // before the fence is signaled from the GPU thread.
+        ProcessReadbacksSync();
+        if (async_fences && scheduler.HasPriorityOperations()) {
+            scheduler.Finish();
+        }
+        if (signal) {
+            signal();
+        }
+        return;
+    }
+
+    // Asynchronous path: record the copies, submit them and return without waiting. The
+    // priority thread waits for the GPU, writes the data to guest memory and only then signals
+    // the fence, so the guest still never sees the fence before the data. Fences are signaled
+    // in order because the priority thread runs operations in the order they were deferred.
+    const u64 max_bytes =
+        buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download).SizeBytes() / 2;
+    VideoCore::ReadbackBatch batch{scheduler, max_bytes};
+    texture_cache.RecordImageDownloads(batch);
+    buffer_cache.PrefetchHotRanges(batch, true);
+    const bool has_copies = !batch.Empty();
+    if (!has_copies && !scheduler.HasPriorityOperations()) {
+        // Nothing to read back and nothing in flight: keep the old immediate behavior.
+        if (signal) {
+            signal();
+        }
+        return;
+    }
+    // Without copies there is nothing new to wait for, only earlier fences to stay behind.
+    const u64 tick = has_copies ? scheduler.CurrentTick() : scheduler.CurrentTick() - 1;
+    // Always submit: operations queued before this one may wait on the current command buffer,
+    // and the guest may block on this fence without submitting anything else.
+    scheduler.DeferPriorityOperation(
+        [callbacks = batch.TakeCallbacks(), signal = std::move(signal)]() mutable {
+            for (auto& callback : callbacks) {
+                callback();
+            }
+            if (signal) {
+                signal();
+            }
+        },
+        tick);
+    scheduler.Flush();
+}
+
 void Rasterizer::ProcessDownloadImages() {
-    texture_cache.ProcessDownloadImages();
+    if (async_fences) {
+        // End of a submission, no guest fence attached: still avoid waiting on the GPU.
+        OnFence({});
+        return;
+    }
+    ProcessReadbacksSync();
+}
+
+void Rasterizer::ProcessReadbacksSync() {
+    if (!readback_batching && !async_fences) {
+        texture_cache.ProcessDownloadImages();
+        return;
+    }
+    // Called right before the guest is told the GPU finished (EOP/EOS fences, end of submit).
+    // Pending image readbacks and recently read back buffers that the GPU wrote again are
+    // downloaded here with a single GPU wait, so the CPU finds the data ready instead of
+    // faulting and waiting once per buffer or image.
+    const u64 max_bytes =
+        buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download).SizeBytes() / 2;
+    VideoCore::ReadbackBatch batch{scheduler, max_bytes};
+    texture_cache.RecordImageDownloads(batch);
+    buffer_cache.PrefetchHotRanges(batch);
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {

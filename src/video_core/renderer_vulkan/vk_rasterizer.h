@@ -71,6 +71,11 @@ public:
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
+
+    /// Handles readbacks at an end-of-pipe fence and runs `signal` once their data is in guest
+    /// memory. With async fences the GPU thread doesn't wait and `signal` runs on another thread;
+    /// `must_sync` forces the blocking path (for fences whose signal needs the GPU thread).
+    void OnFence(Common::UniqueFunction<void>&& signal, bool must_sync = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -94,6 +99,7 @@ public:
     }
 
 private:
+    void ProcessReadbacksSync();
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
@@ -140,6 +146,8 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    const bool readback_batching;
+    const bool async_fences;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

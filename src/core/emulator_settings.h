@@ -424,6 +424,16 @@ struct GPUSettings {
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
+    // Writes readback_stats.csv / readback_top.txt diagnostics to the log directory.
+    Setting<bool> readback_stats_enabled{false};
+    // Completes image readbacks and recently read back buffers with one GPU wait per fence.
+    Setting<bool> readback_batching_enabled{false};
+    // Signals end-of-pipe fences after their readbacks complete on another thread instead of
+    // blocking the GPU command thread.
+    Setting<bool> readback_async_fences_enabled{false};
+    // With async fences, lets command stream waits pass for fence values still held back:
+    // 0 = off, 1 = graphics queue only, 2 = graphics and compute queues.
+    Setting<u32> readback_fence_wait_shortcut{1};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -455,6 +465,14 @@ struct GPUSettings {
                                        &GPUSettings::readback_linear_images_enabled),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
+            make_override<GPUSettings>("readback_stats_enabled",
+                                       &GPUSettings::readback_stats_enabled),
+            make_override<GPUSettings>("readback_batching_enabled",
+                                       &GPUSettings::readback_batching_enabled),
+            make_override<GPUSettings>("readback_async_fences_enabled",
+                                       &GPUSettings::readback_async_fences_enabled),
+            make_override<GPUSettings>("readback_fence_wait_shortcut",
+                                       &GPUSettings::readback_fence_wait_shortcut),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
         };
     }
@@ -462,7 +480,10 @@ struct GPUSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
+                                   direct_memory_access_enabled, readback_stats_enabled,
+                                   readback_batching_enabled, readback_async_fences_enabled,
+                                   readback_fence_wait_shortcut,
+                                   dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
@@ -742,6 +763,10 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackStatsEnabled, readback_stats_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAsyncFencesEnabled, readback_async_fences_enabled)
+    SETTING_FORWARD(m_gpu, ReadbackFenceWaitShortcut, readback_fence_wait_shortcut)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
 
     u32 GetVblankFrequency() {

@@ -482,6 +482,18 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             if (gj.contains("Vulkan"))
                 ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
 
+            // Readback tuning overrides. Launchers rewrite <serial>.json and drop keys they
+            // don't know, so these live in a separate file that only the emulator reads.
+            const auto readbackPath = Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) /
+                                      (serial + ".readback.json");
+            if (std::filesystem::exists(readbackPath)) {
+                std::ifstream readback_in(readbackPath);
+                json rj;
+                readback_in >> rj;
+                if (rj.contains("GPU"))
+                    ApplyGroupOverrides(m_gpu, rj.at("GPU"), changed);
+            }
+
             PrintChangedSummary(changed);
             EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
             return true;

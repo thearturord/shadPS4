@@ -10,7 +10,9 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
@@ -68,15 +70,66 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
+void TextureCache::RecordImageDownloads(ReadbackBatch& batch) {
+    std::unique_lock lk{download_images_mutex};
+    for (const ImageId image_id : download_images) {
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const u32 download_size = ImageDownloadSize(image);
+        batch.Reserve(download_size);
+        u8* download = RecordImageCopy(image, download_size);
+        if (ReadbackStats::IsEnabled()) {
+            ReadbackStats::OnImageReadback(image.info.guest_address, download_size,
+                                           image.info.size.width, image.info.size.height,
+                                           image.info.num_bits, 0);
+        }
+        batch.Add(download_size, true,
+                  [device_addr = image.info.guest_address, download, download_size] {
+                      Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                                download, download_size);
+                  });
+    }
+    download_images.clear();
+}
+
+u32 TextureCache::ImageDownloadSize(const Image& image) {
+    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
+                              image.info.resources.layers * (image.info.num_bits / 8);
+    ASSERT(download_size <= image.info.guest_size);
+    return download_size;
+}
+
 void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    const u32 download_size = ImageDownloadSize(image);
+    u8* download = RecordImageCopy(image, download_size);
+
+    if (sync) {
+        const u64 start = ReadbackStats::NowNs();
+        scheduler.Finish();
+        if (ReadbackStats::IsEnabled()) {
+            ReadbackStats::OnImageReadback(image.info.guest_address, download_size,
+                                           image.info.size.width, image.info.size.height,
+                                           image.info.num_bits, ReadbackStats::NowNs() - start);
+        }
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+                                                  download, download_size);
+    } else {
+        scheduler.DeferPriorityOperation(
+            [this, device_addr = image.info.guest_address, download, download_size] {
+                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+                                                          download_size);
+            });
+    }
+}
+
+u8* TextureCache::RecordImageCopy(Image& image, u32 download_size) {
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
-    ASSERT(download_size <= image.info.guest_size);
     const auto [download, offset] = download_buffer.Map(download_size);
     download_buffer.Commit();
     const vk::BufferImageCopy image_download = {
@@ -99,18 +152,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
                              download_buffer.Handle(), image_download);
-
-    if (sync) {
-        scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
-    } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
-            });
-    }
+    return download;
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {

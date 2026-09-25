@@ -18,6 +18,7 @@
 #include "imgui/shadnet_notifications_layer.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -838,6 +839,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    if (!is_reusing_frame) {
+        VideoCore::ReadbackStats::OnPresent();
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

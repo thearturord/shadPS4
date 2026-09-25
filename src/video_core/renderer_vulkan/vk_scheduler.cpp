@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -103,10 +107,17 @@ void Scheduler::Flush() {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
+    const u64 start = VideoCore::ReadbackStats::NowNs();
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
+    // Deferred write backs (async readbacks) for work that is now complete must land in guest
+    // memory before anything that relies on Finish() reads it.
+    WaitPriorityOperations();
+    if (VideoCore::ReadbackStats::IsEnabled()) {
+        VideoCore::ReadbackStats::OnFinish(VideoCore::ReadbackStats::NowNs() - start);
+    }
 }
 
 void Scheduler::Wait(u64 tick) {
@@ -116,6 +127,27 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     master_semaphore.Wait(tick);
+}
+
+void Scheduler::WaitPriorityOperations() {
+    if (num_priority_ops.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    // Normally this is a short wait for write backs of already completed GPU work. Poll so a
+    // wait that never ends gets reported (hang diagnostics).
+    const auto start = std::chrono::steady_clock::now();
+    bool reported = false;
+    u32 pending;
+    while ((pending = num_priority_ops.load(std::memory_order_acquire)) != 0) {
+        if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds{2}) {
+            reported = true;
+            LOG_WARNING(Render_Vulkan,
+                        "Hang check: waiting for {} priority operations to finish (GPU reached "
+                        "tick {}, CPU recording {})",
+                        pending, master_semaphore.KnownGpuTick(), master_semaphore.CurrentTick());
+        }
+        std::this_thread::yield();
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -217,12 +249,30 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        master_semaphore.Wait(op.gpu_tick);
+        // Wait in slices so a wait that never completes gets reported (hang diagnostics).
+        constexpr u64 ReportAfterNs = 2'000'000'000ULL;
+        bool reported = false;
+        while (!master_semaphore.WaitFor(op.gpu_tick, ReportAfterNs) &&
+               !stoken.stop_requested()) {
+            if (!reported) {
+                reported = true;
+                LOG_WARNING(Render_Vulkan,
+                            "Hang check: priority operation still waiting for GPU tick {} (GPU "
+                            "reached {}, CPU recording {}){}",
+                            op.gpu_tick, master_semaphore.KnownGpuTick(),
+                            master_semaphore.CurrentTick(),
+                            op.gpu_tick >= master_semaphore.CurrentTick()
+                                ? " - tick was never submitted"
+                                : "");
+            }
+        }
         if (stoken.stop_requested()) {
             break;
         }
 
         op.callback();
+        num_priority_ops.fetch_sub(1, std::memory_order_acq_rel);
+        num_priority_ops.notify_all();
     }
 }
 

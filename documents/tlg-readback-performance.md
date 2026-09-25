@@ -120,6 +120,28 @@ CPU-visible fence and its readback data stay deferred.
   thread waiting on priority operations, and flip label waits. One intermittent hang was seen
   once and not reproduced since.
 
+### 6. Texture cache fixes
+- **Crash:** a 3D texture reused at the same address with more depth (36x36x1197
+  R16G16B16A16) hit `ResolveOverlap: Unreachable code`. The old image is now replaced when it
+  hasn't been used for more than 32 submits. The assertion remains for images in use.
+- **Image age:** `ResolveOverlap` counted image age in scheduler ticks. Async fences flush many
+  times per frame, which made recently used images look old. Age is now counted with `gc_tick`,
+  which advances once per guest submit.
+
+### 7. Shared memory experiment (parked, branch `tlg-shared-memory-experiment`)
+Buffers read back in 8+ different frames (up to 16 MB) were re-created on top of guest memory
+through `VK_EXT_external_memory_host`, so the GPU writes guest memory directly.
+- The import only works once all tracker protection is removed from the pages. Before that, the
+  NVIDIA driver returned `ErrorOutOfDeviceMemory`. `HostMappedForeignMemory` returns
+  `ErrorInitializationFailed`.
+- Result: 69 buffers were shared, but the title screen dropped from 60 to 13 FPS with only 3 tiny
+  (16-80 KB) shared buffers, and gameplay dropped to 6-7 FPS. Every fence after a GPU write to
+  shared memory must wait for the GPU, and the command processor thread then spends ~2 s/s
+  (summed across queues) blocked in `WaitRegMem` on those fences. Large shared buffers (7-12 MB)
+  also moved heavy GPU traffic onto PCIe.
+- Conclusion: shared memory only pays off once fence waits no longer block the command processor
+  thread (see `documents/tlg-gpu-side-fence-waits-plan.md`).
+
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
   (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of

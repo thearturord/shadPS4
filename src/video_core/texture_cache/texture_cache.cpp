@@ -316,8 +316,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
-    const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+    // Age is counted in guest submissions (gc_tick advances once per submit), not scheduler ticks:
+    // those advance at every flush, and with async readback fences that is many times per frame.
+    const bool safe_to_delete = gc_tick - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -484,10 +485,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
                   (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
 
-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+                  merged_image_id.index, static_cast<int>(binding), gc_tick,
+                  gc_tick - cache_image.tick_accessed_last);
 
-        UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
+        // Seen in The Last Guardian: a 3D texture at the same address grows in depth. Replace
+        // the old image when it hasn't been used recently instead of aborting.
+        ASSERT_MSG(safe_to_delete,
+                   "Encountered unresolvable image overlap with equal memory address.");
+        FreeImage(cache_image_id);
+        return {merged_image_id, -1, -1};
     }
 
     // Right overlap, the image requested is a possible subresource of the image from cache.
@@ -626,7 +632,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
-    image.tick_accessed_last = scheduler.CurrentTick();
+    image.tick_accessed_last = gc_tick;
     TouchImage(image);
 
     // If the image requested is a subresource of the image from cache record its location.

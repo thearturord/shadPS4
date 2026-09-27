@@ -121,6 +121,7 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    VideoCore::ReadbackStats::CpPhase phase{"waiting for a GPU tick (Scheduler::Wait)"};
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -135,6 +136,7 @@ void Scheduler::WaitPriorityOperations() {
     }
     // Normally this is a short wait for write backs of already completed GPU work. Poll so a
     // wait that never ends gets reported (hang diagnostics).
+    VideoCore::ReadbackStats::CpPhase phase{"waiting for priority operations (write backs)"};
     const auto start = std::chrono::steady_clock::now();
     bool reported = false;
     u32 pending;

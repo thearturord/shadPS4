@@ -70,6 +70,31 @@ void Rasterizer::CpSync() {
                            vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
 }
 
+bool Rasterizer::CommandStreamBarrier(u64 producer_tick) {
+    if (scheduler.IsFree(producer_tick)) {
+        // The producer already finished on the GPU, nothing left to order against.
+        return false;
+    }
+    if (last_barrier_work == recorded_work) {
+        // No work was recorded since the last barrier: the producer comes before it and every
+        // later command comes after it, so it already orders this wait too.
+        return false;
+    }
+    last_barrier_work = recorded_work;
+    scheduler.EndRendering();
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    return true;
+}
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
@@ -242,6 +267,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     DebugState.IncDrawCall();
     VideoCore::ReadbackStats::OnDraw();
+    ++recorded_work;
 
     ResetBindings();
 }
@@ -317,7 +343,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
-    VideoCore::ReadbackStats::OnDraw();
+        VideoCore::ReadbackStats::OnDraw();
+        ++recorded_work;
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
@@ -328,7 +355,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
-    VideoCore::ReadbackStats::OnDraw();
+        VideoCore::ReadbackStats::OnDraw();
+        ++recorded_work;
     }
 
     ResetBindings();
@@ -362,6 +390,7 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     VideoCore::ReadbackStats::OnDispatch();
+    ++recorded_work;
 
     ResetBindings();
 }
@@ -396,6 +425,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
     VideoCore::ReadbackStats::OnDispatch();
+    ++recorded_work;
 
     ResetBindings();
 }
@@ -409,6 +439,10 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+u64 Rasterizer::CurrentTick() const noexcept {
+    return scheduler.CurrentTick();
 }
 
 void Rasterizer::OnSubmit() {
@@ -1092,10 +1126,12 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
+    ++recorded_work;
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
+    ++recorded_work;
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {

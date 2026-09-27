@@ -10,6 +10,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <queue>
 
@@ -188,27 +189,62 @@ private:
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
-    /// Fence writes that were deferred until their readbacks complete (async readback fences).
-    /// The GPU executes commands in order, so a wait in the command stream for one of these
-    /// values may pass right away, like it did when fences were written immediately.
-    struct PendingFenceWrite {
+    /// Label timeline: per fence label, the latest value a fence packet the command processor
+    /// already recorded will write, while fence writes are held back (async readback fences
+    /// write them once the GPU finished and the readbacks landed). A command stream wait only
+    /// needs its producer to be recorded ahead of it in the single Vulkan queue, not executed,
+    /// so it may pass on that value. When everything recorded has landed, guest memory is
+    /// authoritative again, and so it is as soon as someone else writes the label meanwhile.
+    struct LabelState {
         VAddr address;
-        u64 value;
         u32 num_bytes;
-        u64 id;
+        u32 queue; ///< Queue of the latest fence: 0 = graphics, n = compute ring n - 1.
+        u64 latest_value;
+        u64 latest_seq; ///< Order in which the fence packets were processed.
+        u64 gpu_tick;   ///< Scheduler tick holding the GPU work before the latest fence.
+        u32 pending;    ///< Recorded fences whose write hasn't landed yet.
+        bool overridden;
+        /// Guest memory before the first held back fence, then every value recorded since.
+        std::vector<u64> known_values;
     };
-    u64 AddPendingFenceWrite(VAddr address, u64 value, u32 num_bytes);
-    void RemovePendingFenceWrite(u64 id);
-    bool IsSatisfiedByPendingFence(const PM4CmdWaitRegMem& wait_reg_mem, bool is_compute);
+    static constexpr size_t MaxKnownLabelValues = 64;
+    struct FenceMatch {
+        bool satisfied{};
+        u64 gpu_tick{};
+        u32 queue{};
+        u32 value{};
+        u32 initial{};
+    };
+    u64 RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue);
+    void RetireFence(VAddr address, u64 seq);
+    FenceMatch MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem);
 
-    /// Runs `signal` once the readbacks before this fence are in guest memory, registering the
-    /// fence write (if known) so that command stream waits on it don't block meanwhile.
+    /// readback_fence_wait_shortcut: 0 = off, 1 = graphics queue waits, 2 = graphics and compute
+    /// queue waits, 3 = like 2 plus a GPU barrier that orders the work after the wait on the
+    /// GPU (the wait passes on a recorded fence instead of a finished one).
+    [[nodiscard]] bool FenceShortcutEnabled(bool is_compute) const noexcept {
+        return fence_wait_shortcut != 0 && (!is_compute || fence_wait_shortcut >= 2);
+    }
+
+    /// Called when a wait passed on a recorded fence: orders the following GPU work after it.
+    void OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+                             u32 queue);
+
     /// Logs a command stream wait that has been blocked for more than 2 seconds.
     void ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue, u64 wait_start,
                         bool& reported);
+    /// Logs a MemSemaphore/Rewind wait that has been blocked for more than 2 seconds.
+    void ReportLongSpin(const char* what, const void* address, u64 wait_start, bool& reported);
 
+    /// A command processor memory write (WriteData) normally lands when the packet is processed.
+    /// If a fence write to the same label is still held back, the GPU would run it after that
+    /// fence, so it is queued behind it instead. Returns false when it can be written now.
+    bool DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue);
+
+    /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
+    /// fence value (if known) in the label timeline meanwhile.
     void SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
-                                   VAddr address, u64 value, u32 num_bytes);
+                                   VAddr address, u64 value, u32 num_bytes, u32 queue);
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -257,9 +293,12 @@ private:
     std::thread::id gpu_id;
     s32 curr_qid{-1};
     const u32 fence_wait_shortcut;
-    std::mutex pending_fence_mutex;
-    std::vector<PendingFenceWrite> pending_fence_writes;
-    u64 next_pending_fence_id{};
+    std::mutex recorded_fence_mutex;
+    std::vector<LabelState> label_states;
+    u64 next_fence_seq{};
+    std::unordered_set<VAddr> logged_compute_passes;
+    std::unordered_set<VAddr> logged_overrides;
+    std::unordered_set<VAddr> logged_deferred_writes;
 };
 
 } // namespace AmdGpu

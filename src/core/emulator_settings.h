@@ -432,7 +432,8 @@ struct GPUSettings {
     // blocking the GPU command thread.
     Setting<bool> readback_async_fences_enabled{false};
     // With async fences, lets command stream waits pass for fence values still held back:
-    // 0 = off, 1 = graphics queue only, 2 = graphics and compute queues.
+    // 0 = off, 1 = graphics queue only, 2 = graphics and compute queues, 3 = like 2 plus a GPU
+    // barrier after each wait that passed on a fence recorded but not finished yet.
     Setting<u32> readback_fence_wait_shortcut{1};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};

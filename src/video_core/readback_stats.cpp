@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <fstream>
 #include <map>
@@ -22,7 +23,10 @@ namespace VideoCore::ReadbackStats {
 
 namespace Detail {
 std::atomic<bool> enabled{false};
-}
+std::atomic<u32> cp_packet{};
+std::atomic<const char*> cp_phase{};
+thread_local bool is_cp_thread{};
+} // namespace Detail
 
 namespace {
 
@@ -59,6 +63,12 @@ struct Counters {
     std::atomic<u64> regmem_waits{};
     std::atomic<u64> regmem_wait_ns{};
     std::atomic<u64> regmem_shortcuts{};
+    // Indexed by [is_compute][WaitClass].
+    std::array<std::array<std::atomic<u64>, u32(WaitClass::Count)>, 2> wait_count{};
+    std::array<std::array<std::atomic<u64>, u32(WaitClass::Count)>, 2> wait_ns{};
+    std::atomic<u64> sem_waits{};
+    std::atomic<u64> sem_wait_ns{};
+    std::atomic<u64> stream_barriers{};
     std::atomic<u64> stream_waits{};
     std::atomic<u64> stream_wait_ns{};
 };
@@ -91,6 +101,14 @@ struct ShaderStat {
     u64 blocked_ns{};
 };
 
+struct WaitStat {
+    VAddr address{};
+    bool is_compute{};
+    std::array<u64, u32(WaitClass::Count)> count{};
+    std::array<u64, u32(WaitClass::Count)> ns{};
+    u64 total_ns{};
+};
+
 struct ImageStat {
     VAddr addr{};
     u32 width{};
@@ -109,6 +127,7 @@ u64 writer_seq{};
 std::unordered_map<VAddr, BufferStat> buffer_stats;
 std::unordered_map<u64, ShaderStat> shader_stats;
 std::unordered_map<VAddr, ImageStat> image_stats;
+std::unordered_map<u64, WaitStat> wait_stats;
 
 std::mutex thread_mutex;
 std::condition_variable_any stop_cv;
@@ -167,8 +186,12 @@ void WriteTopReport(u64 elapsed_ns) {
     std::vector<BufferStat> buffers;
     std::vector<ShaderStat> shaders;
     std::vector<ImageStat> images;
+    std::vector<WaitStat> waits;
     {
         std::scoped_lock lk{maps_mutex};
+        for (const auto& [_, stat] : wait_stats) {
+            waits.push_back(stat);
+        }
         buffers.reserve(buffer_stats.size());
         for (const auto& [_, stat] : buffer_stats) {
             buffers.push_back(stat);
@@ -188,6 +211,12 @@ void WriteTopReport(u64 elapsed_ns) {
     });
     std::ranges::sort(images, [](const auto& a, const auto& b) {
         return a.finish_ns > b.finish_ns;
+    });
+    std::ranges::sort(waits, [](const auto& a, const auto& b) {
+        if (a.total_ns != b.total_ns) {
+            return a.total_ns > b.total_ns;
+        }
+        return a.count[0] > b.count[0];
     });
 
     std::string out;
@@ -225,6 +254,19 @@ void WriteTopReport(u64 elapsed_ns) {
                            Ms(img.finish_ns));
     }
 
+    out += "\n== Command stream waits (WaitRegMem), by blocked time ==\n";
+    out += "pass = passed on a recorded fence, producer = waited for another ring to record it,\n"
+           "fence = waited for a held back fence to land, memory = value not written by a fence\n";
+    out += fmt::format("{:>18} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11} {:>11} {:>11}\n", "address",
+                       "queue", "pass", "producer", "fence", "memory", "producer_ms",
+                       "fence_ms", "memory_ms");
+    for (size_t i = 0; i < std::min<size_t>(waits.size(), 40); ++i) {
+        const auto& w = waits[i];
+        out += fmt::format("{:#18x} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11.1f} {:>11.1f} {:>11.1f}\n",
+                           w.address, w.is_compute ? "compute" : "gfx", w.count[0], w.count[1],
+                           w.count[2], w.count[3], Ms(w.ns[1]), Ms(w.ns[2]), Ms(w.ns[3]));
+    }
+
     std::ofstream file{LogPath("readback_top.txt"), std::ios::trunc};
     file << out;
 }
@@ -238,11 +280,14 @@ void ReporterThread(std::stop_token stoken) {
            "buf_MB,buf_gpu_wait_ms,game_blocked_ms,img_readbacks,img_MB,img_gpu_wait_ms,"
            "finish_calls,finish_ms,gpu_thread_busy_pct,batches,batch_buffers,batch_images,"
            "batch_MB,batch_wait_ms,regmem_waits,regmem_wait_ms,regmem_shortcuts,stream_waits,"
-           "stream_wait_ms\n";
+           "stream_wait_ms,gfx_pass,gfx_producer,gfx_producer_ms,gfx_fence,gfx_fence_ms,"
+           "gfx_memory,gfx_memory_ms,cmp_pass,cmp_producer,cmp_producer_ms,cmp_fence,"
+           "cmp_fence_ms,cmp_memory,cmp_memory_ms,sem_waits,sem_wait_ms,stream_barriers\n";
     csv.flush();
 
     u64 last_ns = NowNs();
     u32 ticks = 0;
+    u32 stalled_seconds = 0;
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{thread_mutex};
@@ -257,9 +302,35 @@ void ReporterThread(std::stop_token stoken) {
         const double busy =
             interval ? 100.0 * (1.0 - std::min(1.0, static_cast<double>(idle) / interval)) : 0.0;
 
+        // Stall watchdog: the command processor is busy but records nothing.
+        const bool no_work = counters.submits.load() == 0 && counters.draws.load() == 0 &&
+                             counters.dispatches.load() == 0 && counters.presents.load() == 0;
+        if (no_work && busy > 95.0) {
+            if (++stalled_seconds == 3) {
+                const u32 packet = Detail::cp_packet.load(std::memory_order_relaxed);
+                const char* phase = Detail::cp_phase.load(std::memory_order_relaxed);
+                LOG_WARNING(Render,
+                            "Hang check: command processor busy for 3s without recording work. "
+                            "Last packet: queue {} opcode {:#x}, phase: {}",
+                            packet >> 16, packet & 0xFFFF, phase ? phase : "packet processing");
+            }
+        } else {
+            stalled_seconds = 0;
+        }
+        std::string wait_columns;
+        for (u32 q = 0; q < 2; ++q) {
+            for (u32 c = 0; c < u32(WaitClass::Count); ++c) {
+                const u64 count = take(counters.wait_count[q][c]);
+                const u64 ns = take(counters.wait_ns[q][c]);
+                wait_columns += c == 0 ? fmt::format(",{}", count)
+                                       : fmt::format(",{},{:.2f}", count, Ms(ns));
+            }
+        }
+
         csv << fmt::format(
             "{:.1f},{},{},{},{},{},{},{:.2f},{},{:.2f},{},{},{},{},{:.2f},{:.2f},{:.2f},{},{:.2f},"
-            "{:.2f},{},{:.2f},{:.1f},{},{},{},{:.2f},{:.2f},{},{:.2f},{},{},{:.2f}\n",
+            "{:.2f},{},{:.2f},{:.1f},{},{},{},{:.2f},{:.2f},{},{:.2f},{},{},{:.2f}{},{},{:.2f},"
+            "{}\n",
             static_cast<double>(now - start_ns) / 1e9, take(counters.presents),
             take(counters.submits), take(counters.draws), take(counters.dispatches),
             take(counters.read_faults), take(counters.write_faults), Ms(take(counters.fault_ns)),
@@ -274,7 +345,8 @@ void ReporterThread(std::stop_token stoken) {
             Mb(take(counters.batch_bytes)), Ms(take(counters.batch_wait_ns)),
             take(counters.regmem_waits), Ms(take(counters.regmem_wait_ns)),
             take(counters.regmem_shortcuts), take(counters.stream_waits),
-            Ms(take(counters.stream_wait_ns)));
+            Ms(take(counters.stream_wait_ns)), wait_columns, take(counters.sem_waits),
+            Ms(take(counters.sem_wait_ns)), take(counters.stream_barriers));
         csv.flush();
 
         if (++ticks % 5 == 0) {
@@ -404,13 +476,34 @@ void OnBatch(u32 num_buffers, u32 num_images, u64 bytes, u64 wait_ns) {
     counters.batch_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
 }
 
-void OnRegMemWait(u64 wait_ns, bool shortcut) {
-    if (shortcut) {
+void OnCommandWait(bool is_compute, VAddr address, WaitClass cls, u64 wait_ns) {
+    const u32 q = is_compute ? 1 : 0;
+    const u32 c = static_cast<u32>(cls);
+    if (cls == WaitClass::FencePass) {
         counters.regmem_shortcuts.fetch_add(1, std::memory_order_relaxed);
-        return;
+    } else {
+        counters.regmem_waits.fetch_add(1, std::memory_order_relaxed);
+        counters.regmem_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
     }
-    counters.regmem_waits.fetch_add(1, std::memory_order_relaxed);
-    counters.regmem_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+    counters.wait_count[q][c].fetch_add(1, std::memory_order_relaxed);
+    counters.wait_ns[q][c].fetch_add(wait_ns, std::memory_order_relaxed);
+
+    std::scoped_lock lk{maps_mutex};
+    auto& stat = wait_stats[address ^ (u64{q} << 63)];
+    stat.address = address;
+    stat.is_compute = is_compute;
+    ++stat.count[c];
+    stat.ns[c] += wait_ns;
+    stat.total_ns += wait_ns;
+}
+
+void OnSemaphoreWait(u64 wait_ns) {
+    counters.sem_waits.fetch_add(1, std::memory_order_relaxed);
+    counters.sem_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+}
+
+void OnStreamBarrier() {
+    counters.stream_barriers.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnStreamWait(u64 wait_ns) {

@@ -218,6 +218,8 @@ struct PageManager::Impl {
         const bool is_write = Common::IsWriteError(context);
         const bool stats = ReadbackStats::IsEnabled();
         const u64 start = stats ? ReadbackStats::NowNs() : 0;
+        ReadbackStats::CpPhase phase{is_write ? "page fault handler (write)"
+                                              : "page fault handler (read)"};
         const bool handled =
             is_write ? rasterizer->InvalidateMemory(addr, 8) : rasterizer->ReadMemory(addr, 8);
         if (stats && handled) {

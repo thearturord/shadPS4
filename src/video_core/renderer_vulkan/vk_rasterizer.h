@@ -81,6 +81,14 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+
+    /// Orders all later GPU work after everything recorded so far, for a command stream wait
+    /// that passed because its producer (a fence recorded at `producer_tick`) was already
+    /// recorded, not because it finished. Returns whether a barrier was recorded.
+    bool CommandStreamBarrier(u64 producer_tick);
+
+    [[nodiscard]] u64 CurrentTick() const noexcept;
+
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -148,6 +156,8 @@ private:
     const bool guest_markers_enabled;
     const bool readback_batching;
     const bool async_fences;
+    u64 recorded_work{};
+    u64 last_barrier_work{~0ULL};
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

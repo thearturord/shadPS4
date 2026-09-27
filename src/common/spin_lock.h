@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <thread>
 
 namespace Common {
 
@@ -27,7 +28,11 @@ public:
     [[nodiscard]] bool try_lock();
 
 private:
+    void LockSlow();
+
     std::atomic_flag lck = ATOMIC_FLAG_INIT;
+    /// Holder of the lock, for the hang check in LockSlow.
+    std::atomic<std::thread::id> owner{};
 };
 
 } // namespace Common

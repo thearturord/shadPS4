@@ -44,7 +44,7 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
 | `readback_stats_enabled` | Writes `log/readback_stats.csv` (one line per second) and `log/readback_top.txt` (buffers, writer shaders and images ranked by stall time). |
 | `readback_batching_enabled` | Completes image readbacks and recently read back buffers with one GPU wait per fence. |
 | `readback_async_fences_enabled` | Fences are signaled from a background thread once their readbacks are in guest memory, instead of the GPU thread blocking. |
-| `readback_fence_wait_shortcut` | With async fences: 0 = off, 1 = graphics queue `WaitRegMem` may pass for fence values still held back, 2 = graphics and compute. |
+| `readback_fence_wait_shortcut` | With async fences: 0 = off, 1 = graphics queue `WaitRegMem` may pass for fence values still held back, 2 = graphics and compute, 3 = graphics and compute plus a GPU barrier after each such wait. |
 
 ## Steps taken
 
@@ -141,6 +141,18 @@ through `VK_EXT_external_memory_host`, so the GPU writes guest memory directly.
   also moved heavy GPU traffic onto PCIe.
 - Conclusion: shared memory only pays off once fence waits no longer block the command processor
   thread (see `documents/tlg-gpu-side-fence-waits-plan.md`).
+
+### 8. Fence waits on the GPU timeline (`readback_fence_wait_shortcut: 3`)
+See `documents/tlg-gpu-side-fence-waits-plan.md`. Command stream waits pass as soon as the fence
+they wait for is recorded, and a GPU barrier (level 3) orders the following work after it, so the
+command processor thread no longer waits for the GPU at these waits. Only the latest recorded
+value per label counts. The stats now split waits by class and queue, and a watchdog logs where
+the command processor is stuck if it stops recording work for 3 s. Spin locks held for more than
+2 s are reported too.
+- `WriteData` to a label whose fence write is still held back is queued behind it (fixed the
+  `StallUntilSignaled` crash that level 2 always had).
+- Result: stable in gameplay, compute fence waits gone (~1.5 s/s to 0), but FPS about the same
+  (~29.6 average, median 29). The command processor is still ~97% busy with other work.
 
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences

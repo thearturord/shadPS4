@@ -78,16 +78,21 @@ static void NoFenceWrite(void*, u64, u32) {}
 /// Writes a fence value from outside the GPU thread. Memory without a GPU mapping is never page
 /// protected by the tracker, so it can be written directly (fence labels often live in plain
 /// game memory). Returns false when the write must be done on the GPU thread instead.
-static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
-                                   u32 num_bytes) {
-    if (Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
+static bool TryWriteOffThread(Vulkan::Rasterizer* rasterizer, void* address, const void* data,
+                              u32 num_bytes) {
+    if (Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
         return true;
     }
     if (rasterizer && !rasterizer->IsMapped(reinterpret_cast<VAddr>(address), num_bytes)) {
-        std::memcpy(address, &data, num_bytes);
+        std::memcpy(address, data, num_bytes);
         return true;
     }
     return false;
+}
+
+static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
+                                   u32 num_bytes) {
+    return TryWriteOffThread(rasterizer, address, &data, num_bytes);
 }
 
 /// Runs a fence signal that may execute outside the GPU thread (async readback fences). Fence
@@ -119,39 +124,124 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
-u64 Liverpool::AddPendingFenceWrite(VAddr address, u64 value, u32 num_bytes) {
-    std::scoped_lock lk{pending_fence_mutex};
-    const u64 id = ++next_pending_fence_id;
-    pending_fence_writes.push_back({address, value, num_bytes, id});
-    return id;
+static u64 ReadLabel(VAddr address, u32 num_bytes) {
+    u64 value{};
+    std::memcpy(&value, reinterpret_cast<const void*>(address), num_bytes);
+    return value;
 }
 
-void Liverpool::RemovePendingFenceWrite(u64 id) {
-    std::scoped_lock lk{pending_fence_mutex};
-    std::erase_if(pending_fence_writes, [id](const auto& write) { return write.id == id; });
-}
-
-bool Liverpool::IsSatisfiedByPendingFence(const PM4CmdWaitRegMem& wait_reg_mem, bool is_compute) {
-    // 0 = off, 1 = graphics queue waits only, 2 = graphics and compute queue waits.
-    if (fence_wait_shortcut == 0 || (is_compute && fence_wait_shortcut < 2)) {
-        return false;
+u64 Liverpool::RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue) {
+    // Read outside the lock, see MatchRecordedFence.
+    const u64 memory = ReadLabel(address, num_bytes);
+    std::scoped_lock lk{recorded_fence_mutex};
+    const u64 seq = ++next_fence_seq;
+    // A label reused with another size: forget the old state, waits then poll memory.
+    std::erase_if(label_states, [&](const LabelState& label) {
+        return label.address < address + num_bytes && address < label.address + label.num_bytes &&
+               (label.address != address || label.num_bytes != num_bytes);
+    });
+    auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->overridden) {
+        // Start tracking from what guest memory holds now.
+        if (it == label_states.end()) {
+            it = label_states.emplace(label_states.end());
+            it->address = address;
+            it->num_bytes = num_bytes;
+        }
+        it->overridden = false;
+        it->known_values.clear();
+        it->known_values.push_back(memory);
     }
+    // Only the latest value can satisfy a later wait: the GPU runs the fences in the order they
+    // were recorded, so older values are overwritten before any later wait could observe them.
+    it->latest_value = value;
+    it->latest_seq = seq;
+    it->gpu_tick = rasterizer ? rasterizer->CurrentTick() : 0;
+    it->queue = queue;
+    ++it->pending;
+    if (it->known_values.size() < MaxKnownLabelValues) {
+        it->known_values.push_back(value);
+    }
+    return seq;
+}
+
+void Liverpool::RetireFence(VAddr address, u64 seq) {
+    std::scoped_lock lk{recorded_fence_mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->latest_seq < seq) {
+        return;
+    }
+    if (--it->pending == 0) {
+        // Everything recorded has landed: guest memory is authoritative again.
+        label_states.erase(it);
+    }
+}
+
+Liverpool::FenceMatch Liverpool::MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem) {
     if (wait_reg_mem.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
-        return false;
+        return {};
     }
     const VAddr wait_address = wait_reg_mem.Address<VAddr>();
-    std::scoped_lock lk{pending_fence_mutex};
-    for (const auto& write : pending_fence_writes) {
-        if (wait_address < write.address ||
-            wait_address + sizeof(u32) > write.address + write.num_bytes) {
+    // Read outside the lock: the read may fault into a readback that waits on the thread
+    // retiring fences.
+    const u32 memory = *wait_reg_mem.Address();
+    std::scoped_lock lk{recorded_fence_mutex};
+    for (auto& label : label_states) {
+        if (wait_address < label.address ||
+            wait_address + sizeof(u32) > label.address + label.num_bytes) {
             continue;
         }
-        const u32 shift = static_cast<u32>(wait_address - write.address) * 8;
-        if (wait_reg_mem.TestValue(static_cast<u32>(write.value >> shift))) {
-            return true;
+        if (label.overridden) {
+            return {};
+        }
+        const u32 shift = static_cast<u32>(wait_address - label.address) * 8;
+        const auto slice = [shift](u64 value) { return static_cast<u32>(value >> shift); };
+        // Guest memory may only hold the value from before the first held back fence, or one
+        // of the recorded values. Anything else was written by someone else (typically the
+        // guest CPU resetting or releasing the label), and that write is newer than the
+        // recorded values: from now on waits on this label poll guest memory.
+        if (std::ranges::none_of(label.known_values,
+                                 [&](u64 known) { return slice(known) == memory; })) {
+            label.overridden = true;
+            if (logged_overrides.insert(label.address).second) {
+                LOG_INFO(Render,
+                         "Fence timeline: label {:#x} changed to {:#x} outside the recorded "
+                         "fences (held back value {:#x}, value before them {:#x}); waits on it "
+                         "poll memory until the next fence",
+                         label.address, memory, slice(label.latest_value),
+                         slice(label.known_values.front()));
+            }
+            return {};
+        }
+        const u32 value = slice(label.latest_value);
+        return {
+            .satisfied = wait_reg_mem.TestValue(value),
+            .gpu_tick = label.gpu_tick,
+            .queue = label.queue,
+            .value = value,
+            .initial = slice(label.known_values.front()),
+        };
+    }
+    return {};
+}
+
+void Liverpool::OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+                                    u32 queue) {
+    if (fence_wait_shortcut >= 3 && rasterizer && rasterizer->CommandStreamBarrier(match.gpu_tick)) {
+        VideoCore::ReadbackStats::OnStreamBarrier();
+    }
+    if (queue != GfxQueueId) {
+        const VAddr address = wait_reg_mem.Address<VAddr>();
+        if (logged_compute_passes.insert(address).second) {
+            LOG_INFO(Render,
+                     "Fence timeline: compute ring {} passed a wait on {:#x} (func={} ref={:#x} "
+                     "mask={:#x}) with value {:#x} recorded by queue {}; memory holds {:#x}, "
+                     "held {:#x} before the fence",
+                     queue - 1, address, static_cast<u32>(wait_reg_mem.function.Value()),
+                     wait_reg_mem.ref, wait_reg_mem.mask, match.value, match.queue,
+                     *wait_reg_mem.Address(), match.initial);
         }
     }
-    return false;
 }
 
 void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue,
@@ -164,9 +254,11 @@ void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char*
     const u32 value = is_memory ? *wait_reg_mem.Address() : regs.reg_array[wait_reg_mem.Reg()];
     std::string pending;
     {
-        std::scoped_lock lk{pending_fence_mutex};
-        for (const auto& write : pending_fence_writes) {
-            pending += fmt::format(" [{:#x}={:#x}]", write.address, write.value);
+        std::scoped_lock lk{recorded_fence_mutex};
+        for (const auto& label : label_states) {
+            pending += fmt::format(" [{:#x}={:#x} q{} pending={}{}]", label.address,
+                                   label.latest_value, label.queue, label.pending,
+                                   label.overridden ? " overridden" : "");
         }
     }
     LOG_WARNING(Render, "Hang check: {} queue waiting >2s on {} {:#x}: value={:#x} func={} ref={:#x} "
@@ -177,8 +269,17 @@ void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char*
                 wait_reg_mem.mask, pending.empty() ? " none" : pending);
 }
 
+void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_start,
+                               bool& reported) {
+    if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
+        return;
+    }
+    reported = true;
+    LOG_WARNING(Render, "Hang check: {} waiting >2s on {}", what, fmt::ptr(address));
+}
+
 void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
-                                          VAddr address, u64 value, u32 num_bytes) {
+                                          VAddr address, u64 value, u32 num_bytes, u32 queue) {
     if (!rasterizer) {
         signal();
         return;
@@ -187,13 +288,51 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
         rasterizer->OnFence(std::move(signal), must_sync);
         return;
     }
-    const u64 id = AddPendingFenceWrite(address, value, num_bytes);
+    const u64 seq = RecordFence(address, value, num_bytes, queue);
     rasterizer->OnFence(
-        [this, id, signal = std::move(signal)]() mutable {
+        [this, address, seq, signal = std::move(signal)]() mutable {
             signal();
-            RemovePendingFenceWrite(id);
+            RetireFence(address, seq);
         },
         must_sync);
+}
+
+bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
+    const VAddr begin = reinterpret_cast<VAddr>(address);
+    {
+        std::scoped_lock lk{recorded_fence_mutex};
+        const bool held_back = std::ranges::any_of(label_states, [&](const LabelState& label) {
+            return label.pending != 0 && label.address < begin + num_bytes &&
+                   begin < label.address + label.num_bytes;
+        });
+        if (!held_back) {
+            return false;
+        }
+    }
+    if (logged_deferred_writes.insert(begin).second) {
+        LOG_INFO(Render,
+                 "Fence timeline: queue {} writes {} bytes to label {:#x} while a fence write to "
+                 "it is held back; the write is queued behind it",
+                 queue, num_bytes, begin);
+    }
+    std::vector<u32> words(data, data + num_bytes / sizeof(u32));
+    u64 value{};
+    std::memcpy(&value, words.data(), std::min<u32>(num_bytes, sizeof(u64)));
+    auto signal = [this, address, words = std::move(words)] {
+        const u32 size = static_cast<u32>(words.size() * sizeof(u32));
+        RunFenceSignal(
+            *this, gpu_id, [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
+            [address, words] {
+                const u32 size = static_cast<u32>(words.size() * sizeof(u32));
+                if (!Core::Memory::Instance()->TryWriteBacking(address, words.data(), size)) {
+                    std::memcpy(address, words.data(), size);
+                }
+            });
+    };
+    const bool is_label = num_bytes == sizeof(u32) || num_bytes == sizeof(u64);
+    SignalFenceAfterReadbacks(std::move(signal), false, is_label ? begin : 0, value,
+                              is_label ? num_bytes : 0, queue);
+    return true;
 }
 
 void Liverpool::ProcessCommands() {
@@ -206,6 +345,7 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        VideoCore::ReadbackStats::CpPhase phase{"guest command (SendCommand)"};
         callback();
     }
 }
@@ -213,6 +353,7 @@ void Liverpool::ProcessCommands() {
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
     gpu_id = std::this_thread::get_id();
+    VideoCore::ReadbackStats::MarkCpThread();
 
     while (!stoken.stop_requested()) {
         {
@@ -265,6 +406,7 @@ void Liverpool::Process(std::stop_token stoken) {
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
+                VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
@@ -378,6 +520,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::ReadbackStats::CpPacket(GfxQueueId, static_cast<u32>(opcode));
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -796,10 +939,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     event_eos->command == PM4CmdEventWriteEos::Command::GdsStore;
                 SignalFenceAfterReadbacks(std::move(signal), is_gds_store,
                                           is_gds_store ? 0 : event_eos->Address<VAddr>(),
-                                          event_eos->DataDWord(), sizeof(u32));
+                                          event_eos->DataDWord(), sizeof(u32), GfxQueueId);
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
+                        VideoCore::ReadbackStats::CpPhase phase{"EOS GDS store (Finish)"};
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
@@ -837,7 +981,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                                                             : 0;
                 SignalFenceAfterReadbacks(std::move(signal), false,
                                           reinterpret_cast<VAddr>(event_eop->Address<u8>()),
-                                          event_eop->DataQWord(), eop_bytes);
+                                          event_eop->DataQWord(), eop_bytes, GfxQueueId);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -883,7 +1027,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
-                    std::memcpy(address, write_data->data, data_size);
+                    if (!DeferWriteBehindFences(address, write_data->data, data_size, GfxQueueId)) {
+                        std::memcpy(address, write_data->data, data_size);
+                    }
                 } else {
                     UNREACHABLE();
                 }
@@ -904,8 +1050,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                    bool reported = false;
+                    bool blocked = false;
                     while (!mem_semaphore->Signaled()) {
+                        blocked = true;
+                        ReportLongSpin("gfx MemSemaphore", mem_semaphore, wait_start, reported);
                         YIELD_GFX();
+                    }
+                    if (blocked) {
+                        VideoCore::ReadbackStats::OnSemaphoreWait(
+                            VideoCore::ReadbackStats::NowNs() - wait_start);
                     }
                     mem_semaphore->Decrement();
                 }
@@ -920,8 +1075,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                bool reported = false;
+                bool blocked = false;
                 while (!rewind->Valid()) {
+                    blocked = true;
+                    ReportLongSpin("gfx Rewind", rewind, wait_start, reported);
                     YIELD_GFX();
+                }
+                if (blocked) {
+                    VideoCore::ReadbackStats::OnSemaphoreWait(VideoCore::ReadbackStats::NowNs() -
+                                                              wait_start);
                 }
                 break;
             }
@@ -939,19 +1103,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 if (!wait_reg_mem->Test(regs.reg_array)) {
-                    if (IsSatisfiedByPendingFence(*wait_reg_mem, false)) {
-                        VideoCore::ReadbackStats::OnRegMemWait(0, true);
-                        break;
-                    }
+                    using VideoCore::ReadbackStats::WaitClass;
                     const u64 wait_start = VideoCore::ReadbackStats::NowNs();
                     bool reported = false;
-                    while (!wait_reg_mem->Test(regs.reg_array) &&
-                           !IsSatisfiedByPendingFence(*wait_reg_mem, false)) {
+                    bool blocked = false;
+                    bool held_back = false;
+                    WaitClass wait_class{};
+                    while (true) {
+                        const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+                        if (match.satisfied && FenceShortcutEnabled(false)) {
+                            OnWaitPassedOnFence(*wait_reg_mem, match, GfxQueueId);
+                            wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                            break;
+                        }
+                        held_back |= match.satisfied;
+                        if (wait_reg_mem->Test(regs.reg_array)) {
+                            wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                            break;
+                        }
+                        blocked = true;
                         ReportLongWait(*wait_reg_mem, "gfx", wait_start, reported);
                         YIELD_GFX();
                     }
-                    VideoCore::ReadbackStats::OnRegMemWait(
-                        VideoCore::ReadbackStats::NowNs() - wait_start, false);
+                    if (VideoCore::ReadbackStats::IsEnabled()) {
+                        VideoCore::ReadbackStats::OnCommandWait(
+                            false, wait_reg_mem->Address<VAddr>(), wait_class,
+                            blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+                    }
                 }
                 break;
             }
@@ -1085,6 +1263,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1235,7 +1414,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
             if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                if (!DeferWriteBehindFences(write_data->Address<void*>(), write_data->data,
+                                            data_size, vqid + 1)) {
+                    std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
+                }
             } else {
                 UNREACHABLE();
             }
@@ -1246,8 +1428,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                bool reported = false;
+                bool blocked = false;
                 while (!mem_semaphore->Signaled()) {
+                    blocked = true;
+                    ReportLongSpin("compute MemSemaphore", mem_semaphore, wait_start, reported);
                     YIELD_ASC(vqid);
+                }
+                if (blocked) {
+                    VideoCore::ReadbackStats::OnSemaphoreWait(VideoCore::ReadbackStats::NowNs() -
+                                                              wait_start);
                 }
                 mem_semaphore->Decrement();
             }
@@ -1257,19 +1448,33 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             if (!wait_reg_mem->Test(regs.reg_array)) {
-                if (IsSatisfiedByPendingFence(*wait_reg_mem, true)) {
-                    VideoCore::ReadbackStats::OnRegMemWait(0, true);
-                    break;
-                }
+                using VideoCore::ReadbackStats::WaitClass;
                 const u64 wait_start = VideoCore::ReadbackStats::NowNs();
                 bool reported = false;
-                while (!wait_reg_mem->Test(regs.reg_array) &&
-                       !IsSatisfiedByPendingFence(*wait_reg_mem, true)) {
+                bool blocked = false;
+                bool held_back = false;
+                WaitClass wait_class{};
+                while (true) {
+                    const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+                    if (match.satisfied && FenceShortcutEnabled(true)) {
+                        OnWaitPassedOnFence(*wait_reg_mem, match, vqid + 1);
+                        wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                        break;
+                    }
+                    held_back |= match.satisfied;
+                    if (wait_reg_mem->Test(regs.reg_array)) {
+                        wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                        break;
+                    }
+                    blocked = true;
                     ReportLongWait(*wait_reg_mem, "compute", wait_start, reported);
                     YIELD_ASC(vqid);
                 }
-                VideoCore::ReadbackStats::OnRegMemWait(VideoCore::ReadbackStats::NowNs() - wait_start,
-                                                       false);
+                if (VideoCore::ReadbackStats::IsEnabled()) {
+                    VideoCore::ReadbackStats::OnCommandWait(
+                        true, wait_reg_mem->Address<VAddr>(), wait_class,
+                        blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+                }
             }
             break;
         }
@@ -1309,7 +1514,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             SignalFenceAfterReadbacks(std::move(signal),
                                       release_data_sel == DataSelect::GdsMemStore,
                                       release_mem->Address<VAddr>(), release_mem->DataQWord(),
-                                      release_bytes);
+                                      release_bytes, vqid + 1);
             break;
         }
         case PM4ItOpcode::EventWrite: {

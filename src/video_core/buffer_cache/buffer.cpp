@@ -251,6 +251,7 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
                 return false;
             }
             const u64 start = ReadbackStats::NowNs();
+            ReadbackStats::CpPhase phase{"stream buffer full, waiting for the GPU"};
             scheduler->Wait(watch.tick);
             ReadbackStats::OnStreamWait(ReadbackStats::NowNs() - start);
         }

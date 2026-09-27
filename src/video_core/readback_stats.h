@@ -93,6 +93,7 @@ enum class CpTime : u32 {
     VulkanCmd,      ///< vkCmd* calls (recording commands, barriers, descriptors, state).
     VulkanSubmit,   ///< vkQueueSubmit.
     VulkanOther,    ///< Command buffer begin/end/allocation, object creation, queries.
+    StreamMemcpy,   ///< The memory copy inside stream copies (nested in BufStreamCopy).
     Count,
 };
 
@@ -228,6 +229,34 @@ void OnShaderCall(const ShaderCall& call);
 
 /// Records a Vulkan queue submission of the rasterizer.
 void OnVkSubmit();
+
+/// Records a submission of the rasterizer's scheduler (command list shape: draws and dispatches
+/// per command buffer).
+void OnRasterizerSubmit();
+
+/// Records a render pass started by the rasterizer's scheduler.
+void OnRenderPassBegin();
+
+/// Records buffer data uploaded from guest memory.
+void OnUpload(u64 bytes);
+
+/// Records pages that became hot (readback_hot_write_pages_enabled) and hot page decays.
+void OnHotPages(u32 count);
+void OnHotPageDecay();
+
+/// Records a buffer created by the buffer cache: the range asked for, the range created, and the
+/// buffers merged into it (their contents are copied on the GPU).
+void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end,
+                     u32 num_merged, u64 merged_bytes, bool stream_leap);
+
+/// Hazards a deferred constant copy (multi-core plan) would have to wait for.
+enum class Hazard : u32 {
+    CpGuestWrite,   ///< The command processor wrote guest memory.
+    CpWriteOverlap, ///< ... overlapping constant data copied in the same command buffer.
+    GpuMarkOverlap, ///< A range marked GPU-written overlaps constant data of the same buffer.
+    Count,
+};
+void OnHazard(Hazard hazard);
 
 /// Records an asynchronous fence and whether it had to submit the command buffer.
 void OnAsyncFence(bool submitted);

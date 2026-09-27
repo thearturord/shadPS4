@@ -75,6 +75,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    if (timing_pool) {
+        VideoCore::ReadbackStats::OnRenderPassBegin();
+    }
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -285,6 +288,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     VideoCore::ReadbackStats::OnVkSubmit();
+    if (timing_pool) {
+        VideoCore::ReadbackStats::OnRasterizerSubmit();
+    }
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 

@@ -82,6 +82,11 @@ public:
 
     void CpSync();
 
+    /// Readback stats: a guest memory write done by the command processor itself.
+    void NoteCpGuestWrite(VAddr addr, u64 size) {
+        buffer_cache.NoteCpGuestWrite(addr, size);
+    }
+
     /// Orders all later GPU work after everything recorded so far, for a command stream wait
     /// that passed because its producer (a fence recorded at `producer_tick`) was already
     /// recorded, not because it finished. Returns whether a barrier was recorded.

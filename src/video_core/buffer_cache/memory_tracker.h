@@ -13,6 +13,7 @@
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/readback_stats.h"
 
 namespace VideoCore {
 
@@ -23,7 +24,22 @@ public:
     static constexpr size_t MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
+    explicit MemoryTracker(PageManager& tracker_)
+        : tracker{&tracker_},
+          hot_pages_enabled{EmulatorSettings.IsReadbackHotWritePagesEnabled()} {}
+
+    /// Forgets hot pages everywhere (see RegionManager::DecayHotPages).
+    void DecayHotPages() {
+        if (!hot_pages_enabled) {
+            return;
+        }
+        for (auto& pool : manager_pool) {
+            for (auto& manager : pool) {
+                std::scoped_lock lk{manager.lock};
+                manager.DecayHotPages();
+            }
+        }
+    }
     ~MemoryTracker() = default;
 
     /// Returns true if a region has been modified from the CPU
@@ -76,6 +92,10 @@ public:
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
                     }
+                    if (const u32 new_hot =
+                            manager->NoteCpuWrite(manager->GetCpuAddr() + offset, size)) {
+                        ReadbackStats::OnHotPages(new_hot);
+                    }
                     manager->template ChangeRegionState<Type::CPU, true>(
                         manager->GetCpuAddr() + offset, size);
                     return false;
@@ -93,7 +113,7 @@ public:
                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
                                manager->lock.lock();
                                manager->template ForEachModifiedRange<Type::CPU, true>(
-                                   manager->GetCpuAddr() + offset, size, func);
+                                   manager->GetCpuAddr() + offset, size, func, !is_written);
                                if (!is_written) {
                                    manager->lock.unlock();
                                }
@@ -180,6 +200,7 @@ private:
         // Each manager tracks a 4_MB virtual address space.
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
+        new_manager->SetHotPagesEnabled(hot_pages_enabled);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
     }
@@ -188,6 +209,7 @@ private:
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};
+    bool hot_pages_enabled{};
 };
 
 } // namespace VideoCore

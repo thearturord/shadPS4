@@ -183,6 +183,12 @@ BufferCache::DownloadResult BufferCache::DownloadBufferMemory(Buffer& buffer, VA
 
 void BufferCache::AdvanceHotEpoch() {
     ++hot_epoch;
+    // Pages the CPU stopped rewriting become write-protected again at their next upload.
+    constexpr u64 HotPageLifetime = 1024;
+    if (hot_epoch % HotPageLifetime == 0) {
+        memory_tracker->DecayHotPages();
+        ReadbackStats::OnHotPageDecay();
+    }
 }
 
 void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark) {
@@ -348,6 +354,36 @@ void BufferCache::WaitForDownloads(VAddr device_addr, u64 size) {
     }
     if (ReadbackStats::IsEnabled()) {
         ReadbackStats::OnFinish(ReadbackStats::NowNs() - start);
+    }
+}
+
+void BufferCache::NotePendingStreamSource(VAddr device_addr, u64 size) {
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != pending_stream_tick) {
+        pending_stream_tick = tick;
+        pending_stream_sources.clear();
+        pending_stream_min = ~0ULL;
+        pending_stream_max = 0;
+    }
+    pending_stream_sources.emplace_back(device_addr, device_addr + size);
+    pending_stream_min = std::min<VAddr>(pending_stream_min, device_addr);
+    pending_stream_max = std::max<VAddr>(pending_stream_max, device_addr + size);
+}
+
+bool BufferCache::OverlapsPendingStreamSource(VAddr device_addr, u64 size) {
+    if (scheduler.CurrentTick() != pending_stream_tick || device_addr >= pending_stream_max ||
+        device_addr + size <= pending_stream_min) {
+        return false;
+    }
+    return std::ranges::any_of(pending_stream_sources, [&](const auto& source) {
+        return source.first < device_addr + size && device_addr < source.second;
+    });
+}
+
+void BufferCache::NoteCpGuestWrite(VAddr device_addr, u64 size) {
+    ReadbackStats::OnHazard(ReadbackStats::Hazard::CpGuestWrite);
+    if (OverlapsPendingStreamSource(device_addr, size)) {
+        ReadbackStats::OnHazard(ReadbackStats::Hazard::CpWriteOverlap);
     }
 }
 
@@ -633,6 +669,8 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufStreamCopy};
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
         if (ReadbackStats::IsEnabled()) {
+            // Phase 0 hazard measurement, disabled: its overlap scan cost ~10% of the thread.
+            // NotePendingStreamSource(device_addr, size);
             ReadbackStats::OnStreamCopy(size);
             if (auto* events = ReadbackStats::CpEvents()) {
                 events->stream_copy_bytes += size;
@@ -650,6 +688,10 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufGpuMark};
         if (auto* events = ReadbackStats::CpEvents()) {
             events->gpu_marked_bytes += size;
+            // Phase 0 hazard measurement, disabled.
+            // if (OverlapsPendingStreamSource(device_addr, size)) {
+            //     ReadbackStats::OnHazard(ReadbackStats::Hazard::GpuMarkOverlap);
+            // }
         }
         gpu_modified_ranges.Add(device_addr, size);
     }
@@ -841,6 +883,15 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
     const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
+    if (ReadbackStats::IsEnabled()) {
+        u64 merged_bytes = 0;
+        for (const BufferId overlap_id : overlap.ids) {
+            merged_bytes += slot_buffers[overlap_id].SizeBytes();
+        }
+        ReadbackStats::OnBufferCreated(device_addr, device_addr + wanted_size, overlap.begin,
+                                       overlap.end, static_cast<u32>(overlap.ids.size()),
+                                       merged_bytes, overlap.has_stream_leap);
+    }
     const BufferId new_buffer_id =
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
@@ -920,6 +971,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
     if (src_buffer) {
         if (auto* events = ReadbackStats::CpEvents()) {
             events->upload_bytes += total_size_bytes;
+            ReadbackStats::OnUpload(total_size_bytes);
         }
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();

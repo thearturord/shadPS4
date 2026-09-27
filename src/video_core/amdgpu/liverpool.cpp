@@ -928,6 +928,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
+                        // Phase 0 hazard measurement, disabled.
+                        // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
+                        //     rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
+                        //                                  num_counter_pairs * 16);
+                        // }
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
@@ -1043,6 +1048,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                // Phase 0 hazard measurement, disabled.
+                // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
+                //     rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(address), data_size);
+                // }
                 if (!write_data->wr_one_addr.Value()) {
                     if (!DeferWriteBehindFences(address, write_data->data, data_size, GfxQueueId)) {
                         std::memcpy(address, write_data->data, data_size);
@@ -1433,6 +1442,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            // Phase 0 hazard measurement, disabled.
+            // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
+            //     rasterizer->NoteCpGuestWrite(write_data->Address<VAddr>(), data_size);
+            // }
             if (!write_data->wr_one_addr.Value()) {
                 if (!DeferWriteBehindFences(write_data->Address<void*>(), write_data->data,
                                             data_size, vqid + 1)) {

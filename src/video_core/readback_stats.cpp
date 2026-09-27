@@ -14,10 +14,19 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
+#include "common/string_util.h"
 #include "common/path_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "video_core/readback_stats.h"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 namespace VideoCore::ReadbackStats {
 
@@ -82,6 +91,16 @@ struct Counters {
     std::atomic<u64> present_cpu_ns{};
     std::atomic<u64> presents_timed{};
     std::atomic<u64> stream_copies{};
+    std::atomic<u64> upload_bytes{};
+    std::atomic<u64> hot_pages_new{};
+    std::atomic<u64> hot_decays{};
+    std::atomic<u64> buffers_created{};
+    std::atomic<u64> buffers_merged{};
+    std::atomic<u64> merge_bytes{};
+    std::atomic<u64> render_passes{};
+    std::atomic<u64> cmds_since_submit{};
+    std::array<std::atomic<u64>, 6> submit_hist{};
+    std::array<std::atomic<u64>, static_cast<size_t>(Hazard::Count)> hazards{};
     std::atomic<u64> vk_submits{};
     std::atomic<u64> async_fences{};
     std::atomic<u64> async_fence_submits{};
@@ -142,7 +161,38 @@ constexpr std::array<const char*, static_cast<size_t>(CpTime::Count)> CpTimeName
     "bind buffers",   "bind textures",  "render targets",  "vertex/index", "descriptors",
     "dynamic state",  "begin pass",     "stream copy",     "buffer lookup", "gpu mark",
     "tex find image", "tex view/layout", "tex sampler",    "stats",        "vk cmd",
-    "vk submit",      "vk other",
+    "vk submit",      "vk other",       "stream memcpy",
+};
+
+struct BufferRegionStat {
+    VAddr region{};
+    u64 created{};
+    u64 merged{};
+    u64 merged_bytes{};
+    u64 wanted_bytes{};
+    VAddr min_wanted{~0ULL};
+    VAddr max_wanted{};
+    u64 max_size{};
+    u64 stream_leaps{};
+};
+
+struct BufferCreation {
+    u64 time_ms;
+    VAddr wanted_begin;
+    VAddr wanted_end;
+    VAddr begin;
+    VAddr end;
+    u32 num_merged;
+    u64 merged_bytes;
+    bool stream_leap;
+};
+
+struct ThreadCpuStat {
+    std::string name;
+    u64 last_cpu_100ns{};
+    double sum_pct{};
+    double max_pct{};
+    u32 samples{};
 };
 
 struct ImageStat {
@@ -165,6 +215,10 @@ std::unordered_map<u64, ShaderStat> shader_stats;
 std::unordered_map<VAddr, ImageStat> image_stats;
 std::unordered_map<u64, WaitStat> wait_stats;
 std::unordered_map<u64, ShaderCallStat> shader_call_stats;
+std::unordered_map<VAddr, BufferRegionStat> buffer_region_stats;
+std::vector<BufferCreation> last_buffer_creations; // ring of the last 32
+size_t next_buffer_creation{};
+std::unordered_map<u32, ThreadCpuStat> thread_cpu_stats; // reporter thread only
 
 std::mutex thread_mutex;
 std::condition_variable_any stop_cv;
@@ -367,6 +421,58 @@ void WriteTopReport(u64 elapsed_ns) {
                     : 0.0);
     }
 
+    std::vector<BufferRegionStat> regions;
+    std::vector<BufferCreation> creations;
+    {
+        std::scoped_lock lk{maps_mutex};
+        for (const auto& [_, stat] : buffer_region_stats) {
+            regions.push_back(stat);
+        }
+        for (size_t i = 0; i < last_buffer_creations.size(); ++i) {
+            creations.push_back(
+                last_buffer_creations[(next_buffer_creation + i) % last_buffer_creations.size()]);
+        }
+    }
+    std::ranges::sort(regions, [](const auto& a, const auto& b) { return a.created > b.created; });
+    out += "\n== Buffer creations by 16 MB region (whole run) ==\n";
+    out += fmt::format("{:>14} {:>9} {:>9} {:>10} {:>10} {:>14} {:>14} {:>10} {:>6}\n",
+                       "region", "created", "merged", "merged_MB", "wanted_MB", "min_wanted",
+                       "max_wanted", "max_KB", "leaps");
+    for (size_t i = 0; i < std::min<size_t>(regions.size(), 20); ++i) {
+        const auto& r = regions[i];
+        out += fmt::format("{:#14x} {:>9} {:>9} {:>10.1f} {:>10.1f} {:#14x} {:#14x} {:>10} {:>6}\n",
+                           r.region << 24, r.created, r.merged, Mb(r.merged_bytes),
+                           Mb(r.wanted_bytes), r.min_wanted, r.max_wanted, r.max_size / 1024,
+                           r.stream_leaps);
+    }
+    out += "\n== Last buffer creations ==\n";
+    out += fmt::format("{:>9} {:>14} {:>9} {:>14} {:>10} {:>7} {:>10} {:>5}\n", "time_ms",
+                       "wanted", "wanted_KB", "created", "size_KB", "merged", "merged_KB",
+                       "leap");
+    for (const auto& c : creations) {
+        out += fmt::format("{:>9} {:#14x} {:>9} {:#14x} {:>10} {:>7} {:>10} {:>5}\n", c.time_ms,
+                           c.wanted_begin, (c.wanted_end - c.wanted_begin) / 1024, c.begin,
+                           (c.end - c.begin) / 1024, c.num_merged, c.merged_bytes / 1024,
+                           c.stream_leap ? "yes" : "");
+    }
+
+    std::vector<ThreadCpuStat> threads;
+    for (const auto& [_, stat] : thread_cpu_stats) {
+        if (stat.samples > 0) {
+            threads.push_back(stat);
+        }
+    }
+    std::ranges::sort(threads, [](const auto& a, const auto& b) {
+        return a.sum_pct / a.samples > b.sum_pct / b.samples;
+    });
+    out += "\n== Threads by CPU use, seconds with more than 20,000 draws (100% = one core) ==\n";
+    out += fmt::format("{:>40} {:>8} {:>8} {:>8}\n", "thread", "avg_%", "max_%", "seconds");
+    for (size_t i = 0; i < std::min<size_t>(threads.size(), 30); ++i) {
+        const auto& t = threads[i];
+        out += fmt::format("{:>40} {:>8.1f} {:>8.1f} {:>8}\n", t.name.substr(0, 40),
+                           t.sum_pct / t.samples, t.max_pct, t.samples);
+    }
+
     out += "\n== Where the time of the top 25 shaders goes (per call) ==\n";
     for (size_t i = 0; i < std::min<size_t>(shader_calls.size(), 25); ++i) {
         const auto& s = shader_calls[i];
@@ -407,6 +513,56 @@ void WriteTopReport(u64 elapsed_ns) {
     file << out;
 }
 
+/// CPU use of every thread of the process during the last interval (Windows only).
+void SampleThreads(u64 interval_ns, bool heavy_second) {
+#ifdef _WIN32
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    const DWORD pid = GetCurrentProcessId();
+    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != pid) {
+            continue;
+        }
+        const HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+        if (!thread) {
+            continue;
+        }
+        FILETIME creation, exit, kernel, user;
+        if (GetThreadTimes(thread, &creation, &exit, &kernel, &user)) {
+            const auto to_u64 = [](const FILETIME& t) {
+                return (u64{t.dwHighDateTime} << 32) | t.dwLowDateTime;
+            };
+            const u64 cpu = to_u64(kernel) + to_u64(user);
+            auto [it, inserted] = thread_cpu_stats.try_emplace(entry.th32ThreadID);
+            auto& stat = it->second;
+            if (inserted || stat.name.empty()) {
+                PWSTR name = nullptr;
+                if (SUCCEEDED(GetThreadDescription(thread, &name)) && name) {
+                    stat.name = Common::UTF16ToUTF8(name);
+                    LocalFree(name);
+                }
+                if (stat.name.empty()) {
+                    stat.name = fmt::format("thread {}", entry.th32ThreadID);
+                }
+            }
+            if (!inserted && heavy_second && interval_ns > 0 && cpu >= stat.last_cpu_100ns) {
+                const double pct = 100.0 * static_cast<double>(cpu - stat.last_cpu_100ns) * 100.0 /
+                                   static_cast<double>(interval_ns);
+                stat.sum_pct += pct;
+                stat.max_pct = std::max(stat.max_pct, pct);
+                ++stat.samples;
+            }
+            stat.last_cpu_100ns = cpu;
+        }
+        CloseHandle(thread);
+    }
+    CloseHandle(snapshot);
+#endif
+}
+
 void ReporterThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:ReadbackStats");
 
@@ -425,8 +581,13 @@ void ReporterThread(std::stop_token stoken) {
            "rec_bind_buffers_ms,rec_bind_textures_ms,rec_render_targets_ms,rec_vertex_index_ms,"
            "rec_descriptors_ms,rec_dynamic_state_ms,rec_begin_pass_ms,buf_stream_copy_ms,"
            "buf_lookup_ms,buf_gpu_mark_ms,tex_find_image_ms,tex_view_layout_ms,tex_sampler_ms,"
-           "stats_overhead_ms,vk_cmd_ms,vk_submit_ms,vk_other_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
-           "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits\n";
+           "stats_overhead_ms,vk_cmd_ms,vk_submit_ms,vk_other_ms,stream_memcpy_ms,"
+           "cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
+           "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits,"
+           "upload_MB,hot_pages_new,hot_decays,buffers_created,buffers_merged,merge_MB,"
+           "render_passes,submit_cmds_0,submit_cmds_1_7,submit_cmds_8_31,submit_cmds_32_127,"
+           "submit_cmds_128_511,submit_cmds_512p,cp_guest_writes,cp_write_overlaps,"
+           "gpu_mark_overlaps\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -445,6 +606,8 @@ void ReporterThread(std::stop_token stoken) {
         const u64 idle = take(counters.gpu_idle_ns);
         const double busy =
             interval ? 100.0 * (1.0 - std::min(1.0, static_cast<double>(idle) / interval)) : 0.0;
+
+        SampleThreads(interval, counters.draws.load() >= 20000);
 
         // Stall watchdog: the command processor is busy but records nothing.
         const bool no_work = counters.submits.load() == 0 && counters.draws.load() == 0 &&
@@ -485,6 +648,19 @@ void ReporterThread(std::stop_token stoken) {
                                       Mb(take(counters.stream_copy_bytes)),
                                       take(counters.vk_submits), take(counters.async_fences),
                                       take(counters.async_fence_submits));
+            cp_columns += fmt::format(",{:.2f},{},{},{},{},{:.2f},{}",
+                                      Mb(take(counters.upload_bytes)),
+                                      take(counters.hot_pages_new), take(counters.hot_decays),
+                                      take(counters.buffers_created),
+                                      take(counters.buffers_merged),
+                                      Mb(take(counters.merge_bytes)),
+                                      take(counters.render_passes));
+            for (auto& bucket : counters.submit_hist) {
+                cp_columns += fmt::format(",{}", take(bucket));
+            }
+            for (auto& hazard : counters.hazards) {
+                cp_columns += fmt::format(",{}", take(hazard));
+            }
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -556,10 +732,12 @@ void OnSubmit() {
 
 void OnDraw() {
     counters.draws.fetch_add(1, std::memory_order_relaxed);
+    counters.cmds_since_submit.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnDispatch() {
     counters.dispatches.fetch_add(1, std::memory_order_relaxed);
+    counters.cmds_since_submit.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnFault(bool is_write, u64 handler_ns) {
@@ -693,6 +871,76 @@ void OnShaderCall(const ShaderCall& call) {
         stat.category_ns[i] += call.category_ns[i];
     }
     stat.events += call.events;
+}
+
+void OnRasterizerSubmit() {
+    const u64 commands = counters.cmds_since_submit.exchange(0, std::memory_order_relaxed);
+    const size_t bucket = commands == 0     ? 0
+                          : commands < 8    ? 1
+                          : commands < 32   ? 2
+                          : commands < 128  ? 3
+                          : commands < 512  ? 4
+                                            : 5;
+    counters.submit_hist[bucket].fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnRenderPassBegin() {
+    counters.render_passes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnUpload(u64 bytes) {
+    counters.upload_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void OnHotPages(u32 count) {
+    if (IsEnabled()) {
+        counters.hot_pages_new.fetch_add(count, std::memory_order_relaxed);
+    }
+}
+
+void OnHotPageDecay() {
+    if (IsEnabled()) {
+        counters.hot_decays.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end,
+                     u32 num_merged, u64 merged_bytes, bool stream_leap) {
+    counters.buffers_created.fetch_add(1, std::memory_order_relaxed);
+    counters.buffers_merged.fetch_add(num_merged, std::memory_order_relaxed);
+    counters.merge_bytes.fetch_add(merged_bytes, std::memory_order_relaxed);
+    std::scoped_lock lk{maps_mutex};
+    auto& region = buffer_region_stats[wanted_begin >> 24];
+    region.region = wanted_begin >> 24;
+    ++region.created;
+    region.merged += num_merged;
+    region.merged_bytes += merged_bytes;
+    region.wanted_bytes += wanted_end - wanted_begin;
+    region.min_wanted = std::min(region.min_wanted, wanted_begin);
+    region.max_wanted = std::max(region.max_wanted, wanted_begin);
+    region.max_size = std::max<u64>(region.max_size, end - begin);
+    region.stream_leaps += stream_leap ? 1 : 0;
+    const BufferCreation creation{
+        .time_ms = (NowNs() - start_ns) / 1'000'000,
+        .wanted_begin = wanted_begin,
+        .wanted_end = wanted_end,
+        .begin = begin,
+        .end = end,
+        .num_merged = num_merged,
+        .merged_bytes = merged_bytes,
+        .stream_leap = stream_leap,
+    };
+    constexpr size_t MaxCreations = 32;
+    if (last_buffer_creations.size() < MaxCreations) {
+        last_buffer_creations.push_back(creation);
+    } else {
+        last_buffer_creations[next_buffer_creation] = creation;
+        next_buffer_creation = (next_buffer_creation + 1) % MaxCreations;
+    }
+}
+
+void OnHazard(Hazard hazard) {
+    counters.hazards[static_cast<size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnVkSubmit() {

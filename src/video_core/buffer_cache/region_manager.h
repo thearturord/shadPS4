@@ -14,6 +14,8 @@
 #endif
 #include "common/debug.h"
 #include "common/types.h"
+#include <array>
+
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 
@@ -42,6 +44,51 @@ public:
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+    }
+
+    /// Hot pages: pages the CPU rewrites right after nearly every upload. Write-protecting them
+    /// again after each upload only buys a write fault per rewrite, so they stay CPU-modified and
+    /// writable and are uploaded at each use instead. A page used as a GPU write target stops
+    /// being hot. Must be called under the lock.
+    void SetHotPagesEnabled(bool enabled) noexcept {
+        hot_pages_enabled = enabled;
+    }
+
+    /// Counts CPU writes to pages an upload just write-protected again. Returns the number of
+    /// pages that became hot. Must be called under the lock.
+    u32 NoteCpuWrite(u64 dirty_addr, u64 size) noexcept {
+        if (!hot_pages_enabled) {
+            return 0;
+        }
+        const size_t offset = dirty_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page = std::min<size_t>(
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE),
+            NUM_PAGES_PER_REGION);
+        u32 new_hot = 0;
+        for (size_t page = start_page; page < end_page; ++page) {
+            if (!reprotected.Get(page)) {
+                continue;
+            }
+            reprotected.Unset(page);
+            if (refaults[page] < 255) {
+                ++refaults[page];
+            }
+            if (refaults[page] >= HotRefaults && !hot.Get(page)) {
+                hot.Set(page);
+                ++new_hot;
+            }
+        }
+        return new_hot;
+    }
+
+    /// Forgets hot pages and halves the rewrite counts, so pages the CPU stopped rewriting get
+    /// write-protected again at their next upload. Must be called under the lock.
+    void DecayHotPages() noexcept {
+        hot.Clear();
+        for (auto& count : refaults) {
+            count >>= 1;
+        }
     }
 
     VAddr GetCpuAddr() const {
@@ -109,7 +156,8 @@ public:
      * @param func            Function to call for each turned off region
      */
     template <Type type, bool clear>
-    void ForEachModifiedRange(VAddr query_cpu_range, s64 size, auto&& func) {
+    void ForEachModifiedRange(VAddr query_cpu_range, s64 size, auto&& func,
+                              bool keep_hot = false) {
         RENDERER_TRACE;
         const size_t offset = query_cpu_range - cpu_addr;
         const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
@@ -123,11 +171,30 @@ public:
         RegionBits mask(bits, start_page, end_page);
 
         if constexpr (clear) {
-            bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
+                if (hot_pages_enabled) {
+                    RegionBits range;
+                    range.SetRange(start_page, end_page);
+                    if (keep_hot) {
+                        // Uploaded for reading: hot pages stay modified (and writable).
+                        const RegionBits cleared = range & ~hot;
+                        bits &= ~cleared;
+                        reprotected |= mask & cleared;
+                    } else {
+                        // Uploaded before a GPU write: every page goes back to normal tracking.
+                        bits.UnsetRange(start_page, end_page);
+                        hot &= ~range;
+                        reprotected &= ~range;
+                    }
+                } else {
+                    bits.UnsetRange(start_page, end_page);
+                }
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                bits.UnsetRange(start_page, end_page);
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                    UpdateProtection<false, true>();
+                }
             }
         }
 
@@ -183,12 +250,19 @@ private:
         tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
     }
 
+    /// CPU rewrites after an upload before a page becomes hot.
+    static constexpr u8 HotRefaults = 3;
+
     PageManager* tracker;
     VAddr cpu_addr = 0;
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;
+    bool hot_pages_enabled{};
+    RegionBits hot{};         ///< Kept CPU-modified and writable (see SetHotPagesEnabled).
+    RegionBits reprotected{}; ///< Write-protected again by an upload, not rewritten since.
+    std::array<u8, NUM_PAGES_PER_REGION> refaults{}; ///< CPU rewrites after an upload.
 };
 
 } // namespace VideoCore

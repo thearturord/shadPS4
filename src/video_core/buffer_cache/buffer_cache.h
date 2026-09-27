@@ -175,6 +175,11 @@ public:
     /// downloaded. Must run on the GPU thread.
     void UnmarkSettledPages(VAddr device_addr, u64 size);
 
+    /// Measurement for the multi-core plan: a guest memory write by the command processor
+    /// (WriteData, occlusion results, semaphores...). Counts overlaps with constant data copied
+    /// in the current command buffer, which a deferred copy would have to wait for.
+    void NoteCpGuestWrite(VAddr device_addr, u64 size);
+
     /// Returns true if an asynchronous download of part of the range has not landed yet.
     bool IsDownloadInFlight(VAddr device_addr, u64 size);
 
@@ -276,6 +281,13 @@ private:
         u64 id;
     };
     std::vector<InflightDownload> inflight_downloads; // guarded by pending_unmarks_mutex
+    // Stream copy sources of the current command buffer (readback stats only).
+    void NotePendingStreamSource(VAddr device_addr, u64 size);
+    bool OverlapsPendingStreamSource(VAddr device_addr, u64 size);
+    std::vector<std::pair<VAddr, VAddr>> pending_stream_sources;
+    u64 pending_stream_tick{};
+    VAddr pending_stream_min{~0ULL};
+    VAddr pending_stream_max{};
     u64 next_inflight_id{};
     u64 hot_epoch{};
     SplitRangeMap<BufferId> buffer_ranges;

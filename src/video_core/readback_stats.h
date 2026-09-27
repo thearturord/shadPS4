@@ -21,15 +21,28 @@ extern std::atomic<bool> enabled;
 extern std::atomic<u32> cp_packet;
 extern std::atomic<const char*> cp_phase;
 extern thread_local bool is_cp_thread;
+extern thread_local u32 cp_current;
+extern thread_local u64 cp_since;
+extern thread_local u64 cp_packets;
+extern thread_local u32 cp_yield_kind;
+extern std::atomic<u64> cp_time_ns[];
 } // namespace Detail
+
+
+[[nodiscard]] inline bool IsEnabled() noexcept {
+    return Detail::enabled.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline u64 NowNs() noexcept {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
 
 /// Called by the command processor thread once, so phases are only recorded for it.
 inline void MarkCpThread() noexcept {
     Detail::is_cp_thread = true;
-}
-
-[[nodiscard]] inline bool IsEnabled() noexcept {
-    return Detail::enabled.load(std::memory_order_relaxed);
+    Detail::cp_since = NowNs();
 }
 
 /// Records the packet the command processor is working on (queue 0 = graphics, n = compute
@@ -37,8 +50,75 @@ inline void MarkCpThread() noexcept {
 inline void CpPacket(u32 queue, u32 opcode) noexcept {
     if (IsEnabled()) {
         Detail::cp_packet.store((queue << 16) | (opcode & 0xFFFF), std::memory_order_relaxed);
+        ++Detail::cp_packets;
     }
 }
+
+/// Command processor time categories. Time is exclusive: a step nested in another one (an
+/// upload inside a draw, say) only counts for the inner step.
+enum class CpTime : u32 {
+    Other,          ///< Packet parsing, register writes and anything not listed below.
+    Draw,           ///< Recording draws, minus the nested steps below.
+    Dispatch,       ///< Recording dispatches, minus the nested steps below.
+    PipelineLookup, ///< Pipeline key refresh, lookup and compilation.
+    Upload,         ///< Buffer and image uploads.
+    Fence,          ///< EOP/EOS/ReleaseMem: readback copies, submits.
+    SubmitEnd,      ///< End of a guest submission: readbacks and submit.
+    Fault,          ///< Page fault handlers running on the command processor thread.
+    Protect,        ///< Page protection changes.
+    GpuWait,        ///< Waiting for the GPU (Finish, stream buffers, write backs).
+    GuestCommand,   ///< Work sent by guest threads (SendCommand).
+    FlipSleep,      ///< Sleeping on a video out (flip) label.
+    Idle,           ///< Nothing submitted.
+    Count,
+};
+
+/// Measures command processor time for a category (see CpTime). Does nothing on other threads.
+class CpTimer {
+public:
+    explicit CpTimer(CpTime category) noexcept {
+        if (IsEnabled() && Detail::is_cp_thread) {
+            const u64 now = NowNs();
+            Detail::cp_time_ns[Detail::cp_current].fetch_add(now - Detail::cp_since,
+                                                             std::memory_order_relaxed);
+            prev = Detail::cp_current;
+            Detail::cp_current = static_cast<u32>(category);
+            Detail::cp_since = now;
+            active = true;
+        }
+    }
+    ~CpTimer() {
+        if (active) {
+            const u64 now = NowNs();
+            Detail::cp_time_ns[Detail::cp_current].fetch_add(now - Detail::cp_since,
+                                                             std::memory_order_relaxed);
+            Detail::cp_current = prev;
+            Detail::cp_since = now;
+        }
+    }
+    CpTimer(const CpTimer&) = delete;
+    CpTimer& operator=(const CpTimer&) = delete;
+
+private:
+    u32 prev{};
+    bool active{};
+};
+
+/// Called right before a command stream wait yields (`flip` = waiting on a video out label).
+inline void CpWaitYield(bool flip) noexcept {
+    if (Detail::is_cp_thread) {
+        Detail::cp_yield_kind = flip ? 2 : 1;
+    }
+}
+
+/// Records time the command processor spent resuming a queue that only re-checked its wait.
+void OnCpSpin(bool flip, u64 ns);
+
+/// Records GPU execution time of a command buffer of the rasterizer (timestamp queries).
+void OnGpuBusy(u64 ns);
+
+/// Records CPU time of one Presenter::Present call.
+void OnPresentCpu(u64 ns);
 
 /// Marks a potentially blocking step on the command processor thread for the stall watchdog.
 /// Does nothing on other threads.
@@ -71,12 +151,6 @@ enum class WaitClass : u32 {
     Memory,       ///< Blocked on a value no recorded fence writes (guest CPU or shader write).
     Count,
 };
-
-[[nodiscard]] inline u64 NowNs() noexcept {
-    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count());
-}
 
 /// Reads the setting and starts the reporter thread when enabled.
 void Start();

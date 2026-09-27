@@ -16,6 +16,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -325,6 +326,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
@@ -356,6 +358,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     if (!RefreshComputeKey()) {
         return nullptr;
     }

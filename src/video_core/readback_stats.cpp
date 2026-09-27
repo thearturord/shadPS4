@@ -26,6 +26,11 @@ std::atomic<bool> enabled{false};
 std::atomic<u32> cp_packet{};
 std::atomic<const char*> cp_phase{};
 thread_local bool is_cp_thread{};
+thread_local u32 cp_current{};
+thread_local u64 cp_since{};
+thread_local u64 cp_packets{};
+thread_local u32 cp_yield_kind{};
+std::atomic<u64> cp_time_ns[static_cast<u32>(CpTime::Count)]{};
 } // namespace Detail
 
 namespace {
@@ -69,6 +74,11 @@ struct Counters {
     std::atomic<u64> sem_waits{};
     std::atomic<u64> sem_wait_ns{};
     std::atomic<u64> stream_barriers{};
+    std::atomic<u64> cp_spin_ns{};
+    std::atomic<u64> cp_flip_spin_ns{};
+    std::atomic<u64> gpu_busy_ns{};
+    std::atomic<u64> present_cpu_ns{};
+    std::atomic<u64> presents_timed{};
     std::atomic<u64> stream_waits{};
     std::atomic<u64> stream_wait_ns{};
 };
@@ -282,7 +292,11 @@ void ReporterThread(std::stop_token stoken) {
            "batch_MB,batch_wait_ms,regmem_waits,regmem_wait_ms,regmem_shortcuts,stream_waits,"
            "stream_wait_ms,gfx_pass,gfx_producer,gfx_producer_ms,gfx_fence,gfx_fence_ms,"
            "gfx_memory,gfx_memory_ms,cmp_pass,cmp_producer,cmp_producer_ms,cmp_fence,"
-           "cmp_fence_ms,cmp_memory,cmp_memory_ms,sem_waits,sem_wait_ms,stream_barriers\n";
+           "cmp_fence_ms,cmp_memory,cmp_memory_ms,sem_waits,sem_wait_ms,stream_barriers,"
+           "cp_other_ms,cp_draw_ms,cp_dispatch_ms,cp_pipeline_ms,cp_upload_ms,cp_fence_ms,"
+           "cp_submit_end_ms,cp_fault_ms,cp_protect_ms,cp_gpu_wait_ms,cp_guest_cmd_ms,"
+           "cp_flip_sleep_ms,cp_idle_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,"
+           "present_cpu_ms\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -317,6 +331,27 @@ void ReporterThread(std::stop_token stoken) {
         } else {
             stalled_seconds = 0;
         }
+        // Command processor time. Spinning over waiting queues happens in the "other" category,
+        // so it is reported separately and taken out of it.
+        std::string cp_columns;
+        {
+            std::array<u64, static_cast<u32>(CpTime::Count)> cp{};
+            for (u32 i = 0; i < cp.size(); ++i) {
+                cp[i] = Detail::cp_time_ns[i].exchange(0, std::memory_order_relaxed);
+            }
+            const u64 spin = take(counters.cp_spin_ns);
+            const u64 flip_spin = take(counters.cp_flip_spin_ns);
+            cp[0] -= std::min(cp[0], spin + flip_spin);
+            for (const u64 ns : cp) {
+                cp_columns += fmt::format(",{:.2f}", Ms(ns));
+            }
+            const u64 presents_timed = take(counters.presents_timed);
+            cp_columns += fmt::format(",{:.2f},{:.2f},{:.2f},{:.2f}", Ms(spin), Ms(flip_spin),
+                                      Ms(take(counters.gpu_busy_ns)),
+                                      presents_timed ? Ms(take(counters.present_cpu_ns)) /
+                                                           static_cast<double>(presents_timed)
+                                                     : 0.0);
+        }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
             for (u32 c = 0; c < u32(WaitClass::Count); ++c) {
@@ -330,7 +365,7 @@ void ReporterThread(std::stop_token stoken) {
         csv << fmt::format(
             "{:.1f},{},{},{},{},{},{},{:.2f},{},{:.2f},{},{},{},{},{:.2f},{:.2f},{:.2f},{},{:.2f},"
             "{:.2f},{},{:.2f},{:.1f},{},{},{},{:.2f},{:.2f},{},{:.2f},{},{},{:.2f}{},{},{:.2f},"
-            "{}\n",
+            "{}{}\n",
             static_cast<double>(now - start_ns) / 1e9, take(counters.presents),
             take(counters.submits), take(counters.draws), take(counters.dispatches),
             take(counters.read_faults), take(counters.write_faults), Ms(take(counters.fault_ns)),
@@ -346,7 +381,7 @@ void ReporterThread(std::stop_token stoken) {
             take(counters.regmem_waits), Ms(take(counters.regmem_wait_ns)),
             take(counters.regmem_shortcuts), take(counters.stream_waits),
             Ms(take(counters.stream_wait_ns)), wait_columns, take(counters.sem_waits),
-            Ms(take(counters.sem_wait_ns)), take(counters.stream_barriers));
+            Ms(take(counters.sem_wait_ns)), take(counters.stream_barriers), cp_columns);
         csv.flush();
 
         if (++ticks % 5 == 0) {
@@ -504,6 +539,20 @@ void OnSemaphoreWait(u64 wait_ns) {
 
 void OnStreamBarrier() {
     counters.stream_barriers.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnCpSpin(bool flip, u64 ns) {
+    (flip ? counters.cp_flip_spin_ns : counters.cp_spin_ns).fetch_add(ns,
+                                                                      std::memory_order_relaxed);
+}
+
+void OnGpuBusy(u64 ns) {
+    counters.gpu_busy_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void OnPresentCpu(u64 ns) {
+    counters.present_cpu_ns.fetch_add(ns, std::memory_order_relaxed);
+    counters.presents_timed.fetch_add(1, std::memory_order_relaxed);
 }
 
 void OnStreamWait(u64 wait_ns) {

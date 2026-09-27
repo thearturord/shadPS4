@@ -761,6 +761,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     ReadbackStats::CpPhase phase{"image upload (RefreshImage)"};
+    ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Upload};
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));

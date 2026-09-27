@@ -30,6 +30,42 @@ Scheduler::~Scheduler() {
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
+    if (timing_pool) {
+        instance.GetDevice().destroyQueryPool(timing_pool);
+    }
+}
+
+void Scheduler::EnableGpuTiming() {
+    const vk::QueryPoolCreateInfo pool_ci = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = NumTimingSlots * 2,
+    };
+    const auto [result, pool] = instance.GetDevice().createQueryPool(pool_ci);
+    if (result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "GPU timing disabled: createQueryPool failed ({})",
+                    vk::to_string(result));
+        return;
+    }
+    timing_pool = pool;
+    timestamp_period = instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+    LOG_INFO(Render_Vulkan, "GPU timing enabled (timestamp period {} ns)", timestamp_period);
+}
+
+void Scheduler::ReadGpuTiming(u32 slot) {
+    std::array<u64, 2> stamps{};
+    const auto result = instance.GetDevice().getQueryPoolResults(
+        timing_pool, slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+        vk::QueryResultFlagBits::e64);
+    if (result != vk::Result::eSuccess || stamps[1] < stamps[0]) {
+        return;
+    }
+    // Command buffers may overlap on the GPU: only count time not counted already.
+    const u64 start = std::max(stamps[0], last_timing_end);
+    if (stamps[1] > start) {
+        VideoCore::ReadbackStats::OnGpuBusy(
+            static_cast<u64>(static_cast<double>(stamps[1] - start) * timestamp_period));
+    }
+    last_timing_end = std::max(last_timing_end, stamps[1]);
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
@@ -122,6 +158,7 @@ void Scheduler::Finish() {
 
 void Scheduler::Wait(u64 tick) {
     VideoCore::ReadbackStats::CpPhase phase{"waiting for a GPU tick (Scheduler::Wait)"};
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::GpuWait};
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -137,6 +174,7 @@ void Scheduler::WaitPriorityOperations() {
     // Normally this is a short wait for write backs of already completed GPU work. Poll so a
     // wait that never ends gets reported (hang diagnostics).
     VideoCore::ReadbackStats::CpPhase phase{"waiting for priority operations (write backs)"};
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::GpuWait};
     const auto start = std::chrono::steady_clock::now();
     bool reported = false;
     u32 pending;
@@ -169,6 +207,14 @@ void Scheduler::AllocateWorkerCommandBuffers() {
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
 
+    current_timing_slot = -1;
+    if (timing_pool) {
+        current_timing_slot = static_cast<s32>(next_timing_slot++ % NumTimingSlots);
+        current_cmdbuf.resetQueryPool(timing_pool, current_timing_slot * 2, 2);
+        current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timing_pool,
+                                      current_timing_slot * 2);
+    }
+
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
 
@@ -195,6 +241,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     EndRendering();
+    if (current_timing_slot >= 0) {
+        const u32 slot = static_cast<u32>(current_timing_slot);
+        current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing_pool,
+                                      slot * 2 + 1);
+        std::unique_lock lk(pending_ops_mutex);
+        pending_ops.emplace([this, slot] { ReadGpuTiming(slot); }, signal_value);
+    }
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();

@@ -791,6 +791,7 @@ void BufferCache::ChangeRegister(BufferId buffer_id) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size, bool is_written,
                                     bool is_texel_buffer) {
     ReadbackStats::CpPhase phase{"buffer upload (SynchronizeBuffer, holds region locks)"};
+    ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Upload};
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes = 0;
     VAddr buffer_start = buffer.CpuAddr();

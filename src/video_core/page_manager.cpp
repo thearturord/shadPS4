@@ -207,6 +207,7 @@ struct PageManager::Impl {
                    "Attempted to protect region as write-only which is not a valid permission");
         const bool stats = ReadbackStats::IsEnabled();
         const u64 start = stats ? ReadbackStats::NowNs() : 0;
+        ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Protect};
         impl.Protect(address, size, perms);
         if (stats) {
             ReadbackStats::OnProtect(ReadbackStats::NowNs() - start);
@@ -220,6 +221,7 @@ struct PageManager::Impl {
         const u64 start = stats ? ReadbackStats::NowNs() : 0;
         ReadbackStats::CpPhase phase{is_write ? "page fault handler (write)"
                                               : "page fault handler (read)"};
+        ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Fault};
         const bool handled =
             is_write ? rasterizer->InvalidateMemory(addr, 8) : rasterizer->ReadMemory(addr, 8);
         if (stats && handled) {

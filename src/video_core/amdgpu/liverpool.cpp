@@ -271,6 +271,7 @@ void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char*
 
 void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_start,
                                bool& reported) {
+    VideoCore::ReadbackStats::CpWaitYield(false);
     if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
         return;
     }
@@ -280,6 +281,7 @@ void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_s
 
 void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
                                           VAddr address, u64 value, u32 num_bytes, u32 queue) {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Fence};
     if (!rasterizer) {
         signal();
         return;
@@ -346,6 +348,7 @@ void Liverpool::ProcessCommands() {
             --num_commands;
         }
         VideoCore::ReadbackStats::CpPhase phase{"guest command (SendCommand)"};
+        VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::GuestCommand};
         callback();
     }
 }
@@ -357,6 +360,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            VideoCore::ReadbackStats::CpTimer idle_timer{VideoCore::ReadbackStats::CpTime::Idle};
             const u64 idle_start = VideoCore::ReadbackStats::NowNs();
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
@@ -389,7 +393,18 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const bool profile = VideoCore::ReadbackStats::IsEnabled();
+            const u64 resume_start = profile ? VideoCore::ReadbackStats::NowNs() : 0;
+            const u64 packets_before = VideoCore::ReadbackStats::Detail::cp_packets;
+            VideoCore::ReadbackStats::Detail::cp_yield_kind = 0;
             task.resume();
+            if (profile && VideoCore::ReadbackStats::Detail::cp_yield_kind != 0 &&
+                VideoCore::ReadbackStats::Detail::cp_packets == packets_before) {
+                // Only re-checked a wait: time spent cycling over blocked queues.
+                VideoCore::ReadbackStats::OnCpSpin(
+                    VideoCore::ReadbackStats::Detail::cp_yield_kind == 2,
+                    VideoCore::ReadbackStats::NowNs() - resume_start);
+            }
 
             if (task.done()) {
                 task.destroy();
@@ -407,6 +422,8 @@ void Liverpool::Process(std::stop_token stoken) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
+                VideoCore::ReadbackStats::CpTimer timer{
+                    VideoCore::ReadbackStats::CpTime::SubmitEnd};
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
@@ -1099,6 +1116,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    VideoCore::ReadbackStats::CpTimer timer{
+                        VideoCore::ReadbackStats::CpTime::FlipSleep};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
@@ -1123,6 +1142,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                         blocked = true;
                         ReportLongWait(*wait_reg_mem, "gfx", wait_start, reported);
+                        VideoCore::ReadbackStats::CpWaitYield(vo_port->IsVoLabel(wait_addr));
                         YIELD_GFX();
                     }
                     if (VideoCore::ReadbackStats::IsEnabled()) {
@@ -1468,6 +1488,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     }
                     blocked = true;
                     ReportLongWait(*wait_reg_mem, "compute", wait_start, reported);
+                    VideoCore::ReadbackStats::CpWaitYield(false);
                     YIELD_ASC(vqid);
                 }
                 if (VideoCore::ReadbackStats::IsEnabled()) {

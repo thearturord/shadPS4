@@ -230,6 +230,14 @@ transitions without the timeout.
 - **Exit:** readback copies, prefetch MB/s and protect calls down, FPS equal or better. Otherwise
   keep it parked.
 
+**Result (tested on top of phase 3, buffers up to 1 MB):** still much slower. The title screen
+dropped from 60 to 14 FPS as soon as the first 80 KB buffer was shared, and gameplay ran at
+~10 FPS. The command processor was ~5-20% busy, so it was no longer the bottleneck: the GPU
+itself got slow. The buffers the CPU reads back are small but written heavily by shaders
+(likely histograms or counters with atomics), and with shared memory every one of those
+accesses crosses PCIe to system memory. Shared memory stays parked; the right target is data
+the GPU writes once and the CPU reads, which is not what TLG reads back.
+
 ### Phase 5: cleanup
 - Remove superseded paths (old pending-fence list, shortcut levels that lost), update both
   documents, commit as "TLG readback perf 3".

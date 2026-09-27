@@ -441,6 +441,9 @@ public:
     /// already be submitted.
     void WaitPriorityOperations();
 
+    /// Measures GPU execution time of every command buffer (readback stats).
+    void EnableGpuTiming();
+
     static std::mutex submit_mutex;
 
 private:
@@ -449,6 +452,8 @@ private:
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    void ReadGpuTiming(u32 slot);
 
 private:
     const Instance& instance;
@@ -468,6 +473,12 @@ private:
     std::condition_variable_any priority_pending_ops_cv;
     std::atomic<u32> num_priority_ops{};
     std::jthread priority_pending_ops_thread;
+    static constexpr u32 NumTimingSlots = 1024;
+    vk::QueryPool timing_pool{};
+    float timestamp_period{};
+    u32 next_timing_slot{};
+    s32 current_timing_slot{-1};
+    u64 last_timing_end{};
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};

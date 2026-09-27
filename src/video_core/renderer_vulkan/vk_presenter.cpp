@@ -842,6 +842,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     if (!is_reusing_frame) {
         VideoCore::ReadbackStats::OnPresent();
     }
+    struct PresentTimer {
+        u64 start = VideoCore::ReadbackStats::IsEnabled() ? VideoCore::ReadbackStats::NowNs() : 0;
+        ~PresentTimer() {
+            if (start) {
+                VideoCore::ReadbackStats::OnPresentCpu(VideoCore::ReadbackStats::NowNs() - start);
+            }
+        }
+    } present_timer;
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

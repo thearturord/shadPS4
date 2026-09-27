@@ -154,6 +154,25 @@ the command processor is stuck if it stops recording work for 3 s. Spin locks he
 - Result: stable in gameplay, compute fence waits gone (~1.5 s/s to 0), but FPS about the same
   (~29.6 average, median 29). The command processor is still ~97% busy with other work.
 
+### 9. Command processor profile
+`readback_stats.csv` now splits command processor time per second (`cp_*_ms` columns, exclusive
+time), measures GPU execution time with timestamp queries (`gpu_busy_ms`) and the CPU time of
+presenting (`present_cpu_ms`). Gameplay near the gates at ~30 FPS:
+
+| Command processor work | ms per second |
+| :--- | :--- |
+| Recording draws (~68k/s, excluding uploads and pipeline lookup) | ~430 |
+| Recording dispatches (~26k/s) | ~145 |
+| Fence handling | ~110 |
+| Pipeline lookup | ~75 |
+| Waiting for the GPU | ~40-130 |
+| Uploads | ~60 |
+| Page protection | ~30-45 |
+| Idle or spinning on waits | ~5 |
+
+The GPU is only ~31% busy and presentation costs ~0.75 ms per frame. The bottleneck is the
+CPU cost of recording draws (~6 us each), not readbacks anymore.
+
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
   (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of

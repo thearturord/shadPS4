@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -162,6 +165,45 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
         dest += copy_size;
         ++vma;
     }
+}
+
+void MemoryManager::CopyMemoryFast(VAddr virtual_addr, u8* dest, u64 size) {
+    struct MappedArea {
+        VAddr base{};
+        VAddr end{};
+        u64 generation{~0ULL};
+    };
+    // A few recently used areas: stream copies come from a handful of guest heaps.
+    thread_local std::array<MappedArea, 4> areas{};
+    thread_local u32 next_area{};
+
+    const u64 generation = mutex.WriteGeneration();
+    if ((generation & 1) == 0) {
+        for (const auto& area : areas) {
+            if (area.generation == generation && virtual_addr >= area.base &&
+                virtual_addr + size <= area.end) {
+                std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), size);
+                return;
+            }
+        }
+    }
+
+    std::shared_lock lk{mutex};
+    const auto vma = FindVMA(virtual_addr);
+    const VAddr vma_end = vma->second.base + vma->second.size;
+    if (!vma->second.IsMapped() || virtual_addr + size > vma_end) {
+        // Crosses mappings or unmapped memory: take the general path.
+        lk.unlock();
+        CopySparseMemory(virtual_addr, dest, size);
+        return;
+    }
+    // No writer can be active while the shared lock is held, so the generation is stable.
+    areas[next_area++ % areas.size()] = {
+        .base = vma->second.base,
+        .end = vma_end,
+        .generation = mutex.WriteGeneration(),
+    };
+    std::memcpy(dest, std::bit_cast<const u8*>(virtual_addr), size);
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {

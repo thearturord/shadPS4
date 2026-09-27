@@ -186,7 +186,7 @@ public:
         auto* memory = Core::Memory::Instance();
         const VAddr src_vaddr = reinterpret_cast<const VAddr>(src);
         if (memory->IsValidMapping(src_vaddr)) {
-            memory->CopySparseMemory(src_vaddr, data, size);
+            memory->CopyMemoryFast(src_vaddr, data, size);
         } else {
             std::memcpy(data, reinterpret_cast<const void*>(src), size);
         }

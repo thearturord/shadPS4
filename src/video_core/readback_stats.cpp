@@ -79,6 +79,11 @@ struct Counters {
     std::atomic<u64> gpu_busy_ns{};
     std::atomic<u64> present_cpu_ns{};
     std::atomic<u64> presents_timed{};
+    std::atomic<u64> stream_copies{};
+    std::atomic<u64> vk_submits{};
+    std::atomic<u64> async_fences{};
+    std::atomic<u64> async_fence_submits{};
+    std::atomic<u64> stream_copy_bytes{};
     std::atomic<u64> stream_waits{};
     std::atomic<u64> stream_wait_ns{};
 };
@@ -295,8 +300,12 @@ void ReporterThread(std::stop_token stoken) {
            "cmp_fence_ms,cmp_memory,cmp_memory_ms,sem_waits,sem_wait_ms,stream_barriers,"
            "cp_other_ms,cp_draw_ms,cp_dispatch_ms,cp_pipeline_ms,cp_upload_ms,cp_fence_ms,"
            "cp_submit_end_ms,cp_fault_ms,cp_protect_ms,cp_gpu_wait_ms,cp_guest_cmd_ms,"
-           "cp_flip_sleep_ms,cp_idle_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,"
-           "present_cpu_ms\n";
+           "cp_flip_sleep_ms,cp_idle_ms,rec_prepare_ms,rec_compute_checks_ms,"
+           "rec_bind_buffers_ms,rec_bind_textures_ms,rec_render_targets_ms,rec_vertex_index_ms,"
+           "rec_descriptors_ms,rec_dynamic_state_ms,rec_begin_pass_ms,buf_stream_copy_ms,"
+           "buf_lookup_ms,buf_gpu_mark_ms,tex_find_image_ms,tex_view_layout_ms,tex_sampler_ms,"
+           "stats_overhead_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
+           "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -351,6 +360,10 @@ void ReporterThread(std::stop_token stoken) {
                                       presents_timed ? Ms(take(counters.present_cpu_ns)) /
                                                            static_cast<double>(presents_timed)
                                                      : 0.0);
+            cp_columns += fmt::format(",{},{:.2f},{},{},{}", take(counters.stream_copies),
+                                      Mb(take(counters.stream_copy_bytes)),
+                                      take(counters.vk_submits), take(counters.async_fences),
+                                      take(counters.async_fence_submits));
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -544,6 +557,22 @@ void OnStreamBarrier() {
 void OnCpSpin(bool flip, u64 ns) {
     (flip ? counters.cp_flip_spin_ns : counters.cp_spin_ns).fetch_add(ns,
                                                                       std::memory_order_relaxed);
+}
+
+void OnVkSubmit() {
+    counters.vk_submits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnAsyncFence(bool submitted) {
+    counters.async_fences.fetch_add(1, std::memory_order_relaxed);
+    if (submitted) {
+        counters.async_fence_submits.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void OnStreamCopy(u64 bytes) {
+    counters.stream_copies.fetch_add(1, std::memory_order_relaxed);
+    counters.stream_copy_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void OnGpuBusy(u64 ns) {

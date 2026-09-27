@@ -70,6 +70,24 @@ enum class CpTime : u32 {
     GuestCommand,   ///< Work sent by guest threads (SendCommand).
     FlipSleep,      ///< Sleeping on a video out (flip) label.
     Idle,           ///< Nothing submitted.
+    // Steps of recording a draw or dispatch (nested in Draw/Dispatch):
+    Prepare,        ///< Pending operations, draw filtering and render state setup.
+    ComputeChecks,  ///< Checks for compute image copies and metadata/image clears.
+    BindBuffers,    ///< Buffer bindings of all stages (buffer cache lookups).
+    BindTextures,   ///< Texture and sampler bindings of all stages (texture cache lookups).
+    RenderTargets,  ///< Color and depth target lookups (BeginRendering).
+    VertexIndex,    ///< Vertex and index buffer bindings.
+    Descriptors,    ///< Descriptor writes, barriers and push constants.
+    DynamicState,   ///< Dynamic state (viewports, depth, blending...).
+    BeginPass,      ///< Starting or continuing the render pass.
+    // Steps of buffer and texture bindings (nested in BindBuffers/BindTextures):
+    BufStreamCopy,  ///< Copying small read-only buffers into the stream buffer.
+    BufLookup,      ///< GPU-modified checks and buffer cache lookups.
+    BufGpuMark,     ///< Marking written ranges as GPU modified (buffers and textures).
+    TexFindImage,   ///< Texture cache image lookups.
+    TexViewLayout,  ///< Image view lookups and layout transitions.
+    TexSampler,     ///< Sampler lookups.
+    StatsOverhead,  ///< Readback stats bookkeeping (writer attribution).
     Count,
 };
 
@@ -113,6 +131,15 @@ inline void CpWaitYield(bool flip) noexcept {
 
 /// Records time the command processor spent resuming a queue that only re-checked its wait.
 void OnCpSpin(bool flip, u64 ns);
+
+/// Records a Vulkan queue submission of the rasterizer.
+void OnVkSubmit();
+
+/// Records an asynchronous fence and whether it had to submit the command buffer.
+void OnAsyncFence(bool submitted);
+
+/// Records a small read-only buffer copied into the stream buffer at bind time.
+void OnStreamCopy(u64 bytes);
 
 /// Records GPU execution time of a command buffer of the rasterizer (timestamp queries).
 void OnGpuBusy(u64 ns);

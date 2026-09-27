@@ -425,11 +425,21 @@ public:
     /// Operations run in the order they were deferred, in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
         num_priority_ops.fetch_add(1, std::memory_order_acq_rel);
+        u64 max_tick = max_priority_tick.load(std::memory_order_relaxed);
+        while (tick > max_tick &&
+               !max_priority_tick.compare_exchange_weak(max_tick, tick, std::memory_order_acq_rel)) {
+        }
         {
             std::unique_lock lk(priority_pending_ops_mutex);
             priority_pending_ops.emplace(std::move(func), tick);
         }
         priority_pending_ops_cv.notify_one();
+    }
+
+    /// Returns true when a deferred priority operation waits for the command buffer that is
+    /// still being recorded, so it has to be submitted for the operation to ever run.
+    [[nodiscard]] bool PriorityOperationsNeedSubmit() const noexcept {
+        return max_priority_tick.load(std::memory_order_acquire) >= CurrentTick();
     }
 
     /// Returns true when deferred priority operations have not finished running.
@@ -472,6 +482,7 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::atomic<u32> num_priority_ops{};
+    std::atomic<u64> max_priority_tick{};
     std::jthread priority_pending_ops_thread;
     static constexpr u32 NumTimingSlots = 1024;
     vk::QueryPool timing_pool{};

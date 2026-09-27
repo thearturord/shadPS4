@@ -240,6 +240,11 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// Same as CopySparseMemory, for small copies done very often (stream buffer copies at every
+    /// draw). When the range lies in a mapped area this thread already looked up and no mapping
+    /// changed since, it copies without taking the lock or searching the mappings again.
+    void CopyMemoryFast(VAddr source, u8* dest, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

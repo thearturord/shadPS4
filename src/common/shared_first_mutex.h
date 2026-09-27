@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 
 namespace Common {
@@ -16,6 +18,7 @@ public:
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait(lock, [this]() { return !writer_active && readers == 0; });
         writer_active = true;
+        write_generation.fetch_add(1, std::memory_order_acq_rel);
     }
 
     bool try_lock() {
@@ -24,6 +27,7 @@ public:
             return false;
         }
         writer_active = true;
+        write_generation.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
 
@@ -34,13 +38,21 @@ public:
             return false;
         }
         writer_active = true;
+        write_generation.fetch_add(1, std::memory_order_acq_rel);
         return true;
     }
 
     void unlock() {
         std::lock_guard<std::mutex> lock(mtx);
+        write_generation.fetch_add(1, std::memory_order_acq_rel);
         writer_active = false;
         cv.notify_all();
+    }
+
+    /// Odd while a writer holds the lock, and different after every exclusive section, so a
+    /// reader can tell whether anything protected by the lock may have changed (seqlock style).
+    [[nodiscard]] std::uint64_t WriteGeneration() const noexcept {
+        return write_generation.load(std::memory_order_acquire);
     }
 
     void lock_shared() {
@@ -80,6 +92,7 @@ private:
     std::condition_variable cv;
     int readers = 0;
     bool writer_active = false;
+    std::atomic<std::uint64_t> write_generation{};
 };
 
 } // namespace Common

@@ -531,16 +531,26 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
 std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, bool is_written,
                                                   bool is_texel_buffer, BufferId buffer_id) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size)) {
+    const bool use_stream = [&] {
+        ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufLookup};
+        return !is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size);
+    }();
+    if (use_stream) {
+        ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufStreamCopy};
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        if (ReadbackStats::IsEnabled()) {
+            ReadbackStats::OnStreamCopy(size);
+        }
         return {&stream_buffer, offset};
     }
     if (IsBufferInvalid(buffer_id)) {
+        ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufLookup};
         buffer_id = FindBuffer(device_addr, size);
     }
     Buffer& buffer = slot_buffers[buffer_id];
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
+        ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufGpuMark};
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};

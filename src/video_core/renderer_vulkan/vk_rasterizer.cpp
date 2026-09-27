@@ -228,10 +228,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Draw};
 
-    scheduler.PopPendingOperations();
-
-    if (!FilterDraw()) {
-        return;
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        scheduler.PopPendingOperations();
+        if (!FilterDraw()) {
+            return;
+        }
     }
 
     const auto& regs = liverpool->regs;
@@ -240,20 +242,38 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    PrepareRenderState(pipeline);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        PrepareRenderState(pipeline);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const auto state = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::RenderTargets};
+        return BeginRendering(pipeline);
+    }();
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
-    if (is_indexed) {
-        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::VertexIndex};
+        buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+        if (is_indexed) {
+            buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+        }
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Descriptors};
+        pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::DynamicState};
+        UpdateDynamicState(pipeline, is_indexed);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BeginPass};
+        scheduler.BeginRendering(state);
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -282,10 +302,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Draw};
 
-    scheduler.PopPendingOperations();
-
-    if (!FilterDraw()) {
-        return;
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        scheduler.PopPendingOperations();
+        if (!FilterDraw()) {
+            return;
+        }
     }
 
     const DrawIndirectParams params = {
@@ -297,15 +319,24 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    PrepareRenderState(pipeline);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        PrepareRenderState(pipeline);
+    }
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    const auto state = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::RenderTargets};
+        return BeginRendering(pipeline);
+    }();
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
-    if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::VertexIndex};
+        buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+        if (is_indexed) {
+            buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        }
     }
 
     const auto& [buffer, base] =
@@ -328,9 +359,18 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Descriptors};
+        pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::DynamicState};
+        UpdateDynamicState(pipeline, is_indexed);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BeginPass};
+        scheduler.BeginRendering(state);
+    }
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
     // instance offsets will be automatically applied by Vulkan from indirect args buffer.
@@ -371,7 +411,10 @@ void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Dispatch};
 
-    scheduler.PopPendingOperations();
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        scheduler.PopPendingOperations();
+    }
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -388,8 +431,11 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Descriptors};
+        scheduler.EndRendering();
+        pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -405,7 +451,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Dispatch};
 
-    scheduler.PopPendingOperations();
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
+        scheduler.PopPendingOperations();
+    }
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -424,8 +473,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
         buffer_barriers.emplace_back(*barrier);
     }
 
-    scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Descriptors};
+        scheduler.EndRendering();
+        pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
@@ -465,9 +517,12 @@ void Rasterizer::OnSubmit() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
-        return false;
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::ComputeChecks};
+        if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+            IsComputeImageClear(pipeline)) {
+            return false;
+        }
     }
 
     set_write_index = 0;
@@ -488,8 +543,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         stage->PushUd(binding, push_data);
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        {
+            VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BindBuffers};
+            BindBuffers(*stage, binding, push_data);
+        }
+        {
+            VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BindTextures};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 
@@ -676,7 +737,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}", vsharp.GetSize(),
                           size, stage.pgm_hash);
             }
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
+            const auto buffer_id = [&] {
+                VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BufLookup};
+                return buffer_cache.FindBuffer(vsharp.base_address, size);
+            }();
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
             buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
@@ -738,6 +802,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
             if (desc.is_written && VideoCore::ReadbackStats::IsEnabled()) {
+                VideoCore::ReadbackStats::CpTimer t{
+                    VideoCore::ReadbackStats::CpTime::StatsOverhead};
                 VideoCore::ReadbackStats::RecordWriter(vsharp.base_address, size, stage.pgm_hash,
                                                        static_cast<u32>(stage.sw_stage));
             }
@@ -756,6 +822,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_barriers.emplace_back(*barrier);
             }
             if (desc.is_written && desc.is_formatted) {
+                VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BufGpuMark};
                 texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
             }
         }
@@ -823,7 +890,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            {
+                VideoCore::ReadbackStats::CpTimer t{
+                    VideoCore::ReadbackStats::CpTime::TexFindImage};
+                image_id = texture_cache.FindImage(desc);
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -856,6 +927,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             bound_images.emplace_back(image_id);
 
+            VideoCore::ReadbackStats::CpTimer view_timer{
+                VideoCore::ReadbackStats::CpTime::TexViewLayout};
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
 
@@ -917,7 +990,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
+        const auto vk_sampler = [&] {
+            VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::TexSampler};
+            return texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
+        }();
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -1200,8 +1276,11 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) 
     }
     // Without copies there is nothing new to wait for, only earlier fences to stay behind.
     const u64 tick = has_copies ? scheduler.CurrentTick() : scheduler.CurrentTick() - 1;
-    // Always submit: operations queued before this one may wait on the current command buffer,
-    // and the guest may block on this fence without submitting anything else.
+    // Submit when this or an earlier operation waits on the current command buffer: the guest
+    // may block on this fence without submitting anything else. Otherwise every tick waited on
+    // is submitted already and submitting would only cost time.
+    const bool needs_submit = has_copies || scheduler.PriorityOperationsNeedSubmit();
+    VideoCore::ReadbackStats::OnAsyncFence(needs_submit);
     scheduler.DeferPriorityOperation(
         [callbacks = batch.TakeCallbacks(), signal = std::move(signal)]() mutable {
             for (auto& callback : callbacks) {
@@ -1212,7 +1291,9 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) 
             }
         },
         tick);
-    scheduler.Flush();
+    if (needs_submit) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::ProcessDownloadImages() {

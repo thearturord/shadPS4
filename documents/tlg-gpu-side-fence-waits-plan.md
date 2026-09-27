@@ -7,34 +7,94 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 Target: The Last Guardian (CUSA03627) with Precise + linear image readbacks. It builds on
 branch `tlg-readback-perf` (`78d4f381`, `6185087a`) and the notes in
-`documents/tlg-readback-performance.md`.
+`documents/tlg-readback-performance.md`. The status section below tracks what was done; the
+sections after it are the original plan.
 
 ## Status
 
-Phases 0-3 are implemented and tested (level 3 is stable in gameplay). Results in gameplay:
-compute waits on held back fences went from ~1.5 s/s to 0, ~2,700 graphics and ~500 compute
-waits per second pass without blocking, but FPS only moved from ~29 (median 27) to ~29.6
-(median 29): the command processor is still ~97% busy (recording ~2,400 draws and ~900
-dispatches per frame, faults and protects, flip label waits). Two ordering bugs found in testing:
-- **WriteData behind held back fences:** compute rings write a label (`WriteData`, 8 bytes)
-  right after waiting for their own fence on it. The write happened immediately and the held
-  back fence value landed later and overwrote it (`StallUntilSignaled` timeout on
-  `0x7c6056f0`). Such writes are now queued behind the held back fence.
-- **Labels written by someone else:** if guest memory holds a value that is neither the value
-  from before the held back fences nor a recorded one, waits on it poll memory again.
+| Phase | State | Commit |
+| :--- | :--- | :--- |
+| 0. Measure and classify waits | Done | `262aa049` (perf 3) |
+| 1. Label timeline | Done | `262aa049` (perf 3) |
+| 2. GPU barriers at satisfied waits | Done | `262aa049` (perf 3) |
+| 3. Compute queues (`readback_fence_wait_shortcut: 3`) | Done, stable in gameplay | `262aa049` (perf 3) |
+| 4. Shared memory, second try | Tested and parked: slower | branch `tlg-shared-memory-experiment` |
+| 5. Cleanup | Partly (documents updated) | - |
+| 6. Command processor profile (added) | Done | `b443bc0a` (perf 4) |
+| 7. Cheaper draw recording (added) | In progress | uncommitted |
+
+### Phases 0-3: fence waits on the GPU timeline
+- **Result:** compute waits on held back fences went from ~1.5 s/s to 0. ~2,700 graphics and ~500
+  compute waits per second pass without blocking. FPS only moved from ~29 (median 27) to ~29.6
+  (median 29): the waits were not the main cost left (see phase 6).
 - **Phase 0:** waits are classified per queue in `readback_stats.csv` (`gfx_*`, `cmp_*`,
   `sem_*` columns) and per address in `readback_top.txt` ("Command stream waits"). MemSemaphore
   and Rewind spins are timed and have hang checks. A stall watchdog logs the last packet and step
-  of the command processor when it stays busy for 3 s without recording work.
-- **Phase 1:** `recorded_fences` in `Liverpool` is the label timeline. It keeps only the latest
-  value per label, so an older held back value can no longer satisfy a wait meant for a newer
-  one (hypothesis 1 of 5.4). Levels 1 and 2 now use it.
+  of the command processor when it stays busy for 3 s without recording work, and spin locks
+  held for more than 2 s are reported.
+- **Phase 1:** `label_states` in `Liverpool` is the label timeline. It keeps only the latest value
+  per label, so an older held back value can no longer satisfy a wait meant for a newer one.
 - **Phase 2:** `Rasterizer::CommandStreamBarrier` records a full memory barrier when a wait passes
   on a fence whose GPU work hasn't finished. Barriers merge when no work was recorded between
   them.
 - **Phase 3:** `readback_fence_wait_shortcut: 3` = graphics and compute queues plus the barrier.
-  The first compute wait passed per label is logged (`Fence timeline:`) to match against a
-  `StallUntilSignaled` label if the crash comes back.
+- Two ordering bugs found in testing and fixed:
+  - **WriteData behind held back fences:** compute rings write a label (`WriteData`, 8 bytes)
+    right after waiting for their own fence on it. The write happened immediately and the held
+    back fence value landed later and overwrote it (`StallUntilSignaled` timeout on
+    `0x7c6056f0`, the crash level 2 always had). Such writes are now queued behind the fence.
+  - **Labels written by someone else:** if guest memory holds a value that is neither the value
+    from before the held back fences nor a recorded one, waits on it poll memory again.
+
+### Phase 4: shared memory (parked)
+Buffers up to 1 MB that the CPU reads back in 8+ frames were imported as host memory. The title
+screen dropped from 60 to 14 FPS as soon as the first 80 KB buffer was shared, and gameplay ran
+at ~10 FPS, with the command processor mostly idle. The GPU itself got slow: these buffers are
+small but written heavily by shaders (likely histograms or counters), and every access then
+crosses PCIe to system memory. The PS4 has unified memory, a PC does not; copying the data back
+(readbacks) is the right model here.
+
+### Phase 6: where the command processor time goes
+`readback_stats.csv` splits command processor time by category (`cp_*_ms`, exclusive time),
+draw and dispatch recording by step (`rec_*_ms`), bindings by step (`buf_*_ms`, `tex_*_ms`),
+and measures GPU execution time with timestamp queries (`gpu_busy_ms`). Gameplay near the gates:
+
+| Command processor work (ms per second) | Profile | After phase 7 changes |
+| :--- | :--- | :--- |
+| Small read-only buffer copies (stream buffer, ~330k/s) | ~155 | ~147 |
+| Fence handling (~4,800 fences/s) | ~115-129 | ~62 |
+| Texture bindings (image lookup, views, layouts, samplers) | ~105 | ~105 |
+| Pipeline lookup | ~75 | ~75 |
+| Other packet processing | ~70 | ~72 |
+| Draw and dispatch commands | ~100 | ~100 |
+| Uploads | ~50 | ~50 |
+| Prepare, descriptors, render targets, render pass, dynamic state | ~150 | ~150 |
+| Page protection | ~30 | ~31 |
+| Waiting for the GPU | ~10-60 | ~11 |
+| GPU busy (of 1000) | ~300 | ~316 |
+
+Findings: the GPU is ~30% busy and presentation costs ~0.75 ms per frame. The limit is the single
+command processor thread recording ~2,500 draws and ~900 dispatches per frame. Readbacks are no
+longer the main cost.
+
+### Phase 7: cheaper draw recording (uncommitted)
+- **Fewer submits at fences:** an async fence only submits the command buffer when it recorded
+  copies or a priority operation waits on the command buffer being recorded
+  (`Scheduler::PriorityOperationsNeedSubmit`). Vulkan submits went from ~4,800/s to ~740/s and
+  fence handling from ~129 to ~62 ms/s.
+- **Stream copy fast path:** `MemoryManager::CopyMemoryFast` skips the memory manager lock and
+  the mapping lookup when a copy lies in a mapped area this thread already looked up and no
+  mapping changed since (`SharedFirstMutex::WriteGeneration`). Only ~5% gain: the remaining
+  ~0.44 us per copy is memory traffic (reading data the guest CPU just wrote, writing to GPU
+  visible memory).
+- Result with profiling on: 23.6 -> 25.6 FPS in the same scene (+8%).
+
+### Next steps
+1. Measure FPS with `readback_stats_enabled: false` (the profiling timers cost a few percent).
+2. Cut per-draw work where state did not change since the previous draw: pipeline key refresh
+   and lookup, texture/sampler lookups, render target lookups.
+3. Longer term: process compute rings on a second thread, so the ~900 dispatches per frame don't
+   share one CPU core with the ~2,500 draws.
 
 ## 1. Goal and success criteria
 
@@ -270,9 +330,10 @@ the GPU writes once and the CPU reads, which is not what TLG reads back.
 | 4 | Small (code exists) | 1-2 runs |
 | 5 | Small | - |
 
-## 10. Open questions
-- Which labels do TLG's compute rings wait on, and who writes them? (Phase 0)
-- Does TLG rely on `MemSemaphore` or `Rewind` in hot paths? (Phase 0)
-- Is the remaining CP busy time after this plan the command recording itself (~2,800 draws and
-  ~950 dispatches per frame)? If so, the next lever is CPU-side draw recording cost, not
-  synchronization.
+## 10. Open questions (answered)
+- Which labels do TLG's compute rings wait on, and who writes them? Their own ReleaseMem labels
+  (value 1, the label holds 0x11 before) and graphics EOP labels (value 0x10), followed by a
+  `WriteData` to the same label.
+- Does TLG rely on `MemSemaphore` or `Rewind` in hot paths? No, `sem_wait_ms` stays at 0.
+- Is the remaining CP busy time the command recording itself? Yes (phase 6): the next lever is
+  CPU-side draw recording cost, not synchronization.

@@ -173,6 +173,16 @@ presenting (`present_cpu_ms`). Gameplay near the gates at ~30 FPS:
 The GPU is only ~31% busy and presentation costs ~0.75 ms per frame. The bottleneck is the
 CPU cost of recording draws (~6 us each), not readbacks anymore.
 
+### 10. Cheaper recording
+A finer profile (`rec_*`, `buf_*`, `tex_*` columns) showed two hot spots besides the spread out
+per-draw work: ~330k small read-only buffer copies per second (~150 ms/s) and ~4,800 async fences
+per second that each submitted a command buffer (~125 ms/s).
+- Async fences only submit when they recorded copies or a priority operation waits on the command
+  buffer being recorded: submits ~4,800/s -> ~740/s, fence handling ~129 -> ~62 ms/s.
+- Stream buffer copies skip the memory manager lock and mapping lookup when the range lies in an
+  area already looked up and no mapping changed since (~5% cheaper, the rest is memory traffic).
+- 23.6 -> 25.6 FPS in the same scene with profiling on (+8%).
+
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
   (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of

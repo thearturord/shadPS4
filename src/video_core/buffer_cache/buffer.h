@@ -8,9 +8,9 @@
 #include <utility>
 #include <vector>
 #include "common/types.h"
-#include "video_core/readback_stats.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -181,6 +181,11 @@ public:
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
 
+    /// Number of times the buffer wrapped around; earlier offsets may be overwritten after it.
+    u64 WrapCount() const noexcept {
+        return wrap_count;
+    }
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -213,6 +218,7 @@ private:
 private:
     u64 offset{};
     u64 mapped_size{};
+    u64 wrap_count{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

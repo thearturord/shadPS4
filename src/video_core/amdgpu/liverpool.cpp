@@ -100,8 +100,8 @@ static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address
 /// which may be waiting on that thread. If the backing can't be written, the whole signal is
 /// redone on the GPU thread instead.
 template <typename Write, typename Signal>
-static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id,
-                           Write&& try_writes, Signal&& full_signal) {
+static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id, Write&& try_writes,
+                           Signal&& full_signal) {
     if (std::this_thread::get_id() == gpu_id) {
         full_signal();
         return;
@@ -227,7 +227,8 @@ Liverpool::FenceMatch Liverpool::MatchRecordedFence(const PM4CmdWaitRegMem& wait
 
 void Liverpool::OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
                                     u32 queue) {
-    if (fence_wait_shortcut >= 3 && rasterizer && rasterizer->CommandStreamBarrier(match.gpu_tick)) {
+    if (fence_wait_shortcut >= 3 && rasterizer &&
+        rasterizer->CommandStreamBarrier(match.gpu_tick)) {
         VideoCore::ReadbackStats::OnStreamBarrier();
     }
     if (queue != GfxQueueId) {
@@ -256,12 +257,13 @@ void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char*
     {
         std::scoped_lock lk{recorded_fence_mutex};
         for (const auto& label : label_states) {
-            pending += fmt::format(" [{:#x}={:#x} q{} pending={}{}]", label.address,
-                                   label.latest_value, label.queue, label.pending,
-                                   label.overridden ? " overridden" : "");
+            pending +=
+                fmt::format(" [{:#x}={:#x} q{} pending={}{}]", label.address, label.latest_value,
+                            label.queue, label.pending, label.overridden ? " overridden" : "");
         }
     }
-    LOG_WARNING(Render, "Hang check: {} queue waiting >2s on {} {:#x}: value={:#x} func={} ref={:#x} "
+    LOG_WARNING(Render,
+                "Hang check: {} queue waiting >2s on {} {:#x}: value={:#x} func={} ref={:#x} "
                 "mask={:#x}; pending fence writes:{}",
                 queue, is_memory ? "memory" : "register",
                 is_memory ? wait_reg_mem.Address<VAddr>() : VAddr{wait_reg_mem.Reg()}, value,
@@ -323,7 +325,8 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
     auto signal = [this, address, words = std::move(words)] {
         const u32 size = static_cast<u32>(words.size() * sizeof(u32));
         RunFenceSignal(
-            *this, gpu_id, [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
+            *this, gpu_id,
+            [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
             [address, words] {
                 const u32 size = static_cast<u32>(words.size() * sizeof(u32));
                 if (!Core::Memory::Instance()->TryWriteBacking(address, words.data(), size)) {
@@ -928,11 +931,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        // Phase 0 hazard measurement, disabled.
-                        // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
-                        //     rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
-                        //                                  num_counter_pairs * 16);
-                        // }
+                        if (rasterizer) {
+                            rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
+                                                         num_counter_pairs * 16);
+                        }
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
@@ -950,7 +952,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         [&] {
                             bool backed = true;
                             eos.SignalFence([&](void* address, u64 data, u32 num_bytes) {
-                                backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                                backed &=
+                                    TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
                             });
                             return backed;
                         },
@@ -986,7 +989,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             bool backed = true;
                             eop.SignalFence(
                                 [&](void* address, u64 data, u32 num_bytes) {
-                                    backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                                    backed &= TryWriteFenceOffThread(rasterizer, address, data,
+                                                                     num_bytes);
                                 },
                                 [] {});
                             if (backed) {
@@ -1048,10 +1052,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
-                // Phase 0 hazard measurement, disabled.
-                // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
-                //     rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(address), data_size);
-                // }
+                if (rasterizer) {
+                    rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(address), data_size);
+                }
                 if (!write_data->wr_one_addr.Value()) {
                     if (!DeferWriteBehindFences(address, write_data->data, data_size, GfxQueueId)) {
                         std::memcpy(address, write_data->data, data_size);
@@ -1442,10 +1445,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            // Phase 0 hazard measurement, disabled.
-            // if (rasterizer && VideoCore::ReadbackStats::IsEnabled()) {
-            //     rasterizer->NoteCpGuestWrite(write_data->Address<VAddr>(), data_size);
-            // }
+            if (rasterizer) {
+                rasterizer->NoteCpGuestWrite(write_data->Address<VAddr>(), data_size);
+            }
             if (!write_data->wr_one_addr.Value()) {
                 if (!DeferWriteBehindFences(write_data->Address<void*>(), write_data->data,
                                             data_size, vqid + 1)) {
@@ -1528,7 +1530,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         bool backed = true;
                         release.SignalFence(
                             [&](void* address, u64 data, u32 num_bytes) {
-                                backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                                backed &=
+                                    TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
                             },
                             [] {}, [](VAddr, u16, u16) {});
                         if (backed) {
@@ -1545,10 +1548,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32)
                                       : release_data_sel == DataSelect::Data64  ? sizeof(u64)
                                                                                 : 0;
-            SignalFenceAfterReadbacks(std::move(signal),
-                                      release_data_sel == DataSelect::GdsMemStore,
-                                      release_mem->Address<VAddr>(), release_mem->DataQWord(),
-                                      release_bytes, vqid + 1);
+            SignalFenceAfterReadbacks(
+                std::move(signal), release_data_sel == DataSelect::GdsMemStore,
+                release_mem->Address<VAddr>(), release_mem->DataQWord(), release_bytes, vqid + 1);
             break;
         }
         case PM4ItOpcode::EventWrite: {

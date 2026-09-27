@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
+#include <xxhash.h>
 #include "common/alignment.h"
 #include "common/debug.h"
 #include "common/scope_exit.h"
@@ -11,8 +12,8 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
-#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/buffer_cache/readback_batch.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -32,6 +33,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                          PageManager& tracker)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
+      stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
@@ -114,8 +116,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         if (memory_tracker->IsRegionGpuModified(page_start, page_size)) {
             ForEachBufferInRange(page_start, page_size, [&](BufferId, Buffer& other) {
                 const VAddr start = std::max<VAddr>(page_start, other.CpuAddr());
-                const VAddr end =
-                    std::min<VAddr>(page_end, other.CpuAddr() + other.SizeBytes());
+                const VAddr end = std::min<VAddr>(page_end, other.CpuAddr() + other.SizeBytes());
                 if (end > start) {
                     result.bytes += DownloadBufferMemory<false>(other, start, end - start).bytes;
                 }
@@ -164,8 +165,8 @@ BufferCache::DownloadResult BufferCache::DownloadBufferMemory(Buffer& buffer, VA
     if (total_size_bytes == 0) {
         return {};
     }
-    auto write_data = RecordDownloadCopies(buffer, device_addr, size, std::move(copies),
-                                           total_size_bytes, false);
+    auto write_data =
+        RecordDownloadCopies(buffer, device_addr, size, std::move(copies), total_size_bytes, false);
     DownloadResult result{.bytes = total_size_bytes};
     if (auto* events = ReadbackStats::CpEvents(); events && !async) {
         events->readback_bytes += total_size_bytes;
@@ -380,10 +381,49 @@ bool BufferCache::OverlapsPendingStreamSource(VAddr device_addr, u64 size) {
     });
 }
 
+void BufferCache::NoteStreamRepeat(VAddr device_addr, u64 size) {
+    ReadbackStats::CpTimer t{ReadbackStats::CpTime::StatsOverhead};
+    if (!memory->IsValidMapping(device_addr, size)) {
+        return;
+    }
+    const u64 hash = XXH3_64bits(reinterpret_cast<const void*>(device_addr), size);
+    const u64 tick = scheduler.CurrentTick();
+    if (stream_seen.size() > (1u << 20)) {
+        stream_seen.clear();
+    }
+    // Stream copies are at most CACHING_PAGESIZE bytes, so the size fits in the low 16 bits.
+    const u64 key = (device_addr << 16) | size;
+    const auto [it, is_new] = stream_seen.try_emplace(key, StreamSeen{tick, hash});
+    if (is_new) {
+        return;
+    }
+    const bool same = it->second.hash == hash;
+    using ReadbackStats::Reuse;
+    if (it->second.tick == tick) {
+        ReadbackStats::OnReuse(same ? Reuse::StreamRepeatTickSame : Reuse::StreamRepeatTickChanged);
+    } else {
+        ReadbackStats::OnReuse(same ? Reuse::StreamRepeatOldSame : Reuse::StreamRepeatOldChanged);
+    }
+    if (same) {
+        ReadbackStats::OnReuse(Reuse::StreamRepeatSameBytes, size);
+    }
+    it->second = {tick, hash};
+}
+
+void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {
+    if (stream_reuse.empty() || device_addr >= stream_reuse_max ||
+        device_addr + size <= stream_reuse_min) {
+        return;
+    }
+    stream_reuse.clear();
+    stream_reuse_min = ~0ULL;
+    stream_reuse_max = 0;
+    ReadbackStats::OnReuse(ReadbackStats::Reuse::StreamReuseResets);
+}
+
 void BufferCache::NoteCpGuestWrite(VAddr device_addr, u64 size) {
-    ReadbackStats::OnHazard(ReadbackStats::Hazard::CpGuestWrite);
-    if (OverlapsPendingStreamSource(device_addr, size)) {
-        ReadbackStats::OnHazard(ReadbackStats::Hazard::CpWriteOverlap);
+    if (stream_reuse_enabled) {
+        InvalidateStreamReuse(device_addr, size);
     }
 }
 
@@ -548,6 +588,7 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
         if (!IsRegionGpuModified(address, num_bytes)) {
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + num_bytes / sizeof(u32), value);
+            NoteCpGuestWrite(address, num_bytes);
             return;
         }
     }
@@ -570,6 +611,7 @@ void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, 
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            NoteCpGuestWrite(dst, num_bytes);
             return;
         }
         // Without a readback there's nothing we can do with this
@@ -667,10 +709,35 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     }();
     if (use_stream) {
         ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufStreamCopy};
+        // Stream copies are at most CACHING_PAGESIZE bytes, so the size fits in the low 16 bits.
+        const u64 reuse_key = (device_addr << 16) | size;
+        if (stream_reuse_enabled) {
+            const u64 tick = scheduler.CurrentTick();
+            const u64 wraps = stream_buffer.WrapCount();
+            if (tick != stream_reuse_tick || wraps != stream_reuse_wraps) {
+                // A new command buffer: the game may have changed the data since. A wrap of the
+                // stream buffer may overwrite earlier copies.
+                stream_reuse_tick = tick;
+                stream_reuse_wraps = wraps;
+                stream_reuse.clear();
+                stream_reuse_min = ~0ULL;
+                stream_reuse_max = 0;
+            } else if (const auto it = stream_reuse.find(reuse_key); it != stream_reuse.end()) {
+                ReadbackStats::OnReuse(ReadbackStats::Reuse::StreamReused);
+                return {&stream_buffer, it->second};
+            }
+        }
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
+        if (stream_reuse_enabled && stream_buffer.WrapCount() == stream_reuse_wraps) {
+            stream_reuse.emplace(reuse_key, offset);
+            stream_reuse_min = std::min<VAddr>(stream_reuse_min, device_addr);
+            stream_reuse_max = std::max<VAddr>(stream_reuse_max, device_addr + size);
+        }
         if (ReadbackStats::IsEnabled()) {
             // Phase 0 hazard measurement, disabled: its overlap scan cost ~10% of the thread.
             // NotePendingStreamSource(device_addr, size);
+            // Stream repeat measurement, disabled: it hashes every copy (~9% of the thread).
+            // NoteStreamRepeat(device_addr, size);
             ReadbackStats::OnStreamCopy(size);
             if (auto* events = ReadbackStats::CpEvents()) {
                 events->stream_copy_bytes += size;

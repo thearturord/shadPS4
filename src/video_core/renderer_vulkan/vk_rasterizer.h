@@ -140,6 +140,10 @@ private:
         bound_images.clear();
     }
 
+    /// Readback stats: compares a draw or dispatch with the previous one.
+    void NoteDrawReuse(const GraphicsPipeline* pipeline);
+    void NoteDispatchReuse(const ComputePipeline* pipeline);
+
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
@@ -163,6 +167,17 @@ private:
     const bool async_fences;
     u64 recorded_work{};
     u64 last_barrier_work{~0ULL};
+
+    struct ReuseState {
+        const GraphicsPipeline* draw_pipeline{};
+        const ComputePipeline* dispatch_pipeline{};
+        std::array<u32, 0x400> ctx_regs{};
+        std::vector<u8> rt_regs;
+        std::vector<u8> scratch;
+        std::array<AmdGpu::ShaderProgram, 6> programs{};
+        AmdGpu::UserData cs_user_data{};
+    };
+    ReuseState reuse_state;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

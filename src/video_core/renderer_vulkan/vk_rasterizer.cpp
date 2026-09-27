@@ -7,13 +7,13 @@
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/readback_batch.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/buffer_cache/readback_batch.h"
-#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -104,8 +104,7 @@ namespace {
 /// set (the call was recorded, handled or skipped).
 struct ShaderCallScope {
     VideoCore::ReadbackStats::ShaderCall call{};
-    const u64 start =
-        VideoCore::ReadbackStats::IsEnabled() ? VideoCore::ReadbackStats::NowNs() : 0;
+    const u64 start = VideoCore::ReadbackStats::IsEnabled() ? VideoCore::ReadbackStats::NowNs() : 0;
     bool report = false;
     VideoCore::ReadbackStats::CpTimeArray start_times{};
     VideoCore::ReadbackStats::CpEventCounters start_events{};
@@ -162,6 +161,83 @@ struct ShaderCallScope {
 };
 
 } // Anonymous namespace
+
+void Rasterizer::NoteDrawReuse(const GraphicsPipeline* pipeline) {
+    VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StatsOverhead};
+    using VideoCore::ReadbackStats::OnReuse;
+    using VideoCore::ReadbackStats::Reuse;
+    const auto& regs = liverpool->regs;
+    auto& s = reuse_state;
+
+    const bool pipeline_same = s.draw_pipeline == pipeline;
+    s.draw_pipeline = pipeline;
+
+    const u32* ctx = &regs.reg_array[AmdGpu::Regs::ContextRegWordOffset];
+    const bool ctx_same = std::memcmp(s.ctx_regs.data(), ctx, sizeof(s.ctx_regs)) == 0;
+    std::memcpy(s.ctx_regs.data(), ctx, sizeof(s.ctx_regs));
+
+    s.scratch.clear();
+    const auto append = [&](const auto& value) {
+        const auto* bytes = reinterpret_cast<const u8*>(&value);
+        s.scratch.insert(s.scratch.end(), bytes, bytes + sizeof(value));
+    };
+    append(regs.color_buffers);
+    append(regs.depth_buffer);
+    append(regs.color_target_mask);
+    append(regs.color_control);
+    append(regs.depth_render_control);
+    append(regs.depth_control);
+    append(regs.depth_htile_data_base);
+    const bool rt_same = s.scratch == s.rt_regs;
+    std::swap(s.scratch, s.rt_regs);
+
+    bool user_data_same = true;
+    for (u32 stage = 0; stage < s.programs.size(); ++stage) {
+        const auto* program = regs.ProgramForStage(stage);
+        if (std::memcmp(&s.programs[stage], program, sizeof(*program)) != 0) {
+            user_data_same = false;
+            std::memcpy(&s.programs[stage], program, sizeof(*program));
+        }
+    }
+
+    OnReuse(Reuse::DrawChecked);
+    if (pipeline_same) {
+        OnReuse(Reuse::DrawPipelineSame);
+    }
+    if (ctx_same) {
+        OnReuse(Reuse::DrawCtxRegsSame);
+    }
+    if (rt_same) {
+        OnReuse(Reuse::DrawRtRegsSame);
+    }
+    if (user_data_same) {
+        OnReuse(Reuse::DrawUserDataSame);
+    }
+    if (pipeline_same && ctx_same && user_data_same) {
+        OnReuse(Reuse::DrawAllSame);
+    }
+}
+
+void Rasterizer::NoteDispatchReuse(const ComputePipeline* pipeline) {
+    VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StatsOverhead};
+    using VideoCore::ReadbackStats::OnReuse;
+    using VideoCore::ReadbackStats::Reuse;
+    auto& s = reuse_state;
+    const auto& user_data = liverpool->GetCsRegs().user_data;
+
+    const bool pipeline_same = s.dispatch_pipeline == pipeline;
+    s.dispatch_pipeline = pipeline;
+    const bool user_data_same = std::memcmp(&s.cs_user_data, &user_data, sizeof(user_data)) == 0;
+    std::memcpy(&s.cs_user_data, &user_data, sizeof(user_data));
+
+    OnReuse(Reuse::DispatchChecked);
+    if (pipeline_same) {
+        OnReuse(Reuse::DispatchPipelineSame);
+        if (user_data_same) {
+            OnReuse(Reuse::DispatchUserDataSame);
+        }
+    }
+}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
@@ -307,6 +383,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    // Draw reuse measurement, disabled: done (see documents/tlg-readback-performance.md).
+    // if (VideoCore::ReadbackStats::IsEnabled()) {
+    //     NoteDrawReuse(pipeline);
+    // }
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -391,6 +471,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+    // Draw reuse measurement, disabled: done (see documents/tlg-readback-performance.md).
+    // if (VideoCore::ReadbackStats::IsEnabled()) {
+    //     NoteDrawReuse(pipeline);
+    // }
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -500,6 +584,10 @@ void Rasterizer::DispatchDirect() {
     if (!pipeline) {
         return;
     }
+    // Dispatch reuse measurement, disabled: done.
+    // if (VideoCore::ReadbackStats::IsEnabled()) {
+    //     NoteDispatchReuse(pipeline);
+    // }
 
     const auto record_dispatch = [&](VideoCore::ReadbackStats::ShaderCallKind kind, u64 work) {
         if (shader_call.Active()) {
@@ -513,12 +601,14 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
-        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchHle, cs_program.NumWorkgroups());
+        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchHle,
+                        cs_program.NumWorkgroups());
         return;
     }
 
     if (!BindResources(pipeline)) {
-        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchSkipped, cs_program.NumWorkgroups());
+        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchSkipped,
+                        cs_program.NumWorkgroups());
         return;
     }
 
@@ -554,6 +644,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipeline) {
         return;
     }
+    // Dispatch reuse measurement, disabled: done.
+    // if (VideoCore::ReadbackStats::IsEnabled()) {
+    //     NoteDispatchReuse(pipeline);
+    // }
 
     if (!BindResources(pipeline)) {
         return;
@@ -990,8 +1084,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             {
-                VideoCore::ReadbackStats::CpTimer t{
-                    VideoCore::ReadbackStats::CpTime::TexFindImage};
+                VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::TexFindImage};
                 image_id = texture_cache.FindImage(desc);
             }
             auto* image = &texture_cache.GetImage(image_id);

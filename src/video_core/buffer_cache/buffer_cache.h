@@ -8,10 +8,11 @@
 #include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
+#include <tsl/robin_map.h>
 #include "common/lru_cache.h"
-#include "common/unique_function.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
@@ -176,8 +177,7 @@ public:
     void UnmarkSettledPages(VAddr device_addr, u64 size);
 
     /// Measurement for the multi-core plan: a guest memory write by the command processor
-    /// (WriteData, occlusion results, semaphores...). Counts overlaps with constant data copied
-    /// in the current command buffer, which a deferred copy would have to wait for.
+    /// (WriteData, occlusion results, DMA...). Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size);
 
     /// Returns true if an asynchronous download of part of the range has not landed yet.
@@ -221,8 +221,8 @@ private:
     /// Records the copy into download memory. The returned function writes the data back to
     /// guest memory and must only run once the GPU has executed the copy.
     Common::UniqueFunction<void> RecordDownloadCopies(Buffer& buffer, VAddr device_addr, u64 size,
-                                                      DownloadCopies&& copies,
-                                                      u64 total_size_bytes, bool deferred_unmark);
+                                                      DownloadCopies&& copies, u64 total_size_bytes,
+                                                      bool deferred_unmark);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -285,6 +285,23 @@ private:
     void NotePendingStreamSource(VAddr device_addr, u64 size);
     bool OverlapsPendingStreamSource(VAddr device_addr, u64 size);
     std::vector<std::pair<VAddr, VAddr>> pending_stream_sources;
+    /// readback_stream_reuse_enabled: stream copies of the current command buffer by range.
+    /// A copy is only reused while the command buffer, and the stream buffer pass, are the same.
+    const bool stream_reuse_enabled;
+    tsl::robin_map<u64, u64> stream_reuse;
+    u64 stream_reuse_tick{};
+    u64 stream_reuse_wraps{};
+    VAddr stream_reuse_min{~0ULL};
+    VAddr stream_reuse_max{};
+    /// Drops the reusable copies if a guest memory write overlaps them.
+    void InvalidateStreamReuse(VAddr device_addr, u64 size);
+    /// Readback stats: how often a stream copy repeats an earlier one (same range, same data).
+    void NoteStreamRepeat(VAddr device_addr, u64 size);
+    struct StreamSeen {
+        u64 tick;
+        u64 hash;
+    };
+    std::unordered_map<u64, StreamSeen> stream_seen;
     u64 pending_stream_tick{};
     VAddr pending_stream_min{~0ULL};
     VAddr pending_stream_max{};

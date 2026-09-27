@@ -438,6 +438,9 @@ struct GPUSettings {
     // Pages the CPU rewrites right after nearly every upload stay writable and are uploaded at
     // each use, instead of being write-protected again and faulting on the next CPU write.
     Setting<bool> readback_hot_write_pages_enabled{false};
+    // Small read-only buffers copied again in the same command buffer reuse the earlier copy
+    // instead of being copied into the stream buffer again.
+    Setting<bool> readback_stream_reuse_enabled{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -479,6 +482,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_fence_wait_shortcut),
             make_override<GPUSettings>("readback_hot_write_pages_enabled",
                                        &GPUSettings::readback_hot_write_pages_enabled),
+            make_override<GPUSettings>("readback_stream_reuse_enabled",
+                                       &GPUSettings::readback_stream_reuse_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
         };
     }
@@ -488,8 +493,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    readbacks_mode, readback_linear_images_enabled,
                                    direct_memory_access_enabled, readback_stats_enabled,
                                    readback_batching_enabled, readback_async_fences_enabled,
-                                   readback_fence_wait_shortcut,
-                                   readback_hot_write_pages_enabled, dump_shaders, patch_shaders,
+                                   readback_fence_wait_shortcut, readback_hot_write_pages_enabled,
+                                   readback_stream_reuse_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
@@ -774,6 +779,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAsyncFencesEnabled, readback_async_fences_enabled)
     SETTING_FORWARD(m_gpu, ReadbackFenceWaitShortcut, readback_fence_wait_shortcut)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackHotWritePagesEnabled, readback_hot_write_pages_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackStreamReuseEnabled, readback_stream_reuse_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
 
     u32 GetVblankFrequency() {

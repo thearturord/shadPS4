@@ -45,6 +45,8 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
 | `readback_batching_enabled` | Completes image readbacks and recently read back buffers with one GPU wait per fence. |
 | `readback_async_fences_enabled` | Fences are signaled from a background thread once their readbacks are in guest memory, instead of the GPU thread blocking. |
 | `readback_fence_wait_shortcut` | With async fences: 0 = off, 1 = graphics queue `WaitRegMem` may pass for fence values still held back, 2 = graphics and compute, 3 = graphics and compute plus a GPU barrier after each such wait. |
+| `readback_hot_write_pages_enabled` | Pages the CPU rewrites after nearly every upload stay writable and are uploaded at each use. Fewer write faults, but more command thread time: keep off. |
+| `readback_stream_reuse_enabled` | A small read-only buffer bound again in the same command buffer reuses its earlier stream copy. |
 
 ## Steps taken
 
@@ -199,6 +201,26 @@ per second that each submitted a command buffer (~125 ms/s).
 - Also: fetch shaders are parsed once per code address instead of at every draw, and pending
   operations only query the GPU progress when there is one to release (no measurable gain).
   Vulkan call timing (option B study: ~10-13% of the command processor) is off by default.
+
+### 12. Phase 0 measurements, stream copy reuse
+- Phase 0 of the multicore plan: the work an encoder thread could take (Vulkan calls ~10-13%,
+  stream memcpy ~3%) is below the plan's ~20% gate, so the multicore rework is on hold.
+- Hot write pages (`readback_hot_write_pages_enabled`): write faults ~35k -> ~6k/s, but uploads
+  on the command thread +~55 ms/s. The game threads have headroom, the command thread doesn't:
+  off by default.
+- Per draw: render target registers repeat in ~98% of draws, but shader user data and context
+  registers change before nearly every draw (~2% and ~5% identical), so skipping binding or
+  pipeline work per draw has little to gain.
+- Stream copies: ~69% repeat a range already copied in the same command buffer with identical
+  data, and 0.0% of those repeats had changed data. `readback_stream_reuse_enabled` reuses the
+  earlier copy; the table is dropped on a new command buffer, a stream buffer wrap, or a command
+  processor write to guest memory (WriteData, occlusion results, CPU-side DMA). GPU-written ranges
+  never take the stream path. Result: ~70% of stream copies skipped, stream copy time 134 -> 57
+  ms/s, ~8% more draws per second on the command thread, better 1% lows.
+- **Pending:** test the spear sequence (start of the game) with stream reuse on.
+- Resolution: dropping the 4K patch raised FPS although the GPU was only ~37% busy. The game waits
+  on GPU results (readbacks, fences, `WaitRegMem`) inside every frame, so GPU frame time is partly
+  on the critical path: command thread GPU waits ~16 -> ~2 ms/s, idle ~45 -> ~12 ms/s.
 
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences

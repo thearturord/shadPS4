@@ -194,6 +194,7 @@ std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) 
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
+        ++wrap_count;
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);

@@ -29,7 +29,6 @@ extern thread_local u32 cp_yield_kind;
 extern std::atomic<u64> cp_time_ns[];
 } // namespace Detail
 
-
 [[nodiscard]] inline bool IsEnabled() noexcept {
     return Detail::enabled.load(std::memory_order_relaxed);
 }
@@ -72,28 +71,28 @@ enum class CpTime : u32 {
     FlipSleep,      ///< Sleeping on a video out (flip) label.
     Idle,           ///< Nothing submitted.
     // Steps of recording a draw or dispatch (nested in Draw/Dispatch):
-    Prepare,        ///< Pending operations, draw filtering and render state setup.
-    ComputeChecks,  ///< Checks for compute image copies and metadata/image clears.
-    BindBuffers,    ///< Buffer bindings of all stages (buffer cache lookups).
-    BindTextures,   ///< Texture and sampler bindings of all stages (texture cache lookups).
-    RenderTargets,  ///< Color and depth target lookups (BeginRendering).
-    VertexIndex,    ///< Vertex and index buffer bindings.
-    Descriptors,    ///< Descriptor writes, barriers and push constants.
-    DynamicState,   ///< Dynamic state (viewports, depth, blending...).
-    BeginPass,      ///< Starting or continuing the render pass.
+    Prepare,       ///< Pending operations, draw filtering and render state setup.
+    ComputeChecks, ///< Checks for compute image copies and metadata/image clears.
+    BindBuffers,   ///< Buffer bindings of all stages (buffer cache lookups).
+    BindTextures,  ///< Texture and sampler bindings of all stages (texture cache lookups).
+    RenderTargets, ///< Color and depth target lookups (BeginRendering).
+    VertexIndex,   ///< Vertex and index buffer bindings.
+    Descriptors,   ///< Descriptor writes, barriers and push constants.
+    DynamicState,  ///< Dynamic state (viewports, depth, blending...).
+    BeginPass,     ///< Starting or continuing the render pass.
     // Steps of buffer and texture bindings (nested in BindBuffers/BindTextures):
-    BufStreamCopy,  ///< Copying small read-only buffers into the stream buffer.
-    BufLookup,      ///< GPU-modified checks and buffer cache lookups.
-    BufGpuMark,     ///< Marking written ranges as GPU modified (buffers and textures).
-    TexFindImage,   ///< Texture cache image lookups.
-    TexViewLayout,  ///< Image view lookups and layout transitions.
-    TexSampler,     ///< Sampler lookups.
-    StatsOverhead,  ///< Readback stats bookkeeping (writer attribution).
+    BufStreamCopy, ///< Copying small read-only buffers into the stream buffer.
+    BufLookup,     ///< GPU-modified checks and buffer cache lookups.
+    BufGpuMark,    ///< Marking written ranges as GPU modified (buffers and textures).
+    TexFindImage,  ///< Texture cache image lookups.
+    TexViewLayout, ///< Image view lookups and layout transitions.
+    TexSampler,    ///< Sampler lookups.
+    StatsOverhead, ///< Readback stats bookkeeping (writer attribution).
     // Time inside the Vulkan driver (nested anywhere above):
-    VulkanCmd,      ///< vkCmd* calls (recording commands, barriers, descriptors, state).
-    VulkanSubmit,   ///< vkQueueSubmit.
-    VulkanOther,    ///< Command buffer begin/end/allocation, object creation, queries.
-    StreamMemcpy,   ///< The memory copy inside stream copies (nested in BufStreamCopy).
+    VulkanCmd,    ///< vkCmd* calls (recording commands, barriers, descriptors, state).
+    VulkanSubmit, ///< vkQueueSubmit.
+    VulkanOther,  ///< Command buffer begin/end/allocation, object creation, queries.
+    StreamMemcpy, ///< The memory copy inside stream copies (nested in BufStreamCopy).
     Count,
 };
 
@@ -246,8 +245,8 @@ void OnHotPageDecay();
 
 /// Records a buffer created by the buffer cache: the range asked for, the range created, and the
 /// buffers merged into it (their contents are copied on the GPU).
-void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end,
-                     u32 num_merged, u64 merged_bytes, bool stream_leap);
+void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end, u32 num_merged,
+                     u64 merged_bytes, bool stream_leap);
 
 /// Hazards a deferred constant copy (multi-core plan) would have to wait for.
 enum class Hazard : u32 {
@@ -257,6 +256,29 @@ enum class Hazard : u32 {
     Count,
 };
 void OnHazard(Hazard hazard);
+
+/// How much per-draw work repeats the previous call (to size skip-unchanged optimizations).
+enum class Reuse : u32 {
+    DrawChecked,             ///< Draws compared with the previous draw.
+    DrawPipelineSame,        ///< ... same pipeline.
+    DrawCtxRegsSame,         ///< ... identical context registers (all 1024).
+    DrawRtRegsSame,          ///< ... identical render target registers.
+    DrawUserDataSame,        ///< ... identical shader programs and user data of all stages.
+    DrawAllSame,             ///< ... same pipeline, context registers and user data.
+    DispatchChecked,         ///< Dispatches compared with the previous dispatch.
+    DispatchPipelineSame,    ///< ... same pipeline.
+    DispatchUserDataSame,    ///< ... same pipeline and identical user data.
+    StreamRepeatTickSame,    ///< Stream copy of a range already copied in this command buffer,
+                             ///< with identical data.
+    StreamRepeatTickChanged, ///< ... with different data.
+    StreamRepeatOldSame, ///< Stream copy of a range copied in an older command buffer, same data.
+    StreamRepeatOldChanged, ///< ... with different data.
+    StreamRepeatSameBytes,  ///< Bytes of stream copies with identical data (reported in MB).
+    StreamReused,           ///< Stream copies skipped by readback_stream_reuse_enabled.
+    StreamReuseResets,      ///< Reuse tables dropped by a command processor write to guest memory.
+    Count,
+};
+void OnReuse(Reuse reuse, u64 amount = 1);
 
 /// Records an asynchronous fence and whether it had to submit the command buffer.
 void OnAsyncFence(bool submitted);

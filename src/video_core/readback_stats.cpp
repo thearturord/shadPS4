@@ -14,8 +14,8 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
-#include "common/string_util.h"
 #include "common/path_util.h"
+#include "common/string_util.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "video_core/readback_stats.h"
@@ -24,8 +24,10 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// clang-format off
 #include <windows.h>
 #include <tlhelp32.h>
+// clang-format on
 #endif
 
 namespace VideoCore::ReadbackStats {
@@ -101,6 +103,7 @@ struct Counters {
     std::atomic<u64> cmds_since_submit{};
     std::array<std::atomic<u64>, 6> submit_hist{};
     std::array<std::atomic<u64>, static_cast<size_t>(Hazard::Count)> hazards{};
+    std::array<std::atomic<u64>, static_cast<size_t>(Reuse::Count)> reuse{};
     std::atomic<u64> vk_submits{};
     std::atomic<u64> async_fences{};
     std::atomic<u64> async_fence_submits{};
@@ -155,13 +158,15 @@ struct ShaderCallStat {
 };
 
 constexpr std::array<const char*, static_cast<size_t>(CpTime::Count)> CpTimeNames = {
-    "other",          "draw itself",    "dispatch itself", "pipeline",     "upload",
-    "fence",          "submit end",     "fault",           "protect",      "gpu wait",
-    "guest cmd",      "flip sleep",     "idle",            "prepare",      "compute checks",
-    "bind buffers",   "bind textures",  "render targets",  "vertex/index", "descriptors",
-    "dynamic state",  "begin pass",     "stream copy",     "buffer lookup", "gpu mark",
-    "tex find image", "tex view/layout", "tex sampler",    "stats",        "vk cmd",
-    "vk submit",      "vk other",       "stream memcpy",
+    "other",         "draw itself",    "dispatch itself", "pipeline",
+    "upload",        "fence",          "submit end",      "fault",
+    "protect",       "gpu wait",       "guest cmd",       "flip sleep",
+    "idle",          "prepare",        "compute checks",  "bind buffers",
+    "bind textures", "render targets", "vertex/index",    "descriptors",
+    "dynamic state", "begin pass",     "stream copy",     "buffer lookup",
+    "gpu mark",      "tex find image", "tex view/layout", "tex sampler",
+    "stats",         "vk cmd",         "vk submit",       "vk other",
+    "stream memcpy",
 };
 
 struct BufferRegionStat {
@@ -317,15 +322,12 @@ void WriteTopReport(u64 elapsed_ns) {
             images.push_back(stat);
         }
     }
-    std::ranges::sort(buffers, [](const auto& a, const auto& b) {
-        return a.blocked_ns > b.blocked_ns;
-    });
-    std::ranges::sort(shaders, [](const auto& a, const auto& b) {
-        return a.blocked_ns > b.blocked_ns;
-    });
-    std::ranges::sort(images, [](const auto& a, const auto& b) {
-        return a.finish_ns > b.finish_ns;
-    });
+    std::ranges::sort(buffers,
+                      [](const auto& a, const auto& b) { return a.blocked_ns > b.blocked_ns; });
+    std::ranges::sort(shaders,
+                      [](const auto& a, const auto& b) { return a.blocked_ns > b.blocked_ns; });
+    std::ranges::sort(images,
+                      [](const auto& a, const auto& b) { return a.finish_ns > b.finish_ns; });
     std::ranges::sort(waits, [](const auto& a, const auto& b) {
         if (a.total_ns != b.total_ns) {
             return a.total_ns > b.total_ns;
@@ -339,8 +341,8 @@ void WriteTopReport(u64 elapsed_ns) {
 
     out += "== Buffers ==\n";
     out += fmt::format("{:>18} {:>10} {:>18} {:>7} {:>8} {:>8} {:>8} {:>10} {:>12} {:>12}\n",
-                       "base", "size", "writer_hash", "stage", "count", "on_read", "on_write",
-                       "MB", "blocked_ms", "gpu_wait_ms");
+                       "base", "size", "writer_hash", "stage", "count", "on_read", "on_write", "MB",
+                       "blocked_ms", "gpu_wait_ms");
     for (size_t i = 0; i < std::min<size_t>(buffers.size(), 40); ++i) {
         const auto& b = buffers[i];
         out += fmt::format("{:#18x} {:>10} {:#18x} {:>7} {:>8} {:>8} {:>8} {:>10.2f} {:>12.1f} "
@@ -354,8 +356,8 @@ void WriteTopReport(u64 elapsed_ns) {
                        "blocked_ms");
     for (size_t i = 0; i < std::min<size_t>(shaders.size(), 40); ++i) {
         const auto& s = shaders[i];
-        out += fmt::format("{:#18x} {:>7} {:>8} {:>10.2f} {:>12.1f}\n", s.hash,
-                           StageName(s.stage), s.count, Mb(s.bytes), Ms(s.blocked_ns));
+        out += fmt::format("{:#18x} {:>7} {:>8} {:>10.2f} {:>12.1f}\n", s.hash, StageName(s.stage),
+                           s.count, Mb(s.bytes), Ms(s.blocked_ns));
     }
 
     out += "\n== Linear images ==\n";
@@ -372,8 +374,8 @@ void WriteTopReport(u64 elapsed_ns) {
     out += "pass = passed on a recorded fence, producer = waited for another ring to record it,\n"
            "fence = waited for a held back fence to land, memory = value not written by a fence\n";
     out += fmt::format("{:>18} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11} {:>11} {:>11}\n", "address",
-                       "queue", "pass", "producer", "fence", "memory", "producer_ms",
-                       "fence_ms", "memory_ms");
+                       "queue", "pass", "producer", "fence", "memory", "producer_ms", "fence_ms",
+                       "memory_ms");
     for (size_t i = 0; i < std::min<size_t>(waits.size(), 40); ++i) {
         const auto& w = waits[i];
         out += fmt::format("{:#18x} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11.1f} {:>11.1f} {:>11.1f}\n",
@@ -381,9 +383,8 @@ void WriteTopReport(u64 elapsed_ns) {
                            w.count[2], w.count[3], Ms(w.ns[1]), Ms(w.ns[2]), Ms(w.ns[3]));
     }
 
-    std::ranges::sort(shader_calls, [](const auto& a, const auto& b) {
-        return a.total_ns > b.total_ns;
-    });
+    std::ranges::sort(shader_calls,
+                      [](const auto& a, const auto& b) { return a.total_ns > b.total_ns; });
     const double seconds = std::max(1.0, static_cast<double>(elapsed_ns) / 1e9);
     u64 all_ns = 0;
     u64 all_calls = 0;
@@ -391,9 +392,9 @@ void WriteTopReport(u64 elapsed_ns) {
         all_ns += s.total_ns;
         all_calls += s.count;
     }
-    out += fmt::format(
-        "\n== Shaders by command processor time (whole run: {} shaders, {} calls, {:.1f} ms/s) ==\n",
-        shader_calls.size(), all_calls, Ms(all_ns) / seconds);
+    out += fmt::format("\n== Shaders by command processor time (whole run: {} shaders, {} calls, "
+                       "{:.1f} ms/s) ==\n",
+                       shader_calls.size(), all_calls, Ms(all_ns) / seconds);
     out += "time includes everything done for the call (bindings, uploads, faults); work = "
            "workgroups for dispatches, vertices x instances for draws (0 = indirect); "
            "bufs/imgs = bound (written/storage); rt = color targets (+d = depth)\n";
@@ -411,8 +412,7 @@ void WriteTopReport(u64 elapsed_ns) {
             "{:>5} {:>6.1f}\n",
             ShaderCallKindName(c.kind), c.hash, c.ps_hash, s.count,
             static_cast<double>(s.count) / seconds, Ms(s.total_ns) / seconds,
-            all_ns ? 100.0 * static_cast<double>(cumulative_ns) / static_cast<double>(all_ns)
-                   : 0.0,
+            all_ns ? 100.0 * static_cast<double>(cumulative_ns) / static_cast<double>(all_ns) : 0.0,
             s.count ? s.total_work / s.count : 0, c.threads_per_group,
             fmt::format("{}({})", c.buffers, c.written_buffers),
             fmt::format("{}({})", c.images, c.storage_images),
@@ -435,20 +435,19 @@ void WriteTopReport(u64 elapsed_ns) {
     }
     std::ranges::sort(regions, [](const auto& a, const auto& b) { return a.created > b.created; });
     out += "\n== Buffer creations by 16 MB region (whole run) ==\n";
-    out += fmt::format("{:>14} {:>9} {:>9} {:>10} {:>10} {:>14} {:>14} {:>10} {:>6}\n",
-                       "region", "created", "merged", "merged_MB", "wanted_MB", "min_wanted",
-                       "max_wanted", "max_KB", "leaps");
+    out += fmt::format("{:>14} {:>9} {:>9} {:>10} {:>10} {:>14} {:>14} {:>10} {:>6}\n", "region",
+                       "created", "merged", "merged_MB", "wanted_MB", "min_wanted", "max_wanted",
+                       "max_KB", "leaps");
     for (size_t i = 0; i < std::min<size_t>(regions.size(), 20); ++i) {
         const auto& r = regions[i];
-        out += fmt::format("{:#14x} {:>9} {:>9} {:>10.1f} {:>10.1f} {:#14x} {:#14x} {:>10} {:>6}\n",
-                           r.region << 24, r.created, r.merged, Mb(r.merged_bytes),
-                           Mb(r.wanted_bytes), r.min_wanted, r.max_wanted, r.max_size / 1024,
-                           r.stream_leaps);
+        out +=
+            fmt::format("{:#14x} {:>9} {:>9} {:>10.1f} {:>10.1f} {:#14x} {:#14x} {:>10} {:>6}\n",
+                        r.region << 24, r.created, r.merged, Mb(r.merged_bytes), Mb(r.wanted_bytes),
+                        r.min_wanted, r.max_wanted, r.max_size / 1024, r.stream_leaps);
     }
     out += "\n== Last buffer creations ==\n";
-    out += fmt::format("{:>9} {:>14} {:>9} {:>14} {:>10} {:>7} {:>10} {:>5}\n", "time_ms",
-                       "wanted", "wanted_KB", "created", "size_KB", "merged", "merged_KB",
-                       "leap");
+    out += fmt::format("{:>9} {:>14} {:>9} {:>14} {:>10} {:>7} {:>10} {:>5}\n", "time_ms", "wanted",
+                       "wanted_KB", "created", "size_KB", "merged", "merged_KB", "leap");
     for (const auto& c : creations) {
         out += fmt::format("{:>9} {:#14x} {:>9} {:#14x} {:>10} {:>7} {:>10} {:>5}\n", c.time_ms,
                            c.wanted_begin, (c.wanted_end - c.wanted_begin) / 1024, c.begin,
@@ -497,8 +496,9 @@ void WriteTopReport(u64 elapsed_ns) {
         }
         const auto& e = s.events;
         const auto kb = [&](u64 bytes) { return static_cast<double>(bytes) / calls / 1024.0; };
-        out += fmt::format("{:>9} {:#x}/{:#x}: {:.1f} us/call = {}\n", ShaderCallKindName(s.last.kind),
-                           s.last.hash, s.last.ps_hash, per_call_us(s.total_ns), top);
+        out +=
+            fmt::format("{:>9} {:#x}/{:#x}: {:.1f} us/call = {}\n", ShaderCallKindName(s.last.kind),
+                        s.last.hash, s.last.ps_hash, per_call_us(s.total_ns), top);
         out += fmt::format(
             "          per call: upload {:.1f} KB, image uploads {:.2f}, protects {:.1f}, faults "
             "{:.2f}, buffers created {:.3f}, GPU-marked {:.1f} KB, stream copy {:.1f} KB, "
@@ -526,7 +526,8 @@ void SampleThreads(u64 interval_ns, bool heavy_second) {
         if (entry.th32OwnerProcessID != pid) {
             continue;
         }
-        const HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+        const HANDLE thread =
+            OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
         if (!thread) {
             continue;
         }
@@ -587,7 +588,11 @@ void ReporterThread(std::stop_token stoken) {
            "upload_MB,hot_pages_new,hot_decays,buffers_created,buffers_merged,merge_MB,"
            "render_passes,submit_cmds_0,submit_cmds_1_7,submit_cmds_8_31,submit_cmds_32_127,"
            "submit_cmds_128_511,submit_cmds_512p,cp_guest_writes,cp_write_overlaps,"
-           "gpu_mark_overlaps\n";
+           "gpu_mark_overlaps,draws_checked,draw_pipeline_same,draw_ctx_regs_same,"
+           "draw_rt_regs_same,draw_user_data_same,draw_all_same,dispatches_checked,"
+           "dispatch_pipeline_same,dispatch_user_data_same,stream_rep_tick_same,"
+           "stream_rep_tick_changed,stream_rep_old_same,stream_rep_old_changed,"
+           "stream_rep_same_MB,stream_reused,stream_reuse_resets\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -644,22 +649,26 @@ void ReporterThread(std::stop_token stoken) {
                                       presents_timed ? Ms(take(counters.present_cpu_ns)) /
                                                            static_cast<double>(presents_timed)
                                                      : 0.0);
-            cp_columns += fmt::format(",{},{:.2f},{},{},{}", take(counters.stream_copies),
-                                      Mb(take(counters.stream_copy_bytes)),
-                                      take(counters.vk_submits), take(counters.async_fences),
-                                      take(counters.async_fence_submits));
-            cp_columns += fmt::format(",{:.2f},{},{},{},{},{:.2f},{}",
-                                      Mb(take(counters.upload_bytes)),
-                                      take(counters.hot_pages_new), take(counters.hot_decays),
-                                      take(counters.buffers_created),
-                                      take(counters.buffers_merged),
-                                      Mb(take(counters.merge_bytes)),
-                                      take(counters.render_passes));
+            cp_columns +=
+                fmt::format(",{},{:.2f},{},{},{}", take(counters.stream_copies),
+                            Mb(take(counters.stream_copy_bytes)), take(counters.vk_submits),
+                            take(counters.async_fences), take(counters.async_fence_submits));
+            cp_columns +=
+                fmt::format(",{:.2f},{},{},{},{},{:.2f},{}", Mb(take(counters.upload_bytes)),
+                            take(counters.hot_pages_new), take(counters.hot_decays),
+                            take(counters.buffers_created), take(counters.buffers_merged),
+                            Mb(take(counters.merge_bytes)), take(counters.render_passes));
             for (auto& bucket : counters.submit_hist) {
                 cp_columns += fmt::format(",{}", take(bucket));
             }
             for (auto& hazard : counters.hazards) {
                 cp_columns += fmt::format(",{}", take(hazard));
+            }
+            for (u32 i = 0; i < counters.reuse.size(); ++i) {
+                const u64 value = take(counters.reuse[i]);
+                cp_columns += i == static_cast<u32>(Reuse::StreamRepeatSameBytes)
+                                  ? fmt::format(",{:.2f}", Mb(value))
+                                  : fmt::format(",{}", value);
             }
         }
         std::string wait_columns;
@@ -667,8 +676,8 @@ void ReporterThread(std::stop_token stoken) {
             for (u32 c = 0; c < u32(WaitClass::Count); ++c) {
                 const u64 count = take(counters.wait_count[q][c]);
                 const u64 ns = take(counters.wait_ns[q][c]);
-                wait_columns += c == 0 ? fmt::format(",{}", count)
-                                       : fmt::format(",{},{:.2f}", count, Ms(ns));
+                wait_columns +=
+                    c == 0 ? fmt::format(",{}", count) : fmt::format(",{},{:.2f}", count, Ms(ns));
             }
         }
 
@@ -679,14 +688,13 @@ void ReporterThread(std::stop_token stoken) {
             static_cast<double>(now - start_ns) / 1e9, take(counters.presents),
             take(counters.submits), take(counters.draws), take(counters.dispatches),
             take(counters.read_faults), take(counters.write_faults), Ms(take(counters.fault_ns)),
-            take(counters.protects), Ms(take(counters.protect_ns)),
-            take(counters.buf_readbacks), take(counters.buf_readbacks_from_read),
-            take(counters.buf_readbacks_from_write), take(counters.buf_readbacks_empty),
-            Mb(take(counters.buf_bytes)), Ms(take(counters.buf_finish_ns)),
-            Ms(take(counters.buf_blocked_ns)), take(counters.img_readbacks),
-            Mb(take(counters.img_bytes)), Ms(take(counters.img_finish_ns)),
-            take(counters.finishes), Ms(take(counters.finish_ns)), busy,
-            take(counters.batches), take(counters.batch_buffers), take(counters.batch_images),
+            take(counters.protects), Ms(take(counters.protect_ns)), take(counters.buf_readbacks),
+            take(counters.buf_readbacks_from_read), take(counters.buf_readbacks_from_write),
+            take(counters.buf_readbacks_empty), Mb(take(counters.buf_bytes)),
+            Ms(take(counters.buf_finish_ns)), Ms(take(counters.buf_blocked_ns)),
+            take(counters.img_readbacks), Mb(take(counters.img_bytes)),
+            Ms(take(counters.img_finish_ns)), take(counters.finishes), Ms(take(counters.finish_ns)),
+            busy, take(counters.batches), take(counters.batch_buffers), take(counters.batch_images),
             Mb(take(counters.batch_bytes)), Ms(take(counters.batch_wait_ns)),
             take(counters.regmem_waits), Ms(take(counters.regmem_wait_ns)),
             take(counters.regmem_shortcuts), take(counters.stream_waits),
@@ -854,13 +862,13 @@ void OnStreamBarrier() {
 }
 
 void OnCpSpin(bool flip, u64 ns) {
-    (flip ? counters.cp_flip_spin_ns : counters.cp_spin_ns).fetch_add(ns,
-                                                                      std::memory_order_relaxed);
+    (flip ? counters.cp_flip_spin_ns : counters.cp_spin_ns)
+        .fetch_add(ns, std::memory_order_relaxed);
 }
 
 void OnShaderCall(const ShaderCall& call) {
-    const u64 key = call.hash ^ (call.ps_hash * 0x9E3779B97F4A7C15ULL) ^
-                    (static_cast<u64>(call.kind) << 59);
+    const u64 key =
+        call.hash ^ (call.ps_hash * 0x9E3779B97F4A7C15ULL) ^ (static_cast<u64>(call.kind) << 59);
     std::scoped_lock lk{maps_mutex};
     auto& stat = shader_call_stats[key];
     stat.last = call;
@@ -875,12 +883,12 @@ void OnShaderCall(const ShaderCall& call) {
 
 void OnRasterizerSubmit() {
     const u64 commands = counters.cmds_since_submit.exchange(0, std::memory_order_relaxed);
-    const size_t bucket = commands == 0     ? 0
-                          : commands < 8    ? 1
-                          : commands < 32   ? 2
-                          : commands < 128  ? 3
-                          : commands < 512  ? 4
-                                            : 5;
+    const size_t bucket = commands == 0    ? 0
+                          : commands < 8   ? 1
+                          : commands < 32  ? 2
+                          : commands < 128 ? 3
+                          : commands < 512 ? 4
+                                           : 5;
     counters.submit_hist[bucket].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -904,8 +912,8 @@ void OnHotPageDecay() {
     }
 }
 
-void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end,
-                     u32 num_merged, u64 merged_bytes, bool stream_leap) {
+void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr end, u32 num_merged,
+                     u64 merged_bytes, bool stream_leap) {
     counters.buffers_created.fetch_add(1, std::memory_order_relaxed);
     counters.buffers_merged.fetch_add(num_merged, std::memory_order_relaxed);
     counters.merge_bytes.fetch_add(merged_bytes, std::memory_order_relaxed);
@@ -941,6 +949,10 @@ void OnBufferCreated(VAddr wanted_begin, VAddr wanted_end, VAddr begin, VAddr en
 
 void OnHazard(Hazard hazard) {
     counters.hazards[static_cast<size_t>(hazard)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void OnReuse(Reuse reuse, u64 amount) {
+    counters.reuse[static_cast<size_t>(reuse)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 void OnVkSubmit() {

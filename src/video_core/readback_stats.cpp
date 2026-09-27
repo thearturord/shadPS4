@@ -304,7 +304,7 @@ void ReporterThread(std::stop_token stoken) {
            "rec_bind_buffers_ms,rec_bind_textures_ms,rec_render_targets_ms,rec_vertex_index_ms,"
            "rec_descriptors_ms,rec_dynamic_state_ms,rec_begin_pass_ms,buf_stream_copy_ms,"
            "buf_lookup_ms,buf_gpu_mark_ms,tex_find_image_ms,tex_view_layout_ms,tex_sampler_ms,"
-           "stats_overhead_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
+           "stats_overhead_ms,vk_cmd_ms,vk_submit_ms,vk_other_ms,cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
            "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits\n";
     csv.flush();
 

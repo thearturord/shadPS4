@@ -171,6 +171,10 @@ public:
     /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
     void ApplyPendingUnmarks();
 
+    /// Unprotects the pages in the range whose data is in guest memory: not written by the GPU
+    /// again and not waiting for an asynchronous download. Must run on the GPU thread.
+    void UnmarkSettledPages(VAddr device_addr, u64 size);
+
 private:
     template <typename Func>
     void ForEachBufferInRange(VAddr device_addr, u64 size, Func&& func) {
@@ -259,6 +263,14 @@ private:
     std::unordered_map<VAddr, HotRange> hot_ranges;
     std::mutex pending_unmarks_mutex;
     std::vector<std::pair<VAddr, u64>> pending_unmarks;
+    /// Asynchronous downloads recorded but not landed in guest memory yet.
+    struct InflightDownload {
+        VAddr addr;
+        u64 size;
+        u64 id;
+    };
+    std::vector<InflightDownload> inflight_downloads; // guarded by pending_unmarks_mutex
+    u64 next_inflight_id{};
     u64 hot_epoch{};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;

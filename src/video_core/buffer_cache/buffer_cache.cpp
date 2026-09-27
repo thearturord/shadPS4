@@ -10,6 +10,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -103,6 +104,37 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             // write backs), then apply its unprotect here instead of after this command.
             scheduler.Finish();
             ApplyPendingUnmarks();
+        }
+        // The faulting page must end up accessible, or the access faults again forever. The
+        // window above stops at this buffer's bounds, so download the page from every buffer on
+        // it. Then drop a GPU mark with nothing left behind it: an async readback's unprotect is
+        // skipped when the GPU writes nearby again before it lands, which can leave part of a
+        // page marked while its data is already in guest memory.
+        const VAddr page_start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+        const u64 page_size = page_end - page_start;
+        if (memory_tracker->IsRegionGpuModified(page_start, page_size)) {
+            ForEachBufferInRange(page_start, page_size, [&](BufferId, Buffer& other) {
+                const VAddr start = std::max<VAddr>(page_start, other.CpuAddr());
+                const VAddr end =
+                    std::min<VAddr>(page_end, other.CpuAddr() + other.SizeBytes());
+                if (end > start) {
+                    result.bytes += DownloadBufferMemory<false>(other, start, end - start).bytes;
+                }
+            });
+            // Only pages with nothing left in flight are unprotected; a page waiting for an
+            // asynchronous download faults again until it lands (ApplyPendingUnmarks).
+            const bool still_marked = memory_tracker->IsRegionGpuModified(page_start, page_size);
+            UnmarkSettledPages(page_start, page_size);
+            if (still_marked && !memory_tracker->IsRegionGpuModified(page_start, page_size)) {
+                static u32 num_logged = 0;
+                if (num_logged < 20) {
+                    ++num_logged;
+                    LOG_INFO(Render_Vulkan,
+                             "Readback: cleared a stale GPU mark on {:#x}-{:#x} (fault at {:#x})",
+                             page_start, page_end, device_addr);
+                }
+            }
         }
         if (is_write && !gpu_modified_ranges.Intersects(window_start, window_size) &&
             memory_tracker->IsRegionGpuModified(window_start, window_size)) {
@@ -242,8 +274,14 @@ Common::UniqueFunction<void> BufferCache::RecordDownloadCopies(Buffer& buffer, V
         .pBufferMemoryBarriers = &pre_barrier,
     });
     cmdbuf.copyBuffer(buffer.buffer, download_buffer.Handle(), copies);
+    u64 inflight_id = 0;
+    if (deferred_unmark) {
+        std::scoped_lock lk{pending_unmarks_mutex};
+        inflight_id = ++next_inflight_id;
+        inflight_downloads.push_back({device_addr, size, inflight_id});
+    }
     return [this, copies = std::move(copies), download = download, offset = offset,
-            buffer_addr = buffer.CpuAddr(), device_addr, size, deferred_unmark] {
+            buffer_addr = buffer.CpuAddr(), device_addr, size, deferred_unmark, inflight_id] {
         auto* memory = Core::Memory::Instance();
         for (const auto& copy : copies) {
             const VAddr copy_device_addr = buffer_addr + copy.srcOffset;
@@ -259,6 +297,8 @@ Common::UniqueFunction<void> BufferCache::RecordDownloadCopies(Buffer& buffer, V
         // copy was recorded, so the unprotect is applied on the GPU thread, where writes are
         // tracked (see ApplyPendingUnmarks). Until then the range stays protected.
         std::scoped_lock lk{pending_unmarks_mutex};
+        std::erase_if(inflight_downloads,
+                      [inflight_id](const auto& download) { return download.id == inflight_id; });
         pending_unmarks.emplace_back(device_addr, size);
     };
 }
@@ -273,11 +313,37 @@ void BufferCache::ApplyPendingUnmarks() {
         unmarks.swap(pending_unmarks);
     }
     for (const auto& [device_addr, size] : unmarks) {
-        // If the GPU wrote the range again, keep it protected so the CPU reads the new data.
-        if (!gpu_modified_ranges.Intersects(device_addr, size)) {
-            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        // Parts the GPU wrote again stay protected so the CPU reads the new data. The rest is
+        // unprotected: skipping the whole range left pages protected with nothing left to
+        // download, which made the CPU fault on them forever.
+        UnmarkSettledPages(device_addr, size);
+    }
+}
+
+void BufferCache::UnmarkSettledPages(VAddr device_addr, u64 size) {
+    const VAddr start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+    const VAddr end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+    RangeSet settled;
+    settled.Add(start, end - start);
+    gpu_modified_ranges.ForEachInRange(start, end - start, [&](VAddr range_start, VAddr range_end) {
+        settled.Subtract(range_start, range_end - range_start);
+    });
+    {
+        std::scoped_lock lk{pending_unmarks_mutex};
+        for (const auto& download : inflight_downloads) {
+            if (download.addr < end && start < download.addr + download.size) {
+                settled.Subtract(download.addr, download.size);
+            }
         }
     }
+    // Protection is per page: a page partly outside the settled ranges stays protected.
+    settled.ForEach([&](VAddr range_start, VAddr range_end) {
+        const VAddr page_start = Common::AlignUp(range_start, TRACKER_BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignDown(range_end, TRACKER_BYTES_PER_PAGE);
+        if (page_end > page_start) {
+            memory_tracker->UnmarkRegionAsGpuModified(page_start, page_end - page_start);
+        }
+    });
 }
 
 void BufferCache::BindVertexBuffers(

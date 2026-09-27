@@ -88,6 +88,10 @@ enum class CpTime : u32 {
     TexViewLayout,  ///< Image view lookups and layout transitions.
     TexSampler,     ///< Sampler lookups.
     StatsOverhead,  ///< Readback stats bookkeeping (writer attribution).
+    // Time inside the Vulkan driver (nested anywhere above):
+    VulkanCmd,      ///< vkCmd* calls (recording commands, barriers, descriptors, state).
+    VulkanSubmit,   ///< vkQueueSubmit.
+    VulkanOther,    ///< Command buffer begin/end/allocation, object creation, queries.
     Count,
 };
 

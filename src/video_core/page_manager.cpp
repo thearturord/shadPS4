@@ -208,6 +208,9 @@ struct PageManager::Impl {
         const bool stats = ReadbackStats::IsEnabled();
         const u64 start = stats ? ReadbackStats::NowNs() : 0;
         ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Protect};
+        if (auto* events = ReadbackStats::CpEvents()) {
+            ++events->protect_calls;
+        }
         impl.Protect(address, size, perms);
         if (stats) {
             ReadbackStats::OnProtect(ReadbackStats::NowNs() - start);
@@ -222,6 +225,9 @@ struct PageManager::Impl {
         ReadbackStats::CpPhase phase{is_write ? "page fault handler (write)"
                                               : "page fault handler (read)"};
         ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Fault};
+        if (auto* events = ReadbackStats::CpEvents()) {
+            ++events->faults;
+        }
         const bool handled =
             is_write ? rasterizer->InvalidateMemory(addr, 8) : rasterizer->ReadMemory(addr, 8);
         if (stats && handled) {

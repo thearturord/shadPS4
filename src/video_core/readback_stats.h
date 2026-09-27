@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include "common/types.h"
@@ -95,6 +96,62 @@ enum class CpTime : u32 {
     Count,
 };
 
+using CpTimeArray = std::array<u64, static_cast<size_t>(CpTime::Count)>;
+
+/// Events counted on the command processor thread, attributed to draws and dispatches.
+struct CpEventCounters {
+    u64 upload_bytes{};      ///< Buffer data uploaded from guest memory.
+    u64 image_uploads{};     ///< Images refreshed from guest memory.
+    u64 protect_calls{};     ///< Page protection changes.
+    u64 faults{};            ///< Page faults handled on the command processor thread.
+    u64 buffers_created{};   ///< Buffer cache buffers created (or merged).
+    u64 gpu_marked_bytes{};  ///< Bytes marked as GPU modified (written buffers).
+    u64 stream_copy_bytes{}; ///< Small read-only buffers copied into the stream buffer.
+    u64 readback_bytes{};    ///< Synchronous buffer readbacks.
+
+    CpEventCounters& operator+=(const CpEventCounters& o) noexcept {
+        upload_bytes += o.upload_bytes;
+        image_uploads += o.image_uploads;
+        protect_calls += o.protect_calls;
+        faults += o.faults;
+        buffers_created += o.buffers_created;
+        gpu_marked_bytes += o.gpu_marked_bytes;
+        stream_copy_bytes += o.stream_copy_bytes;
+        readback_bytes += o.readback_bytes;
+        return *this;
+    }
+    CpEventCounters operator-(const CpEventCounters& o) const noexcept {
+        return {
+            .upload_bytes = upload_bytes - o.upload_bytes,
+            .image_uploads = image_uploads - o.image_uploads,
+            .protect_calls = protect_calls - o.protect_calls,
+            .faults = faults - o.faults,
+            .buffers_created = buffers_created - o.buffers_created,
+            .gpu_marked_bytes = gpu_marked_bytes - o.gpu_marked_bytes,
+            .stream_copy_bytes = stream_copy_bytes - o.stream_copy_bytes,
+            .readback_bytes = readback_bytes - o.readback_bytes,
+        };
+    }
+};
+
+namespace Detail {
+/// Never reset, so a draw or dispatch can take the difference before and after it.
+extern thread_local CpTimeArray cp_local_ns;
+extern thread_local CpEventCounters cp_events;
+} // namespace Detail
+
+/// Event counters of the command processor thread, or nullptr on other threads.
+[[nodiscard]] inline CpEventCounters* CpEvents() noexcept {
+    return IsEnabled() && Detail::is_cp_thread ? &Detail::cp_events : nullptr;
+}
+
+/// Command processor time per category so far, including the step in progress.
+[[nodiscard]] inline CpTimeArray CpTimeSnapshot() noexcept {
+    CpTimeArray totals = Detail::cp_local_ns;
+    totals[Detail::cp_current] += NowNs() - Detail::cp_since;
+    return totals;
+}
+
 /// Measures command processor time for a category (see CpTime). Does nothing on other threads.
 class CpTimer {
 public:
@@ -103,6 +160,7 @@ public:
             const u64 now = NowNs();
             Detail::cp_time_ns[Detail::cp_current].fetch_add(now - Detail::cp_since,
                                                              std::memory_order_relaxed);
+            Detail::cp_local_ns[Detail::cp_current] += now - Detail::cp_since;
             prev = Detail::cp_current;
             Detail::cp_current = static_cast<u32>(category);
             Detail::cp_since = now;
@@ -114,6 +172,7 @@ public:
             const u64 now = NowNs();
             Detail::cp_time_ns[Detail::cp_current].fetch_add(now - Detail::cp_since,
                                                              std::memory_order_relaxed);
+            Detail::cp_local_ns[Detail::cp_current] += now - Detail::cp_since;
             Detail::cp_current = prev;
             Detail::cp_since = now;
         }
@@ -135,6 +194,37 @@ inline void CpWaitYield(bool flip) noexcept {
 
 /// Records time the command processor spent resuming a queue that only re-checked its wait.
 void OnCpSpin(bool flip, u64 ns);
+
+/// Kind of command a shader was recorded for (per-shader profile).
+enum class ShaderCallKind : u32 {
+    Draw,
+    DrawIndirect,
+    Dispatch,
+    DispatchIndirect,
+    DispatchHle,     ///< Handled by the emulator without running the shader (ExecuteShaderHLE).
+    DispatchSkipped, ///< Skipped as an image copy or clear the texture cache handles.
+};
+
+/// One draw or dispatch, for the per-shader profile in readback_top.txt.
+struct ShaderCall {
+    ShaderCallKind kind{};
+    u64 hash{};    ///< Compute shader, or vertex shader for draws.
+    u64 ps_hash{}; ///< Pixel shader for draws (0 if none).
+    u64 work{};    ///< Workgroups (dispatch) or vertices x instances (draw); 0 if indirect.
+    u32 threads_per_group{};
+    u16 buffers{};
+    u16 written_buffers{};
+    u16 images{};
+    u16 storage_images{};
+    u16 color_targets{};
+    bool depth_target{};
+    u64 ns{}; ///< Command processor time of the call, including nested work (uploads...).
+    CpTimeArray category_ns{}; ///< Where that time went.
+    CpEventCounters events{};  ///< What happened during the call.
+};
+
+/// Records a draw or dispatch for the per-shader profile.
+void OnShaderCall(const ShaderCall& call);
 
 /// Records a Vulkan queue submission of the rasterizer.
 void OnVkSubmit();

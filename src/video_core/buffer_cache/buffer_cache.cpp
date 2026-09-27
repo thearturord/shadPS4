@@ -167,6 +167,9 @@ BufferCache::DownloadResult BufferCache::DownloadBufferMemory(Buffer& buffer, VA
     auto write_data = RecordDownloadCopies(buffer, device_addr, size, std::move(copies),
                                            total_size_bytes, false);
     DownloadResult result{.bytes = total_size_bytes};
+    if (auto* events = ReadbackStats::CpEvents(); events && !async) {
+        events->readback_bytes += total_size_bytes;
+    }
     if constexpr (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
@@ -631,6 +634,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
         if (ReadbackStats::IsEnabled()) {
             ReadbackStats::OnStreamCopy(size);
+            if (auto* events = ReadbackStats::CpEvents()) {
+                events->stream_copy_bytes += size;
+            }
         }
         return {&stream_buffer, offset};
     }
@@ -642,6 +648,9 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     SynchronizeBuffer(buffer, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
         ReadbackStats::CpTimer t{ReadbackStats::CpTime::BufGpuMark};
+        if (auto* events = ReadbackStats::CpEvents()) {
+            events->gpu_marked_bytes += size;
+        }
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {&buffer, buffer.Offset(device_addr)};
@@ -824,6 +833,9 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 }
 
 BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+    if (auto* events = ReadbackStats::CpEvents()) {
+        ++events->buffers_created;
+    }
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -906,6 +918,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
         [&] { src_buffer = UploadCopies(buffer, copies, total_size_bytes); });
 
     if (src_buffer) {
+        if (auto* events = ReadbackStats::CpEvents()) {
+            events->upload_bytes += total_size_bytes;
+        }
         scheduler.EndRendering();
         const auto cmdbuf = scheduler.CommandBuffer();
         const vk::BufferMemoryBarrier2 pre_barrier = {

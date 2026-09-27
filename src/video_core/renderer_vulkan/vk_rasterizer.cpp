@@ -98,6 +98,71 @@ bool Rasterizer::CommandStreamBarrier(u64 producer_tick) {
     return true;
 }
 
+namespace {
+
+/// Reports a draw or dispatch to the per-shader profile when it goes out of scope, if a kind was
+/// set (the call was recorded, handled or skipped).
+struct ShaderCallScope {
+    VideoCore::ReadbackStats::ShaderCall call{};
+    const u64 start =
+        VideoCore::ReadbackStats::IsEnabled() ? VideoCore::ReadbackStats::NowNs() : 0;
+    bool report = false;
+    VideoCore::ReadbackStats::CpTimeArray start_times{};
+    VideoCore::ReadbackStats::CpEventCounters start_events{};
+
+    ShaderCallScope() {
+        if (start != 0) {
+            start_times = VideoCore::ReadbackStats::CpTimeSnapshot();
+            start_events = VideoCore::ReadbackStats::Detail::cp_events;
+        }
+    }
+
+    ~ShaderCallScope() {
+        if (start != 0 && report) {
+            call.ns = VideoCore::ReadbackStats::NowNs() - start;
+            const auto end_times = VideoCore::ReadbackStats::CpTimeSnapshot();
+            for (size_t i = 0; i < end_times.size(); ++i) {
+                call.category_ns[i] = end_times[i] - start_times[i];
+            }
+            call.events = VideoCore::ReadbackStats::Detail::cp_events - start_events;
+            VideoCore::ReadbackStats::OnShaderCall(call);
+        }
+    }
+
+    bool Active() const noexcept {
+        return start != 0;
+    }
+
+    void Record(VideoCore::ReadbackStats::ShaderCallKind kind, const Pipeline& pipeline) {
+        if (!Active()) {
+            return;
+        }
+        report = true;
+        call.kind = kind;
+        for (const auto* stage : pipeline.GetStages()) {
+            if (!stage) {
+                continue;
+            }
+            if (stage->sw_stage == Shader::SwStage::Fragment) {
+                call.ps_hash = stage->pgm_hash;
+            } else if (call.hash == 0 || stage->sw_stage == Shader::SwStage::Vertex ||
+                       stage->sw_stage == Shader::SwStage::Compute) {
+                call.hash = stage->pgm_hash;
+            }
+            call.buffers += static_cast<u16>(stage->buffers.size());
+            for (const auto& buffer : stage->buffers) {
+                call.written_buffers += buffer.is_written ? 1 : 0;
+            }
+            call.images += static_cast<u16>(stage->images.size());
+            for (const auto& image : stage->images) {
+                call.storage_images += image.is_written ? 1 : 0;
+            }
+        }
+    }
+};
+
+} // Anonymous namespace
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
@@ -227,6 +292,7 @@ void Rasterizer::EliminateFastClear() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Draw};
+    ShaderCallScope shader_call;
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -292,6 +358,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     DebugState.IncDrawCall();
     VideoCore::ReadbackStats::OnDraw();
     ++recorded_work;
+    if (shader_call.Active()) {
+        shader_call.Record(VideoCore::ReadbackStats::ShaderCallKind::Draw, *pipeline);
+        shader_call.call.work = u64{regs.num_indices} * regs.num_instances.NumInstances();
+        shader_call.call.color_targets = state.num_color_attachments;
+        shader_call.call.depth_target = bool(state.depth_stencil_attachment.image_view);
+    }
 
     ResetBindings();
 }
@@ -301,6 +373,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Draw};
+    ShaderCallScope shader_call;
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -403,6 +476,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         VideoCore::ReadbackStats::OnDraw();
         ++recorded_work;
     }
+    if (shader_call.Active()) {
+        shader_call.Record(VideoCore::ReadbackStats::ShaderCallKind::DrawIndirect, *pipeline);
+        shader_call.call.color_targets = state.num_color_attachments;
+        shader_call.call.depth_target = bool(state.depth_stencil_attachment.image_view);
+    }
 
     ResetBindings();
 }
@@ -410,6 +488,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Dispatch};
+    ShaderCallScope shader_call;
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -422,12 +501,24 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    const auto record_dispatch = [&](VideoCore::ReadbackStats::ShaderCallKind kind, u64 work) {
+        if (shader_call.Active()) {
+            shader_call.Record(kind, *pipeline);
+            shader_call.call.work = work;
+            shader_call.call.threads_per_group = u32{cs_program.num_thread_x.full} *
+                                                 cs_program.num_thread_y.full *
+                                                 cs_program.num_thread_z.full;
+        }
+    };
+
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchHle, cs_program.NumWorkgroups());
         return;
     }
 
     if (!BindResources(pipeline)) {
+        record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::DispatchSkipped, cs_program.NumWorkgroups());
         return;
     }
 
@@ -440,6 +531,7 @@ void Rasterizer::DispatchDirect() {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    record_dispatch(VideoCore::ReadbackStats::ShaderCallKind::Dispatch, cs_program.NumWorkgroups());
     DebugState.IncDispatch();
     VideoCore::ReadbackStats::OnDispatch();
     ++recorded_work;
@@ -450,6 +542,7 @@ void Rasterizer::DispatchDirect() {
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Dispatch};
+    ShaderCallScope shader_call;
 
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::Prepare};
@@ -482,6 +575,12 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    if (shader_call.Active()) {
+        shader_call.Record(VideoCore::ReadbackStats::ShaderCallKind::DispatchIndirect, *pipeline);
+        shader_call.call.threads_per_group = u32{cs_program.num_thread_x.full} *
+                                             cs_program.num_thread_y.full *
+                                             cs_program.num_thread_z.full;
+    }
     DebugState.IncDispatch();
     VideoCore::ReadbackStats::OnDispatch();
     ++recorded_work;

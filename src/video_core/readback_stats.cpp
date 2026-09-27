@@ -30,6 +30,8 @@ thread_local u32 cp_current{};
 thread_local u64 cp_since{};
 thread_local u64 cp_packets{};
 thread_local u32 cp_yield_kind{};
+thread_local CpTimeArray cp_local_ns{};
+thread_local CpEventCounters cp_events{};
 std::atomic<u64> cp_time_ns[static_cast<u32>(CpTime::Count)]{};
 } // namespace Detail
 
@@ -124,6 +126,25 @@ struct WaitStat {
     u64 total_ns{};
 };
 
+struct ShaderCallStat {
+    ShaderCall last{};
+    u64 count{};
+    u64 total_ns{};
+    u64 total_work{};
+    CpTimeArray category_ns{};
+    CpEventCounters events{};
+};
+
+constexpr std::array<const char*, static_cast<size_t>(CpTime::Count)> CpTimeNames = {
+    "other",          "draw itself",    "dispatch itself", "pipeline",     "upload",
+    "fence",          "submit end",     "fault",           "protect",      "gpu wait",
+    "guest cmd",      "flip sleep",     "idle",            "prepare",      "compute checks",
+    "bind buffers",   "bind textures",  "render targets",  "vertex/index", "descriptors",
+    "dynamic state",  "begin pass",     "stream copy",     "buffer lookup", "gpu mark",
+    "tex find image", "tex view/layout", "tex sampler",    "stats",        "vk cmd",
+    "vk submit",      "vk other",
+};
+
 struct ImageStat {
     VAddr addr{};
     u32 width{};
@@ -143,11 +164,30 @@ std::unordered_map<VAddr, BufferStat> buffer_stats;
 std::unordered_map<u64, ShaderStat> shader_stats;
 std::unordered_map<VAddr, ImageStat> image_stats;
 std::unordered_map<u64, WaitStat> wait_stats;
+std::unordered_map<u64, ShaderCallStat> shader_call_stats;
 
 std::mutex thread_mutex;
 std::condition_variable_any stop_cv;
 std::jthread reporter;
 u64 start_ns{};
+
+const char* ShaderCallKindName(ShaderCallKind kind) {
+    switch (kind) {
+    case ShaderCallKind::Draw:
+        return "draw";
+    case ShaderCallKind::DrawIndirect:
+        return "draw-ind";
+    case ShaderCallKind::Dispatch:
+        return "dispatch";
+    case ShaderCallKind::DispatchIndirect:
+        return "disp-ind";
+    case ShaderCallKind::DispatchHle:
+        return "disp-hle";
+    case ShaderCallKind::DispatchSkipped:
+        return "disp-skip";
+    }
+    return "?";
+}
 
 const char* StageName(u32 stage) {
     switch (stage) {
@@ -202,8 +242,13 @@ void WriteTopReport(u64 elapsed_ns) {
     std::vector<ShaderStat> shaders;
     std::vector<ImageStat> images;
     std::vector<WaitStat> waits;
+    std::vector<ShaderCallStat> shader_calls;
     {
         std::scoped_lock lk{maps_mutex};
+        shader_calls.reserve(shader_call_stats.size());
+        for (const auto& [_, stat] : shader_call_stats) {
+            shader_calls.push_back(stat);
+        }
         for (const auto& [_, stat] : wait_stats) {
             waits.push_back(stat);
         }
@@ -280,6 +325,82 @@ void WriteTopReport(u64 elapsed_ns) {
         out += fmt::format("{:#18x} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11.1f} {:>11.1f} {:>11.1f}\n",
                            w.address, w.is_compute ? "compute" : "gfx", w.count[0], w.count[1],
                            w.count[2], w.count[3], Ms(w.ns[1]), Ms(w.ns[2]), Ms(w.ns[3]));
+    }
+
+    std::ranges::sort(shader_calls, [](const auto& a, const auto& b) {
+        return a.total_ns > b.total_ns;
+    });
+    const double seconds = std::max(1.0, static_cast<double>(elapsed_ns) / 1e9);
+    u64 all_ns = 0;
+    u64 all_calls = 0;
+    for (const auto& s : shader_calls) {
+        all_ns += s.total_ns;
+        all_calls += s.count;
+    }
+    out += fmt::format(
+        "\n== Shaders by command processor time (whole run: {} shaders, {} calls, {:.1f} ms/s) ==\n",
+        shader_calls.size(), all_calls, Ms(all_ns) / seconds);
+    out += "time includes everything done for the call (bindings, uploads, faults); work = "
+           "workgroups for dispatches, vertices x instances for draws (0 = indirect); "
+           "bufs/imgs = bound (written/storage); rt = color targets (+d = depth)\n";
+    out += fmt::format("{:>9} {:>18} {:>18} {:>9} {:>9} {:>8} {:>7} {:>11} {:>7} {:>8} {:>8} {:>5} "
+                       "{:>6}\n",
+                       "kind", "shader", "pixel_shader", "calls", "calls/s", "ms/s", "cum%",
+                       "avg_work", "thr/grp", "bufs", "imgs", "rt", "avg_us");
+    u64 cumulative_ns = 0;
+    for (size_t i = 0; i < std::min<size_t>(shader_calls.size(), 60); ++i) {
+        const auto& s = shader_calls[i];
+        const auto& c = s.last;
+        cumulative_ns += s.total_ns;
+        out += fmt::format(
+            "{:>9} {:#18x} {:#18x} {:>9} {:>9.1f} {:>8.2f} {:>6.1f}% {:>11} {:>7} {:>8} {:>8} "
+            "{:>5} {:>6.1f}\n",
+            ShaderCallKindName(c.kind), c.hash, c.ps_hash, s.count,
+            static_cast<double>(s.count) / seconds, Ms(s.total_ns) / seconds,
+            all_ns ? 100.0 * static_cast<double>(cumulative_ns) / static_cast<double>(all_ns)
+                   : 0.0,
+            s.count ? s.total_work / s.count : 0, c.threads_per_group,
+            fmt::format("{}({})", c.buffers, c.written_buffers),
+            fmt::format("{}({})", c.images, c.storage_images),
+            fmt::format("{}{}", c.color_targets, c.depth_target ? "+d" : ""),
+            s.count ? static_cast<double>(s.total_ns) / static_cast<double>(s.count) / 1000.0
+                    : 0.0);
+    }
+
+    out += "\n== Where the time of the top 25 shaders goes (per call) ==\n";
+    for (size_t i = 0; i < std::min<size_t>(shader_calls.size(), 25); ++i) {
+        const auto& s = shader_calls[i];
+        if (s.count == 0) {
+            continue;
+        }
+        const double calls = static_cast<double>(s.count);
+        const auto per_call_us = [&](u64 ns) { return static_cast<double>(ns) / calls / 1000.0; };
+        std::array<u32, static_cast<size_t>(CpTime::Count)> order{};
+        for (u32 c = 0; c < order.size(); ++c) {
+            order[c] = c;
+        }
+        std::ranges::sort(order, [&](u32 a, u32 b) { return s.category_ns[a] > s.category_ns[b]; });
+        std::string top;
+        for (u32 k = 0; k < 6; ++k) {
+            const u32 c = order[k];
+            if (s.category_ns[c] == 0) {
+                break;
+            }
+            top += fmt::format("{}{} {:.1f}", k ? ", " : "", CpTimeNames[c],
+                               per_call_us(s.category_ns[c]));
+        }
+        const auto& e = s.events;
+        const auto kb = [&](u64 bytes) { return static_cast<double>(bytes) / calls / 1024.0; };
+        out += fmt::format("{:>9} {:#x}/{:#x}: {:.1f} us/call = {}\n", ShaderCallKindName(s.last.kind),
+                           s.last.hash, s.last.ps_hash, per_call_us(s.total_ns), top);
+        out += fmt::format(
+            "          per call: upload {:.1f} KB, image uploads {:.2f}, protects {:.1f}, faults "
+            "{:.2f}, buffers created {:.3f}, GPU-marked {:.1f} KB, stream copy {:.1f} KB, "
+            "readback {:.1f} KB\n",
+            kb(e.upload_bytes), static_cast<double>(e.image_uploads) / calls,
+            static_cast<double>(e.protect_calls) / calls, static_cast<double>(e.faults) / calls,
+            static_cast<double>(e.buffers_created) / calls, kb(e.gpu_marked_bytes),
+            kb(e.stream_copy_bytes), kb(e.readback_bytes));
     }
 
     std::ofstream file{LogPath("readback_top.txt"), std::ios::trunc};
@@ -557,6 +678,21 @@ void OnStreamBarrier() {
 void OnCpSpin(bool flip, u64 ns) {
     (flip ? counters.cp_flip_spin_ns : counters.cp_spin_ns).fetch_add(ns,
                                                                       std::memory_order_relaxed);
+}
+
+void OnShaderCall(const ShaderCall& call) {
+    const u64 key = call.hash ^ (call.ps_hash * 0x9E3779B97F4A7C15ULL) ^
+                    (static_cast<u64>(call.kind) << 59);
+    std::scoped_lock lk{maps_mutex};
+    auto& stat = shader_call_stats[key];
+    stat.last = call;
+    ++stat.count;
+    stat.total_ns += call.ns;
+    stat.total_work += call.work;
+    for (size_t i = 0; i < stat.category_ns.size(); ++i) {
+        stat.category_ns[i] += call.category_ns[i];
+    }
+    stat.events += call.events;
 }
 
 void OnVkSubmit() {

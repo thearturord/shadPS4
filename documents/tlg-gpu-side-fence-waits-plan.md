@@ -21,7 +21,11 @@ sections after it are the original plan.
 | 4. Shared memory, second try | Tested and parked: slower | branch `tlg-shared-memory-experiment` |
 | 5. Cleanup | Partly (documents updated) | - |
 | 6. Command processor profile (added) | Done | `b443bc0a` (perf 4) |
-| 7. Cheaper draw recording (added) | In progress | uncommitted |
+| 7. Cheaper recording: fewer fence submits, faster stream copies (added) | Done | `24ced010` (perf 5) |
+| 8. Load hang fix: stale GPU marks (added) | Done | `73d3da1e` (perf 6) |
+| 9. Targeted readback waits (added) | Done | `2f4cba54` (perf 7) |
+| 10. Per-shader profile (added) | Done, diagnostics only | uncommitted |
+| 11. Buffer cache fixes from the per-shader profile (added) | **Pending** | - |
 
 ### Phases 0-3: fence waits on the GPU timeline
 - **Result:** compute waits on held back fences went from ~1.5 s/s to 0. ~2,700 graphics and ~500
@@ -77,7 +81,7 @@ Findings: the GPU is ~30% busy and presentation costs ~0.75 ms per frame. The li
 command processor thread recording ~2,500 draws and ~900 dispatches per frame. Readbacks are no
 longer the main cost.
 
-### Phase 7: cheaper draw recording (uncommitted)
+### Phase 7: cheaper recording (perf 5)
 - **Fewer submits at fences:** an async fence only submits the command buffer when it recorded
   copies or a priority operation waits on the command buffer being recorded
   (`Scheduler::PriorityOperationsNeedSubmit`). Vulkan submits went from ~4,800/s to ~740/s and
@@ -85,16 +89,65 @@ longer the main cost.
 - **Stream copy fast path:** `MemoryManager::CopyMemoryFast` skips the memory manager lock and
   the mapping lookup when a copy lies in a mapped area this thread already looked up and no
   mapping changed since (`SharedFirstMutex::WriteGeneration`). Only ~5% gain: the remaining
-  ~0.44 us per copy is memory traffic (reading data the guest CPU just wrote, writing to GPU
-  visible memory).
+  ~0.44 us per copy is memory traffic.
 - Result with profiling on: 23.6 -> 25.6 FPS in the same scene (+8%).
 
+### Phase 8: load hang fix (perf 6)
+- **Cause:** an async readback's unprotect was dropped for its whole range when the GPU wrote part
+  of it again, leaving pages read-protected with nothing to download. The CPU then faulted on them
+  forever (~355k empty readbacks per second): the intermittent hang when loading into gameplay.
+- **Fix:** landed readbacks unprotect exactly the pages the GPU didn't write again
+  (`BufferCache::UnmarkSettledPages`), and the fault handler downloads the faulting page from
+  every buffer on it and clears a stale mark (`Readback: cleared a stale GPU mark` in the log,
+  a few times per run).
+- **Vulkan call timing** (dispatcher wrappers, `vk_call_timing.cpp`): driver time is ~10-13% of
+  the command processor, so moving Vulkan calls to another thread isn't worth it. Off by default.
+
+### Phase 9: targeted readback waits (perf 7)
+- A fault on a page whose async readback is still in flight waits for that readback only
+  (`BufferCache::WaitForDownloads`) instead of `Finish`. In flight downloads are tracked.
+- Keeping pages protected while any newer readback was in flight was tried and reverted: hot
+  ranges are prefetched at nearly every fence, so the CPU kept waiting (~80 ms/s of GPU waits).
+- Result (profiled): GPU waits ~80 -> ~22 ms/s, guest threads blocked on readbacks ~83 -> ~27
+  ms/s. Unprofiled play: 25-45 FPS depending on the area.
+- Fetch shader parsing is cached per code address and pending operations skip the GPU progress
+  query when nothing can be released (no measurable gain, kept).
+
+### Phase 10: per-shader profile (uncommitted, diagnostics only)
+`readback_top.txt` ranks shaders by command processor time ("Shaders by command processor time")
+and splits the top 25 per call ("Where the time of the top 25 shaders goes"): time per category
+and events per call (upload KB, protects, faults, buffers created, GPU-marked KB, stream copy KB,
+readback KB). Findings at the gates (~3,200 draws and dispatches per frame, 225 shaders):
+- Cost is spread out: top 10 shaders ~50% of the call time, the biggest ~12%. Depth-only
+  (shadow) draws are ~20%; one shadow shader runs ~300 times per frame.
+- Normal draws cost 5-12 us; the largest piece is copying constant data (2-3 us, 2-10 KB per
+  draw). No single fix there.
+- Tiny compute jobs (1-3 workgroups, 3-16 buffers bound, 1-5 written) are ~10% of the time. They
+  do real work, so they can't be skipped; their cost is binding many buffers.
+
+### Phase 11 (pending): buffer cache fixes from the per-shader profile
+1. **Buffer churn.** Compute `0xa912f7d4` (~34 calls per frame, 40 us per call, ~9% of all call
+   time), draw `0x40338244` and compute `0xb5a91460` create a new buffer about every 16 calls
+   (~45 per second), merging (GPU copying) the old ones and destroying them later. ~17 us of the
+   40 us ("buffer lookup" and "prepare"). Next: log each creation (address, size, buffers merged,
+   why the old ones were deleted), then fix the cause (for example grow buffers with headroom).
+2. **Re-protecting pages the CPU rewrites every frame.** The same shaders upload ~72 KB of freshly
+   CPU-written data per call and write-protect the pages again; the next CPU write faults again
+   (~16 us per call, and part of the ~35,000 write faults per second on the game's threads).
+   Idea: stop write-protecting pages that fault every frame and upload them on each use instead
+   (only pages the GPU never writes; accuracy unchanged).
+3. **Over-marking.** Single-workgroup dispatches `0x1171c360`, `0xa4f2ed2d`, `0x7a83ef95` (~800
+   calls per second) bind a ~15 MB buffer as writable, so 15 MB is marked GPU-written on every
+   call. Cheap for the command processor, but it may cause needless faults and readbacks. Riskiest
+   to change: the emulator can't know what a shader really writes.
+4. `0x7d8296d`: 91 us per call, mostly GPU waits after faults (~1%).
+Estimated gain for 1 and 2: ~5-8% of the command processor.
+
 ### Next steps
-1. Measure FPS with `readback_stats_enabled: false` (the profiling timers cost a few percent).
-2. Cut per-draw work where state did not change since the previous draw: pipeline key refresh
-   and lookup, texture/sampler lookups, render target lookups.
-3. Longer term: process compute rings on a second thread, so the ~900 dispatches per frame don't
-   share one CPU core with the ~2,500 draws.
+1. Phase 11 (pending).
+2. Longer term: process compute rings on a second thread (first measure the real share and how
+   often graphics and compute wait for each other), or game patches that reduce draw-heavy
+   effects such as shadows (needs reverse engineering).
 
 ## 1. Goal and success criteria
 

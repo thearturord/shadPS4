@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <unordered_map>
+#include <vector>
+
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -45,12 +49,40 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
+static FetchShaderData ParseFetchShaderCode(const u32* code);
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
     }
 
+    // This runs for every draw (pipeline lookup), but fetch shaders are tiny and rarely change.
+    // Keep the result per code address and decode again only if the code bytes differ.
+    struct CachedFetchShader {
+        std::vector<u32> code;
+        FetchShaderData data;
+    };
+    thread_local std::unordered_map<const u32*, CachedFetchShader> cache;
+
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    if (const auto it = cache.find(code); it != cache.end()) {
+        const auto& cached = it->second;
+        if (std::memcmp(code, cached.code.data(), cached.code.size() * sizeof(u32)) == 0) {
+            return cached.data;
+        }
+    }
+    FetchShaderData data = ParseFetchShaderCode(code);
+    if (cache.size() >= 4096) {
+        cache.clear();
+    }
+    cache[code] = CachedFetchShader{
+        .code = std::vector<u32>(code, code + data.size / sizeof(u32)),
+        .data = data,
+    };
+    return data;
+}
+
+static FetchShaderData ParseFetchShaderCode(const u32* code) {
     FetchShaderData data{};
     GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
     GcnDecodeContext decoder;

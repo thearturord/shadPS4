@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <thread>
 #include <magic_enum/magic_enum.hpp>
 #include "common/alignment.h"
 #include "common/debug.h"
@@ -97,22 +98,19 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
         const u64 window_size = window_end - window_start;
         ApplyPendingUnmarks();
         result = DownloadBufferMemory<false>(buffer, window_start, window_size);
-        if (result.bytes == 0 && scheduler.HasPriorityOperations() &&
-            memory_tracker->IsRegionGpuModified(window_start, window_size)) {
-            // The range is still protected but has nothing left to download: an asynchronous
-            // readback for it is in flight. Wait for it to land (Finish also waits for the
-            // write backs), then apply its unprotect here instead of after this command.
-            scheduler.Finish();
+        const VAddr page_start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+        const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
+        const u64 page_size = page_end - page_start;
+        if (result.bytes == 0 && memory_tracker->IsRegionGpuModified(page_start, page_size) &&
+            IsDownloadInFlight(page_start, page_size)) {
+            // The page has nothing left to download: an asynchronous readback of it was already
+            // submitted. Wait for that one to land instead of finishing all GPU work.
+            WaitForDownloads(page_start, page_size);
             ApplyPendingUnmarks();
         }
         // The faulting page must end up accessible, or the access faults again forever. The
         // window above stops at this buffer's bounds, so download the page from every buffer on
-        // it. Then drop a GPU mark with nothing left behind it: an async readback's unprotect is
-        // skipped when the GPU writes nearby again before it lands, which can leave part of a
-        // page marked while its data is already in guest memory.
-        const VAddr page_start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
-        const VAddr page_end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
-        const u64 page_size = page_end - page_start;
+        // it. Then drop a GPU mark with nothing left behind it.
         if (memory_tracker->IsRegionGpuModified(page_start, page_size)) {
             ForEachBufferInRange(page_start, page_size, [&](BufferId, Buffer& other) {
                 const VAddr start = std::max<VAddr>(page_start, other.CpuAddr());
@@ -122,8 +120,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                     result.bytes += DownloadBufferMemory<false>(other, start, end - start).bytes;
                 }
             });
-            // Only pages with nothing left in flight are unprotected; a page waiting for an
-            // asynchronous download faults again until it lands (ApplyPendingUnmarks).
+            // Downloads of this page have landed by now (the wait above, or the synchronous
+            // download's Finish), so a mark with no GPU write behind it is stale.
             const bool still_marked = memory_tracker->IsRegionGpuModified(page_start, page_size);
             UnmarkSettledPages(page_start, page_size);
             if (still_marked && !memory_tracker->IsRegionGpuModified(page_start, page_size)) {
@@ -320,22 +318,49 @@ void BufferCache::ApplyPendingUnmarks() {
     }
 }
 
+bool BufferCache::IsDownloadInFlight(VAddr device_addr, u64 size) {
+    std::scoped_lock lk{pending_unmarks_mutex};
+    return std::ranges::any_of(inflight_downloads, [&](const InflightDownload& download) {
+        return download.addr < device_addr + size && device_addr < download.addr + download.size;
+    });
+}
+
+void BufferCache::WaitForDownloads(VAddr device_addr, u64 size) {
+    ReadbackStats::CpTimer timer{ReadbackStats::CpTime::GpuWait};
+    // Asynchronous downloads are submitted when recorded. Submit anyway if an operation waits on
+    // the command buffer being recorded, since the downloads land in order after it.
+    if (scheduler.PriorityOperationsNeedSubmit()) {
+        scheduler.Flush();
+    }
+    const u64 start = ReadbackStats::NowNs();
+    bool reported = false;
+    while (IsDownloadInFlight(device_addr, size)) {
+        if (!reported && ReadbackStats::NowNs() - start > 2'000'000'000ULL) {
+            reported = true;
+            LOG_WARNING(Render_Vulkan,
+                        "Hang check: waiting >2s for an asynchronous readback of {:#x}:{:#x}",
+                        device_addr, size);
+        }
+        std::this_thread::yield();
+    }
+    if (ReadbackStats::IsEnabled()) {
+        ReadbackStats::OnFinish(ReadbackStats::NowNs() - start);
+    }
+}
+
 void BufferCache::UnmarkSettledPages(VAddr device_addr, u64 size) {
     const VAddr start = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
     const VAddr end = Common::AlignUp(device_addr + size, TRACKER_BYTES_PER_PAGE);
     RangeSet settled;
     settled.Add(start, end - start);
+    // Only data the GPU wrote and that wasn't downloaded yet keeps a page protected. A page with
+    // a newer download still in flight is unprotected too: its guest memory holds everything that
+    // landed so far, and the game only sees the fence of the newer write once it has landed
+    // (keeping it protected made the CPU wait for the hot ranges that are prefetched at nearly
+    // every fence).
     gpu_modified_ranges.ForEachInRange(start, end - start, [&](VAddr range_start, VAddr range_end) {
         settled.Subtract(range_start, range_end - range_start);
     });
-    {
-        std::scoped_lock lk{pending_unmarks_mutex};
-        for (const auto& download : inflight_downloads) {
-            if (download.addr < end && start < download.addr + download.size) {
-                settled.Subtract(download.addr, download.size);
-            }
-        }
-    }
     // Protection is per page: a page partly outside the settled ranges stays protected.
     settled.ForEach([&](VAddr range_start, VAddr range_end) {
         const VAddr page_start = Common::AlignUp(range_start, TRACKER_BYTES_PER_PAGE);

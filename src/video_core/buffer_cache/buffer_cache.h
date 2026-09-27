@@ -171,9 +171,15 @@ public:
     /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
     void ApplyPendingUnmarks();
 
-    /// Unprotects the pages in the range whose data is in guest memory: not written by the GPU
-    /// again and not waiting for an asynchronous download. Must run on the GPU thread.
+    /// Unprotects the pages in the range that the GPU didn't write again since their data was
+    /// downloaded. Must run on the GPU thread.
     void UnmarkSettledPages(VAddr device_addr, u64 size);
+
+    /// Returns true if an asynchronous download of part of the range has not landed yet.
+    bool IsDownloadInFlight(VAddr device_addr, u64 size);
+
+    /// Waits until asynchronous downloads of the range have landed in guest memory.
+    void WaitForDownloads(VAddr device_addr, u64 size);
 
 private:
     template <typename Func>

@@ -183,6 +183,23 @@ per second that each submitted a command buffer (~125 ms/s).
   area already looked up and no mapping changed since (~5% cheaper, the rest is memory traffic).
 - 23.6 -> 25.6 FPS in the same scene with profiling on (+8%).
 
+### 11. Load hang fix and targeted readback waits
+- **Load hang:** an async readback's unprotect was dropped for its whole range when the GPU wrote
+  part of it again, leaving pages protected with nothing to download. The CPU then faulted on
+  them forever (~355k empty readbacks per second, the intermittent hang when loading into
+  gameplay). Landed readbacks now unprotect exactly the pages the GPU didn't write again, and the
+  fault handler clears a stale mark on the faulting page (`Readback: cleared a stale GPU mark`).
+- **Targeted waits:** a fault on a page whose readback is still in flight waits for that readback
+  only, instead of `Finish` (submit everything and wait for the GPU to go idle).
+- Keeping pages protected while any newer readback was in flight was tried and reverted: hot
+  ranges are prefetched at nearly every fence, so the CPU kept waiting (~80 ms/s of GPU waits).
+  The game only sees a fence after its readback landed, so this strictness isn't needed.
+- Result (profiled): GPU waits ~80 -> ~22 ms/s, game threads blocked on readbacks ~83 -> ~27
+  ms/s. Unprofiled play: 25-45 FPS depending on the area.
+- Also: fetch shaders are parsed once per code address instead of at every draw, and pending
+  operations only query the GPU progress when there is one to release (no measurable gain).
+  Vulkan call timing (option B study: ~10-13% of the command processor) is off by default.
+
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
   (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of

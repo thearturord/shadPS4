@@ -192,7 +192,14 @@ void Scheduler::WaitPriorityOperations() {
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    master_semaphore.Refresh();
+    // Runs at every draw and dispatch: only ask the driver for the GPU progress when there is an
+    // operation it could release.
+    if (pending_ops.empty()) {
+        return;
+    }
+    if (!master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        master_semaphore.Refresh();
+    }
     while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();

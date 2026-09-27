@@ -576,7 +576,11 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
-    if (EmulatorSettings.IsReadbackStatsEnabled()) {
+    // Timing every Vulkan call is the most expensive part of the readback stats. It answered
+    // whether moving Vulkan calls to another thread would pay off (~10-13% of the command
+    // processor time: no), so it stays off unless needed again.
+    constexpr bool TimeVulkanCalls = false;
+    if (TimeVulkanCalls && EmulatorSettings.IsReadbackStatsEnabled()) {
         InstallVulkanCallTiming();
     }
 

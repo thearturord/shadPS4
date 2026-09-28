@@ -301,6 +301,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
       stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()},
       shader_backing_reads{EmulatorSettings.IsShaderBackingReadsEnabled()} {
+    Shader::Gcn::SetFetchShaderBackingReads(shader_backing_reads);
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),

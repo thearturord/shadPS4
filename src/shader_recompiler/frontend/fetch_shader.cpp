@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "common/assert.h"
+#include "core/memory.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 
@@ -51,6 +52,27 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 
 static FetchShaderData ParseFetchShaderCode(const u32* code);
 
+namespace {
+bool backing_reads = false;
+
+/// Where to read the fetch shader code from: its physical backing if enabled (no readback fault
+/// when the page also holds GPU-written data, the GPU never writes shader code), else the guest
+/// mapping. `size` must cover everything that is read.
+const u32* ReadableCode(const u32* code, u64 size) {
+    if (backing_reads) {
+        if (const u8* backing =
+                Core::Memory::Instance()->BackingPointer(reinterpret_cast<VAddr>(code), size)) {
+            return reinterpret_cast<const u32*>(backing);
+        }
+    }
+    return code;
+}
+} // Anonymous namespace
+
+void SetFetchShaderBackingReads(bool enabled) {
+    backing_reads = enabled;
+}
+
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     if (!info.has_fetch_shader) {
         return std::nullopt;
@@ -67,16 +89,24 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     if (const auto it = cache.find(code); it != cache.end()) {
         const auto& cached = it->second;
-        if (std::memcmp(code, cached.code.data(), cached.code.size() * sizeof(u32)) == 0) {
+        const u64 size = cached.code.size() * sizeof(u32);
+        if (std::memcmp(ReadableCode(code, size), cached.code.data(), size) == 0) {
             return cached.data;
         }
     }
-    FetchShaderData data = ParseFetchShaderCode(code);
+    // Fetch shaders are a few dozen instructions; a longer one is read through the guest mapping.
+    constexpr u64 MaxBackingBytes = 1024;
+    const u32* readable = ReadableCode(code, MaxBackingBytes);
+    FetchShaderData data = ParseFetchShaderCode(readable);
+    if (readable != code && data.size > MaxBackingBytes) {
+        readable = code;
+        data = ParseFetchShaderCode(code);
+    }
     if (cache.size() >= 4096) {
         cache.clear();
     }
     cache[code] = CachedFetchShader{
-        .code = std::vector<u32>(code, code + data.size / sizeof(u32)),
+        .code = std::vector<u32>(readable, readable + data.size / sizeof(u32)),
         .data = data,
     };
     return data;

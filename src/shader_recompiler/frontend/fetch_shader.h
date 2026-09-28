@@ -75,4 +75,7 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
+/// Reads fetch shader code through the physical backing (shader_backing_reads).
+void SetFetchShaderBackingReads(bool enabled);
+
 } // namespace Shader::Gcn

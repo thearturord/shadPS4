@@ -144,6 +144,9 @@ private:
     /// Readback stats: compares a draw or dispatch with the previous one.
     void NoteDrawReuse(const GraphicsPipeline* pipeline);
     void NoteDispatchReuse(const ComputePipeline* pipeline);
+    /// Profiler only: how often a stage's resource sharps repeat the last binding of the same
+    /// stage (sizes a skip-unchanged optimization for buffer and texture bindings).
+    void NoteBindReuse(const Shader::Info& stage);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -198,6 +201,14 @@ private:
         AmdGpu::UserData cs_user_data{};
     };
     ReuseState reuse_state;
+
+    struct BindSnapshot {
+        u64 pgm_hash{};
+        std::vector<AmdGpu::Buffer> buffers;
+        std::vector<AmdGpu::Image> images;
+        std::vector<AmdGpu::Sampler> samplers;
+    };
+    std::array<BindSnapshot, 8> bind_snapshots;
 
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;

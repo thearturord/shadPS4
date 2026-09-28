@@ -402,6 +402,16 @@ enum class Reuse : u32 {
     StageSameAsLast,        ///< Lookups that picked the same variant as the program's last one.
     StageFastPath,          ///< Lookups answered by the last variant check (stage_lookup_reuse).
     StageFastPathMismatch,  ///< Verify mode: the full lookup picked another variant.
+    BindStageChecked,       ///< Draw/dispatch stages whose resources were compared with the last
+                            ///< binding of the same stage slot.
+    BindStageSameProgram,   ///< ... same shader as last time.
+    BindStageAllSame,       ///< ... same shader and identical buffer, image and sampler sharps.
+    BindBufferChecked,      ///< Buffer sharps compared with the same slot's last sharp.
+    BindBufferSame,         ///< ... identical.
+    BindImageChecked,       ///< Image sharps compared with the same slot's last sharp.
+    BindImageSame,          ///< ... identical.
+    BindSamplerChecked,     ///< Sampler sharps compared with the same slot's last sharp.
+    BindSamplerSame,        ///< ... identical.
     Count,
 };
 void OnReuse(Reuse reuse, u64 amount = 1);

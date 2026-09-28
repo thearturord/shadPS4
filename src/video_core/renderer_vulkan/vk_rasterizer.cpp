@@ -236,6 +236,46 @@ void Rasterizer::NoteDrawReuse(const GraphicsPipeline* pipeline) {
     }
 }
 
+void Rasterizer::NoteBindReuse(const Shader::Info& stage) {
+    VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StatsOverhead};
+    using VideoCore::ReadbackStats::OnReuse;
+    using VideoCore::ReadbackStats::Reuse;
+    auto& snap = bind_snapshots[static_cast<u32>(stage.sw_stage) % bind_snapshots.size()];
+    const bool same_program = snap.pgm_hash == stage.pgm_hash;
+    snap.pgm_hash = stage.pgm_hash;
+
+    const auto compare = [&](auto& saved, const auto& resources, Reuse checked, Reuse same) {
+        using Sharp = typename std::decay_t<decltype(saved)>::value_type;
+        bool all_same = saved.size() == resources.size();
+        saved.resize(resources.size());
+        for (u32 i = 0; i < resources.size(); ++i) {
+            const Sharp sharp = resources[i].GetSharp(stage);
+            OnReuse(checked);
+            if (std::memcmp(&saved[i], &sharp, sizeof(Sharp)) == 0) {
+                OnReuse(same);
+            } else {
+                all_same = false;
+                saved[i] = sharp;
+            }
+        }
+        return all_same;
+    };
+    const bool buffers_same = compare(snap.buffers, stage.buffers, Reuse::BindBufferChecked,
+                                      Reuse::BindBufferSame);
+    const bool images_same =
+        compare(snap.images, stage.images, Reuse::BindImageChecked, Reuse::BindImageSame);
+    const bool samplers_same = compare(snap.samplers, stage.samplers, Reuse::BindSamplerChecked,
+                                       Reuse::BindSamplerSame);
+
+    OnReuse(Reuse::BindStageChecked);
+    if (same_program) {
+        OnReuse(Reuse::BindStageSameProgram);
+        if (buffers_same && images_same && samplers_same) {
+            OnReuse(Reuse::BindStageAllSame);
+        }
+    }
+}
+
 void Rasterizer::NoteDispatchReuse(const ComputePipeline* pipeline) {
     VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StatsOverhead};
     using VideoCore::ReadbackStats::OnReuse;
@@ -802,6 +842,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
         stage->PushUd(binding, push_data);
+        if (VideoCore::ReadbackStats::IsEnabled()) {
+            NoteBindReuse(*stage);
+        }
         {
             VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::BindBuffers};
             BindBuffers(*stage, binding, push_data);

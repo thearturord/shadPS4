@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
@@ -388,26 +389,18 @@ public:
     /// Returns the recorder for the current command buffer. With command recording enabled
     /// (cp_encoder_mode), commands are recorded and replayed into the command buffer at submit.
     CommandRecorder CommandBuffer() const {
-        return CommandRecorder{current_cmdbuf, record_commands ? &cmd_list : nullptr};
+        return CommandRecorder{current_cmdbuf, record_commands ? current_list : nullptr};
     }
 
     /// Returns the current command buffer for direct use (host passes, ImGui, screenshots):
-    /// commands recorded so far are replayed into it first, so the order is kept.
-    vk::CommandBuffer SyncedCommandBuffer() {
-        if (record_commands && !cmd_list.Empty()) {
-            cmd_list.Replay(current_cmdbuf);
-        }
-        return current_cmdbuf;
-    }
+    /// commands recorded so far are replayed into it first, so the order is kept. With the
+    /// encoder thread, waits until it submitted everything handed over and records the rest of
+    /// this tick on the calling thread.
+    vk::CommandBuffer SyncedCommandBuffer();
 
-    /// Records commands into a list replayed at submit time instead of recording them into the
-    /// command buffer right away (cp_encoder_mode 1).
-    void EnableCommandRecording(bool enable) {
-        if (!enable) {
-            SyncedCommandBuffer();
-        }
-        record_commands = enable;
-    }
+    /// cp_encoder_mode: 0 = commands go straight into the command buffer, 1 = recorded and
+    /// replayed at submit on this thread, 2 = replayed and submitted on an encoder thread.
+    void SetEncoderMode(u32 mode);
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -491,8 +484,35 @@ private:
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
-    mutable CommandList cmd_list;
+    // Command recording (cp_encoder_mode). current_list collects the commands of the open tick.
+    std::unique_ptr<CommandList> current_list_owner{std::make_unique<CommandList>()};
+    CommandList* current_list{current_list_owner.get()};
     bool record_commands{};
+
+    // Encoder thread (cp_encoder_mode 2). The ordering thread closes a tick by handing its
+    // command list over; the encoder replays lists into command buffers and submits them in
+    // tick order. While direct_active, the ordering thread records the open tick into
+    // current_cmdbuf itself (after SyncedCommandBuffer) and submits it (the encoder is idle).
+    struct EncoderJob {
+        std::unique_ptr<CommandList> list;
+        SubmitInfo info;
+        u64 signal_value{};
+        s32 timing_slot{-1};
+    };
+    void EncoderThread(std::stop_token stoken);
+    void HandOffToEncoder(SubmitInfo& info, u64 signal_value);
+    void SubmitCommandBuffer(vk::CommandBuffer cmdbuf, SubmitInfo& info);
+    void WaitEncoderIdle();
+    static constexpr size_t MaxQueuedLists = 8;
+    bool use_encoder{};
+    bool direct_active{};
+    std::mutex encoder_mutex;
+    std::condition_variable_any encoder_cv;
+    std::deque<EncoderJob> encoder_jobs;
+    std::vector<std::unique_ptr<CommandList>> free_lists;
+    u64 jobs_handed{};
+    u64 jobs_done{};
+    std::mutex command_pool_mutex;
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -506,6 +526,7 @@ private:
     std::atomic<u32> num_priority_ops{};
     std::atomic<u64> max_priority_tick{};
     std::jthread priority_pending_ops_thread;
+    std::jthread encoder_thread;
     static constexpr u32 NumTimingSlots = 1024;
     vk::QueryPool timing_pool{};
     float timestamp_period{};

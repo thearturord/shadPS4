@@ -214,7 +214,10 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
 
-    current_cmdbuf = command_pool.Commit();
+    {
+        std::scoped_lock lk{command_pool_mutex};
+        current_cmdbuf = command_pool.Commit();
+    }
     Check(current_cmdbuf.begin(begin_info));
 
     current_timing_slot = -1;
@@ -238,41 +241,71 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
-void Scheduler::SubmitExecution(SubmitInfo& info) {
-    std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = master_semaphore.NextTick();
-
-    // Recorded commands go into the command buffer before anything written directly at the end.
-    EndRendering();
-    if (record_commands && !cmd_list.Empty()) {
-        const u64 replay_start = VideoCore::ReadbackStats::NowNs();
-        const u64 commands = cmd_list.Size();
-        cmd_list.Replay(current_cmdbuf);
-        VideoCore::ReadbackStats::OnCommandReplay(commands,
-                                                  VideoCore::ReadbackStats::NowNs() - replay_start);
+void Scheduler::SetEncoderMode(u32 mode) {
+    if (mode == 0) {
+        SyncedCommandBuffer();
     }
-
-#if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        profiler_scope->~VkCtxScope();
-        TracyVkCollect(profiler_ctx, current_cmdbuf);
+    record_commands = mode >= 1;
+    if (mode >= 2 && !use_encoder) {
+        use_encoder = true;
+        // The command buffer allocated at construction is still open: it becomes the first
+        // direct tick, submitted by the ordering thread. Later ticks go to the encoder.
+        direct_active = true;
+        encoder_thread = std::jthread(std::bind_front(&Scheduler::EncoderThread, this));
+        LOG_INFO(Render_Vulkan, "Command processor: Vulkan encoding on an encoder thread");
     }
-#endif
+}
 
-    EndRendering();
-    if (current_timing_slot >= 0) {
-        const u32 slot = static_cast<u32>(current_timing_slot);
-        current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing_pool,
-                                      slot * 2 + 1);
+vk::CommandBuffer Scheduler::SyncedCommandBuffer() {
+    if (use_encoder && !direct_active) {
+        // Everything handed over must be submitted before commands recorded here, which are
+        // submitted by this thread at the end of the tick.
+        WaitEncoderIdle();
+        AllocateWorkerCommandBuffers();
+        direct_active = true;
+    }
+    if (record_commands && !current_list->Empty()) {
+        current_list->Replay(current_cmdbuf);
+    }
+    return current_cmdbuf;
+}
+
+void Scheduler::WaitEncoderIdle() {
+    std::unique_lock lk{encoder_mutex};
+    encoder_cv.wait(lk, [this] { return jobs_done == jobs_handed; });
+}
+
+void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
+    info.AddSignal(master_semaphore.Handle(), signal_value);
+    EncoderJob job{
+        .info = info,
+        .signal_value = signal_value,
+    };
+    if (timing_pool) {
+        const u32 slot = next_timing_slot++ % NumTimingSlots;
+        job.timing_slot = static_cast<s32>(slot);
         std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace([this, slot] { ReadGpuTiming(slot); }, signal_value);
     }
-    Check(current_cmdbuf.end());
+    {
+        std::unique_lock lk{encoder_mutex};
+        // Back-pressure: the ordering thread may run at most a few ticks ahead of the encoder.
+        encoder_cv.wait(lk, [this] { return encoder_jobs.size() < MaxQueuedLists; });
+        job.list = std::move(current_list_owner);
+        if (free_lists.empty()) {
+            current_list_owner = std::make_unique<CommandList>();
+        } else {
+            current_list_owner = std::move(free_lists.back());
+            free_lists.pop_back();
+        }
+        current_list = current_list_owner.get();
+        encoder_jobs.push_back(std::move(job));
+        ++jobs_handed;
+    }
+    encoder_cv.notify_all();
+}
 
-    const vk::Semaphore timeline = master_semaphore.Handle();
-    info.AddSignal(timeline, signal_value);
-
+void Scheduler::SubmitCommandBuffer(vk::CommandBuffer cmdbuf, SubmitInfo& info) {
     static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -291,21 +324,135 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
         .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
+        .pCommandBuffers = &cmdbuf,
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
     VideoCore::ReadbackStats::OnVkSubmit();
+    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+}
+
+void Scheduler::EncoderThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuEncoder");
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    while (true) {
+        EncoderJob job;
+        {
+            std::unique_lock lk{encoder_mutex};
+            encoder_cv.wait(lk, stoken, [this] { return !encoder_jobs.empty(); });
+            if (encoder_jobs.empty()) {
+                return; // Stop requested and nothing left to submit.
+            }
+            job = std::move(encoder_jobs.front());
+            encoder_jobs.pop_front();
+        }
+        encoder_cv.notify_all();
+
+        const u64 start = VideoCore::ReadbackStats::NowNs();
+        vk::CommandBuffer cmdbuf;
+        {
+            std::scoped_lock lk{command_pool_mutex};
+            cmdbuf = command_pool.Commit();
+        }
+        Check(cmdbuf.begin(begin_info));
+        if (job.timing_slot >= 0) {
+            const u32 slot = static_cast<u32>(job.timing_slot);
+            cmdbuf.resetQueryPool(timing_pool, slot * 2, 2);
+            cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timing_pool, slot * 2);
+        }
+        const u64 commands = job.list->Size();
+        job.list->Replay(cmdbuf);
+        if (job.timing_slot >= 0) {
+            const u32 slot = static_cast<u32>(job.timing_slot);
+            cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing_pool,
+                                  slot * 2 + 1);
+        }
+        Check(cmdbuf.end());
+        {
+            std::scoped_lock lk{submit_mutex};
+            SubmitCommandBuffer(cmdbuf, job.info);
+        }
+        VideoCore::ReadbackStats::OnCommandReplay(commands,
+                                                  VideoCore::ReadbackStats::NowNs() - start);
+        {
+            std::unique_lock lk{encoder_mutex};
+            free_lists.push_back(std::move(job.list));
+            ++jobs_done;
+        }
+        encoder_cv.notify_all();
+    }
+}
+
+void Scheduler::SubmitExecution(SubmitInfo& info) {
+    // Recorded commands go into the command buffer before anything written directly at the end.
+    EndRendering();
+
+    if (use_encoder && !direct_active) {
+        const u64 signal_value = master_semaphore.NextTick();
+        {
+            std::scoped_lock lk{submit_mutex};
+            ImGui::Core::TextureManager::Submit();
+        }
+        if (timing_pool) {
+            VideoCore::ReadbackStats::OnRasterizerSubmit();
+        }
+        HandOffToEncoder(info, signal_value);
+        // The next tick is replayed into a new command buffer: set all dynamic state again.
+        dynamic_state.Invalidate();
+        master_semaphore.Refresh();
+        PopPendingOperations();
+        return;
+    }
+
+    if (record_commands && !current_list->Empty()) {
+        const u64 replay_start = VideoCore::ReadbackStats::NowNs();
+        const u64 commands = current_list->Size();
+        current_list->Replay(current_cmdbuf);
+        VideoCore::ReadbackStats::OnCommandReplay(commands,
+                                                  VideoCore::ReadbackStats::NowNs() - replay_start);
+    }
+
+    std::scoped_lock lk{submit_mutex};
+    const u64 signal_value = master_semaphore.NextTick();
+
+#if TRACY_GPU_ENABLED
+    auto* profiler_ctx = instance.GetProfilerContext();
+    if (profiler_ctx) {
+        profiler_scope->~VkCtxScope();
+        TracyVkCollect(profiler_ctx, current_cmdbuf);
+    }
+#endif
+
+    if (current_timing_slot >= 0) {
+        const u32 slot = static_cast<u32>(current_timing_slot);
+        current_cmdbuf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing_pool,
+                                      slot * 2 + 1);
+        std::unique_lock lk(pending_ops_mutex);
+        pending_ops.emplace([this, slot] { ReadGpuTiming(slot); }, signal_value);
+    }
+    Check(current_cmdbuf.end());
+
+    info.AddSignal(master_semaphore.Handle(), signal_value);
+    ImGui::Core::TextureManager::Submit();
     if (timing_pool) {
         VideoCore::ReadbackStats::OnRasterizerSubmit();
     }
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    SubmitCommandBuffer(current_cmdbuf, info);
 
     master_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
+    if (use_encoder) {
+        // A direct tick (after SyncedCommandBuffer) is done: the next ones go to the encoder.
+        direct_active = false;
+        current_cmdbuf = vk::CommandBuffer{};
+        current_timing_slot = -1;
+        dynamic_state.Invalidate();
+    } else {
+        AllocateWorkerCommandBuffers();
+    }
 
     // Apply pending operations
     PopPendingOperations();

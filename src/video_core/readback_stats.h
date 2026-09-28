@@ -242,6 +242,9 @@ struct ShaderCall {
 /// Records a draw or dispatch for the per-shader profile.
 void OnShaderCall(const ShaderCall& call);
 
+/// Records a replay of recorded commands into a command buffer (cp_encoder_mode).
+void OnCommandReplay(u64 commands, u64 ns);
+
 /// Records a Vulkan queue submission of the rasterizer.
 void OnVkSubmit();
 

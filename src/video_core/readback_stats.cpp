@@ -109,6 +109,8 @@ struct Counters {
     std::atomic<u64> prefetch_repeat_downloads{};
     std::atomic<u64> prefetch_repeat_bytes{};
     std::atomic<u64> hot_range_faults{};
+    std::atomic<u64> replay_commands{};
+    std::atomic<u64> replay_ns{};
     std::atomic<u64> vk_submits{};
     std::atomic<u64> async_fences{};
     std::atomic<u64> async_fence_submits{};
@@ -652,7 +654,8 @@ void ReporterThread(std::stop_token stoken) {
            "stream_rep_tick_changed,stream_rep_old_same,stream_rep_old_changed,"
            "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,stage_lookups,"
            "stage_variant_compares,stage_same_as_last,prefetch_downloads,"
-           "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults\n";
+           "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults,"
+           "cmdlist_commands,cmdlist_replay_ms\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -734,6 +737,8 @@ void ReporterThread(std::stop_token stoken) {
                 ",{},{:.2f},{},{:.2f},{}", take(counters.prefetch_downloads),
                 Mb(take(counters.prefetch_bytes)), take(counters.prefetch_repeat_downloads),
                 Mb(take(counters.prefetch_repeat_bytes)), take(counters.hot_range_faults));
+            cp_columns += fmt::format(",{},{:.2f}", take(counters.replay_commands),
+                                      Ms(take(counters.replay_ns)));
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -1055,6 +1060,11 @@ void OnHazard(Hazard hazard) {
 
 void OnReuse(Reuse reuse, u64 amount) {
     counters.reuse[static_cast<size_t>(reuse)].fetch_add(amount, std::memory_order_relaxed);
+}
+
+void OnCommandReplay(u64 commands, u64 ns) {
+    counters.replay_commands.fetch_add(commands, std::memory_order_relaxed);
+    counters.replay_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 void OnVkSubmit() {

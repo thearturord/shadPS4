@@ -123,7 +123,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    CommandBuffer().beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -131,7 +131,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    current_cmdbuf.endRendering();
+    CommandBuffer().endRendering();
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -242,6 +242,16 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = master_semaphore.NextTick();
 
+    // Recorded commands go into the command buffer before anything written directly at the end.
+    EndRendering();
+    if (record_commands && !cmd_list.Empty()) {
+        const u64 replay_start = VideoCore::ReadbackStats::NowNs();
+        const u64 commands = cmd_list.Size();
+        cmd_list.Replay(current_cmdbuf);
+        VideoCore::ReadbackStats::OnCommandReplay(commands,
+                                                  VideoCore::ReadbackStats::NowNs() - replay_start);
+    }
+
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
     if (profiler_ctx) {
@@ -321,18 +331,16 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         // Wait in slices so a wait that never completes gets reported (hang diagnostics).
         constexpr u64 ReportAfterNs = 2'000'000'000ULL;
         bool reported = false;
-        while (!master_semaphore.WaitFor(op.gpu_tick, ReportAfterNs) &&
-               !stoken.stop_requested()) {
+        while (!master_semaphore.WaitFor(op.gpu_tick, ReportAfterNs) && !stoken.stop_requested()) {
             if (!reported) {
                 reported = true;
-                LOG_WARNING(Render_Vulkan,
-                            "Hang check: priority operation still waiting for GPU tick {} (GPU "
-                            "reached {}, CPU recording {}){}",
-                            op.gpu_tick, master_semaphore.KnownGpuTick(),
-                            master_semaphore.CurrentTick(),
-                            op.gpu_tick >= master_semaphore.CurrentTick()
-                                ? " - tick was never submitted"
-                                : "");
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Hang check: priority operation still waiting for GPU tick {} (GPU "
+                    "reached {}, CPU recording {}){}",
+                    op.gpu_tick, master_semaphore.KnownGpuTick(), master_semaphore.CurrentTick(),
+                    op.gpu_tick >= master_semaphore.CurrentTick() ? " - tick was never submitted"
+                                                                  : "");
             }
         }
         if (stoken.stop_requested()) {
@@ -345,7 +353,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+void DynamicState::Commit(const Instance& instance, const CommandRecorder& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

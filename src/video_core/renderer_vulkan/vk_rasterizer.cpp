@@ -50,6 +50,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
+    scheduler.EnableCommandRecording(EmulatorSettings.GetCpEncoderMode() >= 1);
     memory->SetRasterizer(this);
     VideoCore::ReadbackStats::Start();
     if (VideoCore::ReadbackStats::IsEnabled()) {

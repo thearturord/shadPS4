@@ -12,6 +12,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
+#include "video_core/renderer_vulkan/vk_command_recorder.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
@@ -164,7 +165,7 @@ struct DynamicState {
     bool feedback_loop_enabled{};
 
     /// Commits the dynamic state to the provided command buffer.
-    void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+    void Commit(const Instance& instance, const CommandRecorder& cmdbuf);
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
@@ -384,9 +385,28 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Returns the recorder for the current command buffer. With command recording enabled
+    /// (cp_encoder_mode), commands are recorded and replayed into the command buffer at submit.
+    CommandRecorder CommandBuffer() const {
+        return CommandRecorder{current_cmdbuf, record_commands ? &cmd_list : nullptr};
+    }
+
+    /// Returns the current command buffer for direct use (host passes, ImGui, screenshots):
+    /// commands recorded so far are replayed into it first, so the order is kept.
+    vk::CommandBuffer SyncedCommandBuffer() {
+        if (record_commands && !cmd_list.Empty()) {
+            cmd_list.Replay(current_cmdbuf);
+        }
         return current_cmdbuf;
+    }
+
+    /// Records commands into a list replayed at submit time instead of recording them into the
+    /// command buffer right away (cp_encoder_mode 1).
+    void EnableCommandRecording(bool enable) {
+        if (!enable) {
+            SyncedCommandBuffer();
+        }
+        record_commands = enable;
     }
 
     /// Returns the current command buffer tick.
@@ -426,8 +446,8 @@ public:
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func, u64 tick) {
         num_priority_ops.fetch_add(1, std::memory_order_acq_rel);
         u64 max_tick = max_priority_tick.load(std::memory_order_relaxed);
-        while (tick > max_tick &&
-               !max_priority_tick.compare_exchange_weak(max_tick, tick, std::memory_order_acq_rel)) {
+        while (tick > max_tick && !max_priority_tick.compare_exchange_weak(
+                                      max_tick, tick, std::memory_order_acq_rel)) {
         }
         {
             std::unique_lock lk(priority_pending_ops_mutex);
@@ -471,6 +491,8 @@ private:
     CommandPool command_pool;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
+    mutable CommandList cmd_list;
+    bool record_commands{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

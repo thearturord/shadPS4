@@ -457,6 +457,13 @@ struct GPUSettings {
     // end of every guest submission, 4 = fences without readbacks wait for all earlier work
     // (always on with the encoder thread).
     Setting<u32> cp_encoder_debug{0};
+    // Encoder thread: fence kinds that wait for all earlier work (bit mask, see
+    // VideoCore::FenceKind): 1 = graphics EOP, 2 = graphics EOS, 4 = compute ReleaseMem,
+    // 8 = label writes held behind a fence, 16 = end of a guest submission.
+    // Status: flickering feathers were seen once without full fences, but never again in later
+    // runs with 0 (spear scene included), so the need is unproven. 0 is the fastest (up to ~17%
+    // of CP time in heavy scenes) and presumably can cause the flicker; 31 is the safe default.
+    Setting<u32> cp_full_fence_kinds{31};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -508,21 +515,20 @@ struct GPUSettings {
                                        &GPUSettings::rt_lookup_reuse_enabled),
             make_override<GPUSettings>("cp_encoder_mode", &GPUSettings::cp_encoder_mode),
             make_override<GPUSettings>("cp_encoder_debug", &GPUSettings::cp_encoder_debug),
+            make_override<GPUSettings>("cp_full_fence_kinds", &GPUSettings::cp_full_fence_kinds),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, readback_stats_enabled,
-                                   readback_batching_enabled, readback_async_fences_enabled,
-                                   readback_fence_wait_shortcut, readback_hot_write_pages_enabled,
-                                   readback_stream_reuse_enabled, readback_prefetch_mode,
-                                   readback_prefetch_lifetime, rt_lookup_reuse_enabled,
-                                   cp_encoder_mode, cp_encoder_debug, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    GPUSettings, window_width, window_height, internal_screen_width, internal_screen_height,
+    null_gpu, copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,
+    direct_memory_access_enabled, readback_stats_enabled, readback_batching_enabled,
+    readback_async_fences_enabled, readback_fence_wait_shortcut, readback_hot_write_pages_enabled,
+    readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime,
+    rt_lookup_reuse_enabled, cp_encoder_mode, cp_encoder_debug, cp_full_fence_kinds, dump_shaders,
+    patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
+    fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -811,6 +817,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RtLookupReuseEnabled, rt_lookup_reuse_enabled)
     SETTING_FORWARD(m_gpu, CpEncoderMode, cp_encoder_mode)
     SETTING_FORWARD(m_gpu, CpEncoderDebug, cp_encoder_debug)
+    SETTING_FORWARD(m_gpu, CpFullFenceKinds, cp_full_fence_kinds)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
 
     u32 GetVblankFrequency() {

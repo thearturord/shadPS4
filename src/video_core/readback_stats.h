@@ -11,6 +11,20 @@
 // Diagnostic counters for GPU readbacks and related stalls. Enabled per game with the
 // `readback_stats_enabled` GPU setting. Writes readback_stats.csv (one line per second) and
 // readback_top.txt (buffers/images/shaders ranked by stall time) to the log directory.
+namespace VideoCore {
+
+/// Where a guest fence comes from (bit values, cp_full_fence_kinds).
+enum FenceKind : u32 {
+    FenceGfxEop = 1,         ///< EventWriteEop on the graphics queue.
+    FenceGfxEos = 2,         ///< EventWriteEos on the graphics queue.
+    FenceComputeRelease = 4, ///< ReleaseMem on a compute queue.
+    FenceHeldWrite = 8,      ///< Label write queued behind a fence that has not landed.
+    FenceSubmitEnd = 16,     ///< End of a guest submission (no guest fence attached).
+};
+inline constexpr u32 NumFenceKinds = 5;
+
+} // namespace VideoCore
+
 namespace VideoCore::ReadbackStats {
 
 /// Pseudo stage ids used for writers that are not shaders.
@@ -303,8 +317,9 @@ enum class Reuse : u32 {
 };
 void OnReuse(Reuse reuse, u64 amount = 1);
 
-/// Records an asynchronous fence and whether it had to submit the command buffer.
-void OnAsyncFence(bool submitted);
+/// Records an asynchronous fence of the given kind and whether it had to submit the command
+/// buffer.
+void OnAsyncFence(FenceKind kind, bool submitted);
 
 /// Records a small read-only buffer copied into the stream buffer at bind time.
 void OnStreamCopy(u64 bytes);

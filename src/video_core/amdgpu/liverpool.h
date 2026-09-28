@@ -20,6 +20,7 @@
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/regs.h"
+#include "video_core/readback_stats.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -244,7 +245,8 @@ private:
     /// Runs `signal` once the readbacks before this fence are in guest memory, recording the
     /// fence value (if known) in the label timeline meanwhile.
     void SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
-                                   VAddr address, u64 value, u32 num_bytes, u32 queue);
+                                   VAddr address, u64 value, u32 num_bytes, u32 queue,
+                                   VideoCore::FenceKind kind);
 
     struct GpuQueue {
         std::mutex m_access{};

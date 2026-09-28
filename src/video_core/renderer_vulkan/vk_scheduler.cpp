@@ -379,7 +379,10 @@ void Scheduler::EncoderThread(std::stop_token stoken) {
         }
         Check(cmdbuf.end());
         {
+            // ImGui texture uploads submit to the queue too: done here, the ordering thread
+            // never waits for the submit lock while this thread is in the driver.
             std::scoped_lock lk{submit_mutex};
+            ImGui::Core::TextureManager::Submit();
             SubmitCommandBuffer(cmdbuf, job.info);
         }
         VideoCore::ReadbackStats::OnCommandReplay(commands,
@@ -399,10 +402,6 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     if (use_encoder && !direct_active) {
         const u64 signal_value = master_semaphore.NextTick();
-        {
-            std::scoped_lock lk{submit_mutex};
-            ImGui::Core::TextureManager::Submit();
-        }
         if (timing_pool) {
             VideoCore::ReadbackStats::OnRasterizerSubmit();
         }

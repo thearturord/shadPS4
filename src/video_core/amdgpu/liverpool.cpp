@@ -282,14 +282,15 @@ void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_s
 }
 
 void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
-                                          VAddr address, u64 value, u32 num_bytes, u32 queue) {
+                                          VAddr address, u64 value, u32 num_bytes, u32 queue,
+                                          VideoCore::FenceKind kind) {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Fence};
     if (!rasterizer) {
         signal();
         return;
     }
     if (address == 0 || num_bytes == 0) {
-        rasterizer->OnFence(std::move(signal), must_sync);
+        rasterizer->OnFence(std::move(signal), kind, must_sync);
         return;
     }
     const u64 seq = RecordFence(address, value, num_bytes, queue);
@@ -298,7 +299,7 @@ void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal,
             signal();
             RetireFence(address, seq);
         },
-        must_sync);
+        kind, must_sync);
 }
 
 bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
@@ -336,7 +337,7 @@ bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_b
     };
     const bool is_label = num_bytes == sizeof(u32) || num_bytes == sizeof(u64);
     SignalFenceAfterReadbacks(std::move(signal), false, is_label ? begin : 0, value,
-                              is_label ? num_bytes : 0, queue);
+                              is_label ? num_bytes : 0, queue, VideoCore::FenceHeldWrite);
     return true;
 }
 
@@ -962,9 +963,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // GdsStore reads GDS on this thread right after, keep it synchronous.
                 const bool is_gds_store =
                     event_eos->command == PM4CmdEventWriteEos::Command::GdsStore;
-                SignalFenceAfterReadbacks(std::move(signal), is_gds_store,
-                                          is_gds_store ? 0 : event_eos->Address<VAddr>(),
-                                          event_eos->DataDWord(), sizeof(u32), GfxQueueId);
+                SignalFenceAfterReadbacks(
+                    std::move(signal), is_gds_store, is_gds_store ? 0 : event_eos->Address<VAddr>(),
+                    event_eos->DataDWord(), sizeof(u32), GfxQueueId, VideoCore::FenceGfxEos);
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -1005,9 +1006,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 eop_bytes = eop_data_sel == DataSelect::Data32Low ? sizeof(u32)
                                       : eop_data_sel == DataSelect::Data64  ? sizeof(u64)
                                                                             : 0;
-                SignalFenceAfterReadbacks(std::move(signal), false,
-                                          reinterpret_cast<VAddr>(event_eop->Address<u8>()),
-                                          event_eop->DataQWord(), eop_bytes, GfxQueueId);
+                SignalFenceAfterReadbacks(
+                    std::move(signal), false, reinterpret_cast<VAddr>(event_eop->Address<u8>()),
+                    event_eop->DataQWord(), eop_bytes, GfxQueueId, VideoCore::FenceGfxEop);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1548,9 +1549,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32)
                                       : release_data_sel == DataSelect::Data64  ? sizeof(u64)
                                                                                 : 0;
-            SignalFenceAfterReadbacks(
-                std::move(signal), release_data_sel == DataSelect::GdsMemStore,
-                release_mem->Address<VAddr>(), release_mem->DataQWord(), release_bytes, vqid + 1);
+            SignalFenceAfterReadbacks(std::move(signal),
+                                      release_data_sel == DataSelect::GdsMemStore,
+                                      release_mem->Address<VAddr>(), release_mem->DataQWord(),
+                                      release_bytes, vqid + 1, VideoCore::FenceComputeRelease);
             break;
         }
         case PM4ItOpcode::EventWrite: {

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <condition_variable>
 #include <fstream>
 #include <map>
@@ -114,6 +115,8 @@ struct Counters {
     std::atomic<u64> vk_submits{};
     std::atomic<u64> async_fences{};
     std::atomic<u64> async_fence_submits{};
+    std::array<std::atomic<u64>, NumFenceKinds> fence_kinds{};
+    std::array<std::atomic<u64>, NumFenceKinds> fence_kind_submits{};
     std::atomic<u64> stream_copy_bytes{};
     std::atomic<u64> stream_waits{};
     std::atomic<u64> stream_wait_ns{};
@@ -655,7 +658,9 @@ void ReporterThread(std::stop_token stoken) {
            "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,stage_lookups,"
            "stage_variant_compares,stage_same_as_last,prefetch_downloads,"
            "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults,"
-           "cmdlist_commands,cmdlist_replay_ms\n";
+           "cmdlist_commands,cmdlist_replay_ms,fences_eop,fences_eos,fences_release,"
+           "fences_held_write,fences_submit_end,fence_submits_eop,fence_submits_eos,"
+           "fence_submits_release,fence_submits_held_write,fence_submits_submit_end\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -739,6 +744,12 @@ void ReporterThread(std::stop_token stoken) {
                 Mb(take(counters.prefetch_repeat_bytes)), take(counters.hot_range_faults));
             cp_columns += fmt::format(",{},{:.2f}", take(counters.replay_commands),
                                       Ms(take(counters.replay_ns)));
+            for (auto& count : counters.fence_kinds) {
+                cp_columns += fmt::format(",{}", take(count));
+            }
+            for (auto& count : counters.fence_kind_submits) {
+                cp_columns += fmt::format(",{}", take(count));
+            }
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -1071,10 +1082,17 @@ void OnVkSubmit() {
     counters.vk_submits.fetch_add(1, std::memory_order_relaxed);
 }
 
-void OnAsyncFence(bool submitted) {
+void OnAsyncFence(FenceKind kind, bool submitted) {
+    const u32 index = static_cast<u32>(std::countr_zero(static_cast<u32>(kind)));
     counters.async_fences.fetch_add(1, std::memory_order_relaxed);
+    if (index < NumFenceKinds) {
+        counters.fence_kinds[index].fetch_add(1, std::memory_order_relaxed);
+    }
     if (submitted) {
         counters.async_fence_submits.fetch_add(1, std::memory_order_relaxed);
+        if (index < NumFenceKinds) {
+            counters.fence_kind_submits[index].fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 

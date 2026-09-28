@@ -16,7 +16,6 @@ Test system: Ryzen 7 5700X3D, RTX 4090, 64 GB RAM, 60 FPS patch and native 4K pa
 
 | Metric (gameplay, per second) | Baseline | Current |
 | :--- | :--- | :--- |
-| FPS | ~18 | ~29 average (median 27, range 14-61) |
 | Buffer readbacks that fault and stall | ~350 | ~6 |
 | GPU thread time blocked in `Scheduler::Finish` | ~430 ms | ~9 ms |
 | Guest threads blocked on readbacks | ~380 ms | ~11 ms |
@@ -53,6 +52,12 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
 | `readback_prefetch_mode` | Which ranges are downloaded in advance at fences: 0 = none, 1 = ranges that faulted on a read or a write (default), 2 = read faults only. |
 | `readback_prefetch_lifetime` | Guest submissions (about frames) a prefetched range stays hot after its last fault. Default 600; 60 is used for TLG. |
 | `rt_lookup_reuse_enabled` | Draws with the same render target registers as the previous draw reuse its target images instead of a texture cache lookup. |
+| `cp_encoder_mode` | `tlg-encoder-thread` only. 0 = record Vulkan commands directly, 1 = record into lists replayed on the same thread, 2 = replay and submit on an encoder thread (used for TLG), 3 = like 2 but waiting for each submission (diagnostic). |
+| `cp_full_fence_kinds` | `tlg-encoder-thread` only. With the encoder thread, fence kinds that wait for all work recorded before them (bit mask): 1 = graphics EOP, 2 = graphics EOS, 4 = compute ReleaseMem, 8 = label writes held behind a fence, 16 = end of a guest submission. Default 31; 4 is used for TLG. 0 makes Trico's feathers flicker when pulling the spear out. |
+| `cp_encoder_debug` | `tlg-encoder-thread` only, diagnostics: 1 = wait for the encoder at every fence, 2 = at every guest submission, 4 = full fences without the encoder. |
+| `stage_lookup_reuse` | `tlg-encoder-thread` only. Shader stage lookups first check the variant picked last time: 0 = off, 1 = on, 2 = verify (both paths, mismatches logged). |
+| `readback_async_guest_faults` | `tlg-encoder-thread` only. A guest thread's fault on GPU-written memory: the command thread records and submits the download and goes on, the guest thread waits for it. |
+| `shader_backing_reads` | `tlg-encoder-thread` only. Disabled in code (ignored): reading shader code through the physical backing drew a wrong shader and crashed at game load. |
 
 ## Steps taken
 

@@ -26,8 +26,9 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 > [!NOTE]
 > **Fork:** made for fun, to see how much The Last Guardian could be optimized by someone with no
-> coding knowledge, with Claude doing the programming. The `tlg-readback-perf` branch adds opt-in
-> performance work with accurate readbacks. See [documents/tlg/README.md](./documents/tlg/README.md).
+> coding knowledge, with Claude doing the programming. The `tlg-encoder-thread` branch (default)
+> and `tlg-readback-perf` add opt-in performance work with accurate readbacks. See
+> [documents/tlg/README.md](./documents/tlg/README.md).
 
 |               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
 | :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |

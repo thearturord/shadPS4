@@ -474,9 +474,10 @@ struct GPUSettings {
     // Encoder thread: fence kinds that wait for all earlier work (bit mask, see
     // VideoCore::FenceKind): 1 = graphics EOP, 2 = graphics EOS, 4 = compute ReleaseMem,
     // 8 = label writes held behind a fence, 16 = end of a guest submission.
-    // Status: flickering feathers were seen once without full fences, but never again in later
-    // runs with 0 (spear scene included), so the need is unproven. 0 is the fastest (up to ~17%
-    // of CP time in heavy scenes) and presumably can cause the flicker; 31 is the safe default.
+    // Status: with 0, Trico's feathers flicker when pulling the spear out at the start of the
+    // game. 31, 4 and 27 were all clean there, so the kind that matters isn't pinned down; 4 is
+    // the cheapest tested and is used for TLG (31 makes every fence submit: up to ~17% of CP
+    // time in heavy scenes).
     Setting<u32> cp_full_fence_kinds{31};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};

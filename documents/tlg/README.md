@@ -5,6 +5,10 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # The Last Guardian performance fork
 
+> This is a fork made for fun, to see how much I could optimize this one game with no coding
+> knowledge. All the code and measurements were done with Claude (Anthropic's AI) doing the
+> programming. It is not an official shadPS4 project.
+
 This branch (`tlg-readback-perf`) makes The Last Guardian (CUSA03627) faster in shadPS4 while
 keeping Precise readbacks and linear image readbacks fully accurate. Those readbacks are what keep
 Trico's feathers, climbing, the spear and outdoor lighting correct.

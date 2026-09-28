@@ -402,6 +402,15 @@ public:
     /// replayed at submit on this thread, 2 = replayed and submitted on an encoder thread.
     void SetEncoderMode(u32 mode);
 
+    /// Encoder thread: submits the open tick and waits until everything handed over is
+    /// submitted (cp_encoder_debug diagnostics). Does nothing without the encoder.
+    void SyncEncoder() {
+        if (use_encoder && !direct_active) {
+            Flush();
+            WaitEncoderIdle();
+        }
+    }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return master_semaphore.CurrentTick();
@@ -505,6 +514,7 @@ private:
     void WaitEncoderIdle();
     static constexpr size_t MaxQueuedLists = 8;
     bool use_encoder{};
+    bool encoder_sync{}; ///< cp_encoder_mode 3: wait for each list to be submitted.
     bool direct_active{};
     std::mutex encoder_mutex;
     std::condition_variable_any encoder_cv;

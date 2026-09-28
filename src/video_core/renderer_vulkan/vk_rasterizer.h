@@ -178,6 +178,9 @@ private:
     };
     std::array<CachedTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_cache{};
     const bool rt_reuse_enabled;
+    const u32 encoder_debug;
+    /// Encoder thread: fences without readbacks wait for all work recorded before them.
+    const bool full_eop_fences;
     /// True if the inputs match the cached lookup; otherwise stores them for the next draw.
     template <typename... Ts>
     bool TargetInputsMatch(CachedTarget& cache, const Ts&... parts);

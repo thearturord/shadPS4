@@ -46,7 +46,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       readback_batching{EmulatorSettings.IsReadbackBatchingEnabled()},
       async_fences{EmulatorSettings.IsReadbackAsyncFencesEnabled()},
-      rt_reuse_enabled{EmulatorSettings.IsRtLookupReuseEnabled()} {
+      rt_reuse_enabled{EmulatorSettings.IsRtLookupReuseEnabled()},
+      encoder_debug{EmulatorSettings.GetCpEncoderDebug()},
+      full_eop_fences{EmulatorSettings.GetCpEncoderMode() >= 2 || (encoder_debug & 4) != 0} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -746,6 +748,9 @@ u64 Rasterizer::CurrentTick() const noexcept {
 
 void Rasterizer::OnSubmit() {
     VideoCore::ReadbackStats::OnSubmit();
+    if (encoder_debug & 2) {
+        scheduler.SyncEncoder();
+    }
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -1490,6 +1495,9 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) {
+    if (encoder_debug & 1) {
+        scheduler.SyncEncoder();
+    }
     if (!async_fences || must_sync) {
         // Synchronous path: readbacks complete (and earlier async fences drain, via Finish)
         // before the fence is signaled from the GPU thread.
@@ -1527,11 +1535,16 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) 
         return;
     }
     // Without copies there is nothing new to wait for, only earlier fences to stay behind.
-    const u64 tick = has_copies ? scheduler.CurrentTick() : scheduler.CurrentTick() - 1;
+    // With the encoder thread the fence also waits for the work recorded before it in this
+    // command buffer: its submission can lag, and signaling on the previous command buffer let
+    // the game see the fence long before that work ran (flickering feathers). Also forced by
+    // cp_encoder_debug bit 4.
+    const bool full_eop = full_eop_fences;
+    const u64 tick = has_copies || full_eop ? scheduler.CurrentTick() : scheduler.CurrentTick() - 1;
     // Submit when this or an earlier operation waits on the current command buffer: the guest
     // may block on this fence without submitting anything else. Otherwise every tick waited on
     // is submitted already and submitting would only cost time.
-    const bool needs_submit = has_copies || scheduler.PriorityOperationsNeedSubmit();
+    const bool needs_submit = has_copies || full_eop || scheduler.PriorityOperationsNeedSubmit();
     VideoCore::ReadbackStats::OnAsyncFence(needs_submit);
     scheduler.DeferPriorityOperation(
         [callbacks = batch.TakeCallbacks(), signal = std::move(signal)]() mutable {

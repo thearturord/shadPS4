@@ -251,8 +251,10 @@ void Scheduler::SetEncoderMode(u32 mode) {
         // The command buffer allocated at construction is still open: it becomes the first
         // direct tick, submitted by the ordering thread. Later ticks go to the encoder.
         direct_active = true;
+        encoder_sync = mode == 3;
         encoder_thread = std::jthread(std::bind_front(&Scheduler::EncoderThread, this));
-        LOG_INFO(Render_Vulkan, "Command processor: Vulkan encoding on an encoder thread");
+        LOG_INFO(Render_Vulkan, "Command processor: Vulkan encoding on an encoder thread{}",
+                 encoder_sync ? " (synchronous hand-off, diagnostic)" : "");
     }
 }
 
@@ -303,6 +305,10 @@ void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
         ++jobs_handed;
     }
     encoder_cv.notify_all();
+    if (encoder_sync) {
+        // Diagnostic mode 3: the ordering thread never runs ahead of the submission.
+        WaitEncoderIdle();
+    }
 }
 
 void Scheduler::SubmitCommandBuffer(vk::CommandBuffer cmdbuf, SubmitInfo& info) {

@@ -383,7 +383,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
-    // Draw reuse measurement, disabled: done (see documents/tlg-readback-performance.md).
+    // Draw reuse measurement, disabled: done (see documents/tlg/readback-performance.md).
     // if (VideoCore::ReadbackStats::IsEnabled()) {
     //     NoteDrawReuse(pipeline);
     // }
@@ -471,7 +471,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
-    // Draw reuse measurement, disabled: done (see documents/tlg-readback-performance.md).
+    // Draw reuse measurement, disabled: done (see documents/tlg/readback-performance.md).
     // if (VideoCore::ReadbackStats::IsEnabled()) {
     //     NoteDrawReuse(pipeline);
     // }

@@ -31,8 +31,9 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
   "GPU": {
     "readback_async_fences_enabled": true,
     "readback_batching_enabled": true,
-    "readback_fence_wait_shortcut": 1,
-    "readback_stats_enabled": true
+    "readback_fence_wait_shortcut": 3,
+    "readback_stream_reuse_enabled": true,
+    "readback_stats_enabled": false
   }
 }
 ```
@@ -142,10 +143,10 @@ through `VK_EXT_external_memory_host`, so the GPU writes guest memory directly.
   (summed across queues) blocked in `WaitRegMem` on those fences. Large shared buffers (7-12 MB)
   also moved heavy GPU traffic onto PCIe.
 - Conclusion: shared memory only pays off once fence waits no longer block the command processor
-  thread (see `documents/tlg-gpu-side-fence-waits-plan.md`).
+  thread (see `documents/tlg/gpu-side-fence-waits-plan.md`).
 
 ### 8. Fence waits on the GPU timeline (`readback_fence_wait_shortcut: 3`)
-See `documents/tlg-gpu-side-fence-waits-plan.md`. Command stream waits pass as soon as the fence
+See `documents/tlg/gpu-side-fence-waits-plan.md`. Command stream waits pass as soon as the fence
 they wait for is recorded, and a GPU barrier (level 3) orders the following work after it, so the
 command processor thread no longer waits for the GPU at these waits. Only the latest recorded
 value per label counts. The stats now split waits by class and queue, and a watchdog logs where
@@ -203,8 +204,8 @@ per second that each submitted a command buffer (~125 ms/s).
   Vulkan call timing (option B study: ~10-13% of the command processor) is off by default.
 
 ### 12. Phase 0 measurements, stream copy reuse
-- Phase 0 of the multicore plan: the work an encoder thread could take (Vulkan calls ~10-13%,
-  stream memcpy ~3%) is below the plan's ~20% gate, so the multicore rework is on hold.
+- Moving work to a second command thread: the work an encoder thread could take (Vulkan calls ~10-13%,
+  stream memcpy ~3%) is below the ~20% needed to be worth it, so it is on hold.
 - Hot write pages (`readback_hot_write_pages_enabled`): write faults ~35k -> ~6k/s, but uploads
   on the command thread +~55 ms/s. The game threads have headroom, the command thread doesn't:
   off by default.

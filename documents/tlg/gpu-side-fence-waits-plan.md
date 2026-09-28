@@ -7,7 +7,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 Target: The Last Guardian (CUSA03627) with Precise + linear image readbacks. It builds on
 branch `tlg-readback-perf` (`78d4f381`, `6185087a`) and the notes in
-`documents/tlg-readback-performance.md`. The status section below tracks what was done; the
+`documents/tlg/readback-performance.md`. The status section below tracks what was done; the
 sections after it are the original plan.
 
 ## Status

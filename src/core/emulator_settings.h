@@ -452,9 +452,14 @@ struct GPUSettings {
     // Shader stage lookups first check the variant the program picked last time, without building
     // a new specialization: 0 = off, 1 = on, 2 = verify (both paths, mismatches logged).
     Setting<u32> stage_lookup_reuse{0};
-    // Shader binary headers (hash and length, read at every draw) are read through the physical
-    // backing instead of the guest mapping: no readback when the page also holds GPU-written data.
+    // Shader binary headers and fetch shader code (read at every draw) are read through the
+    // physical backing when the CPU copy of those bytes is current: no readback when only other
+    // bytes of the page were written by the GPU. Bytes the GPU wrote are still read back.
+    // DISABLED (ignored, see Vulkan::Rasterizer): crashed at game load, drew a wrong shader.
     Setting<bool> shader_backing_reads{false};
+    // Diagnostic for shader_backing_reads: every backing read is compared with the guest mapping
+    // (differences are logged) and the guest mapping's bytes are used.
+    Setting<bool> shader_backing_verify{false};
     // Readbacks for page faults of guest threads: the command processor records and submits the
     // downloads, then goes on while the faulting thread waits for them to land.
     Setting<bool> readback_async_guest_faults{false};
@@ -524,6 +529,8 @@ struct GPUSettings {
                                        &GPUSettings::rt_lookup_reuse_enabled),
             make_override<GPUSettings>("stage_lookup_reuse", &GPUSettings::stage_lookup_reuse),
             make_override<GPUSettings>("shader_backing_reads", &GPUSettings::shader_backing_reads),
+            make_override<GPUSettings>("shader_backing_verify",
+                                       &GPUSettings::shader_backing_verify),
             make_override<GPUSettings>("readback_async_guest_faults",
                                        &GPUSettings::readback_async_guest_faults),
             make_override<GPUSettings>("cp_encoder_mode", &GPUSettings::cp_encoder_mode),
@@ -539,10 +546,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     direct_memory_access_enabled, readback_stats_enabled, readback_batching_enabled,
     readback_async_fences_enabled, readback_fence_wait_shortcut, readback_hot_write_pages_enabled,
     readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime,
-    rt_lookup_reuse_enabled, stage_lookup_reuse, shader_backing_reads, readback_async_guest_faults,
-    cp_encoder_mode, cp_encoder_debug, cp_full_fence_kinds, dump_shaders, patch_shaders,
-    vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled,
-    rcas_enabled, rcas_attenuation)
+    rt_lookup_reuse_enabled, stage_lookup_reuse, shader_backing_reads, shader_backing_verify,
+    readback_async_guest_faults, cp_encoder_mode, cp_encoder_debug, cp_full_fence_kinds,
+    dump_shaders, patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode,
+    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -831,6 +838,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, RtLookupReuseEnabled, rt_lookup_reuse_enabled)
     SETTING_FORWARD(m_gpu, StageLookupReuse, stage_lookup_reuse)
     SETTING_FORWARD_BOOL(m_gpu, ShaderBackingReadsEnabled, shader_backing_reads)
+    SETTING_FORWARD_BOOL(m_gpu, ShaderBackingVerifyEnabled, shader_backing_verify)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackAsyncGuestFaultsEnabled, readback_async_guest_faults)
     SETTING_FORWARD(m_gpu, CpEncoderMode, cp_encoder_mode)
     SETTING_FORWARD(m_gpu, CpEncoderDebug, cp_encoder_debug)

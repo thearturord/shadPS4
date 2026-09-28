@@ -30,23 +30,39 @@ using Shader::SwStage;
 
 namespace {
 
-/// AmdGpu::GetParams, reading the binary header through the physical backing when possible
-/// (shader_backing_reads): shaders often share pages with data the GPU writes, and reading them
-/// through the guest mapping then faults and waits for a readback of the whole page.
+/// AmdGpu::GetParams, reading the binary header through the physical backing when the CPU copy
+/// of those bytes is current (shader_backing_reads): shaders share pages with data the GPU writes,
+/// and reading them through the guest mapping then faults and waits for a readback of the page.
+/// The game also copies shader code with the GPU, so the bytes themselves are checked each time.
 template <typename Program>
-Shader::ShaderParams ReadShaderParams(const Program& pgm, bool backing_reads) {
-    if (backing_reads) {
+Shader::ShaderParams ReadShaderParams(const Program& pgm,
+                                      const std::function<bool(VAddr, u64)>& cpu_copy_is_current,
+                                      bool verify) {
+    if (cpu_copy_is_current) {
         const auto* code = pgm.template Address<u32*>();
         const VAddr code_addr = reinterpret_cast<VAddr>(code);
         auto* memory = Core::Memory::Instance();
         constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-        if (const u8* head = memory->BackingPointer(code_addr, 2 * sizeof(u32))) {
+        const u8* head = cpu_copy_is_current(code_addr, 2 * sizeof(u32))
+                             ? memory->BackingPointer(code_addr, 2 * sizeof(u32))
+                             : nullptr;
+        if (head && verify) {
+            memory->VerifyBackingRead(code_addr, head, 2 * sizeof(u32), "shader header");
+        }
+        if (head) {
             std::array<u32, 2> words;
             std::memcpy(words.data(), head, sizeof(words));
             if (words[0] == token_mov_vcchi) {
                 const VAddr info_addr = code_addr + (u64(words[1]) + 1) * 2 * sizeof(u32);
-                if (const u8* info_ptr =
-                        memory->BackingPointer(info_addr, sizeof(AmdGpu::BinaryInfo))) {
+                const u8* info_ptr =
+                    cpu_copy_is_current(info_addr, sizeof(AmdGpu::BinaryInfo))
+                        ? memory->BackingPointer(info_addr, sizeof(AmdGpu::BinaryInfo))
+                        : nullptr;
+                if (info_ptr && verify) {
+                    memory->VerifyBackingRead(info_addr, info_ptr, sizeof(AmdGpu::BinaryInfo),
+                                              "shader binary info");
+                }
+                if (info_ptr && !verify) {
                     AmdGpu::BinaryInfo info;
                     std::memcpy(&info, info_ptr, sizeof(info));
                     if (info.Valid()) {
@@ -299,9 +315,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
-      stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()},
-      shader_backing_reads{EmulatorSettings.IsShaderBackingReadsEnabled()} {
-    Shader::Gcn::SetFetchShaderBackingReads(shader_backing_reads);
+      stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -364,7 +378,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     pipeline_cache = std::move(cache);
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    Shader::Gcn::SetFetchShaderBackingReads({});
+}
+
+void PipelineCache::SetBackingReadCheck(std::function<bool(VAddr, u64)> is_cpu_copy_current,
+                                        bool verify) {
+    cpu_copy_is_current = is_cpu_copy_current;
+    backing_verify = verify;
+    Shader::Gcn::SetFetchShaderBackingReads(std::move(is_cpu_copy_current), verify);
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
@@ -560,7 +583,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = ReadShaderParams(*pgm, shader_backing_reads);
+        const auto params = ReadShaderParams(*pgm, cpu_copy_is_current, backing_verify);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
@@ -664,7 +687,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = ReadShaderParams(cs_pgm, shader_backing_reads);
+    const auto cs_params = ReadShaderParams(cs_pgm, cpu_copy_is_current, backing_verify);
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineStages};
         std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =

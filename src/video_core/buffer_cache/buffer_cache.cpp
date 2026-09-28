@@ -470,6 +470,14 @@ void BufferCache::ApplyPendingUnmarks() {
     }
 }
 
+bool BufferCache::IsCpuCopyCurrent(VAddr device_addr, u64 size) {
+    if (!memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        return true;
+    }
+    return !gpu_modified_ranges.Intersects(device_addr, size) &&
+           !IsDownloadInFlight(device_addr, size);
+}
+
 bool BufferCache::IsDownloadInFlight(VAddr device_addr, u64 size) {
     std::scoped_lock lk{pending_unmarks_mutex};
     return std::ranges::any_of(inflight_downloads, [&](const InflightDownload& download) {

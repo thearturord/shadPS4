@@ -256,6 +256,36 @@ const u8* MemoryManager::BackingPointer(VAddr virtual_addr, u64 size) {
     return backing + (virtual_addr - area_base);
 }
 
+bool MemoryManager::VerifyBackingRead(VAddr virtual_addr, const u8* backing, u64 size,
+                                      const char* what) {
+    const u8* guest = std::bit_cast<const u8*>(virtual_addr);
+    if (std::memcmp(backing, guest, size) == 0) {
+        return true;
+    }
+    static std::atomic<u32> num_logged{};
+    if (num_logged.fetch_add(1, std::memory_order_relaxed) < 50) {
+        u32 type = ~0U;
+        VAddr vma_base{};
+        {
+            std::shared_lock lk{mutex};
+            if (IsValidMapping(virtual_addr, size)) {
+                const auto& vma = FindVMA(virtual_addr)->second;
+                type = static_cast<u32>(vma.type);
+                vma_base = vma.base;
+            }
+        }
+        u64 backing_word{};
+        u64 guest_word{};
+        std::memcpy(&backing_word, backing, std::min<u64>(size, sizeof(u64)));
+        std::memcpy(&guest_word, guest, std::min<u64>(size, sizeof(u64)));
+        LOG_WARNING(Core,
+                    "Backing read mismatch ({}) at {:#x}+{}: mapping type {} (area base {:#x}), "
+                    "backing {:#018x} guest {:#018x}",
+                    what, virtual_addr, size, type, vma_base, backing_word, guest_word);
+    }
+    return false;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};

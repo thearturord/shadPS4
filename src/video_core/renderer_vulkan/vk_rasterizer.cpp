@@ -53,6 +53,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
+    // shader_backing_reads is disabled: reading through MemoryManager::BackingPointer crashed the
+    // command processor at game load (access violation, also in shader_backing_verify mode), and
+    // the first version drew the boy with a wrong shader at the start (the game also copies shader
+    // code with the GPU). The setting is ignored until the backing translation is understood.
+    // if (EmulatorSettings.IsShaderBackingReadsEnabled()) {
+    //     pipeline_cache.SetBackingReadCheck(
+    //         [this](VAddr addr, u64 size) { return buffer_cache.IsCpuCopyCurrent(addr, size); },
+    //         EmulatorSettings.IsShaderBackingVerifyEnabled());
+    // }
     scheduler.SetEncoderMode(EmulatorSettings.GetCpEncoderMode());
     memory->SetRasterizer(this);
     VideoCore::ReadbackStats::Start();

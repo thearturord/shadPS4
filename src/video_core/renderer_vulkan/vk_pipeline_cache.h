@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <variant>
 #include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
@@ -87,6 +88,12 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// shader_backing_reads: shader headers and fetch shader code are read through the physical
+    /// backing when `is_cpu_copy_current(address, size)` is true for the bytes read.
+    /// With `verify`, backing reads are compared with the guest mapping and not used.
+    void SetBackingReadCheck(std::function<bool(VAddr, u64)> is_cpu_copy_current,
+                             bool verify = false);
+
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
     Result GetProgram(Shader::HwStage stage, Shader::SwStage l_stage,
@@ -141,7 +148,9 @@ private:
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{};      // new pipelines added to the cache since the game start
     const u32 stage_lookup_reuse; // 0 = off, 1 = check the last variant first, 2 = verify
-    const bool shader_backing_reads;
+    /// shader_backing_reads: true if the CPU copy of guest memory bytes is current.
+    std::function<bool(VAddr, u64)> cpu_copy_is_current;
+    bool backing_verify{}; ///< shader_backing_verify
     tsl::robin_set<u64> logged_stage_mismatches;
 
     // Only if Config::collectShadersForDebug()

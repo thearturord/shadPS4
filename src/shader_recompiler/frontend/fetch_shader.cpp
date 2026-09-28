@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <functional>
 #include <unordered_map>
 #include <vector>
 
@@ -53,15 +54,21 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
 static FetchShaderData ParseFetchShaderCode(const u32* code);
 
 namespace {
-bool backing_reads = false;
+std::function<bool(VAddr, u64)> cpu_copy_is_current;
+bool verify_backing = false;
 
-/// Where to read the fetch shader code from: its physical backing if enabled (no readback fault
-/// when the page also holds GPU-written data, the GPU never writes shader code), else the guest
-/// mapping. `size` must cover everything that is read.
+/// Where to read fetch shader code from: its physical backing when the CPU copy of those bytes is
+/// current (no readback fault when other bytes of the page were written by the GPU), else the
+/// guest mapping. The game also copies shader code with the GPU, so this is checked every time.
 const u32* ReadableCode(const u32* code, u64 size) {
-    if (backing_reads) {
-        if (const u8* backing =
-                Core::Memory::Instance()->BackingPointer(reinterpret_cast<VAddr>(code), size)) {
+    const VAddr addr = reinterpret_cast<VAddr>(code);
+    if (cpu_copy_is_current && cpu_copy_is_current(addr, size)) {
+        auto* memory = Core::Memory::Instance();
+        if (const u8* backing = memory->BackingPointer(addr, size)) {
+            if (verify_backing) {
+                memory->VerifyBackingRead(addr, backing, size, "fetch shader");
+                return code;
+            }
             return reinterpret_cast<const u32*>(backing);
         }
     }
@@ -69,8 +76,9 @@ const u32* ReadableCode(const u32* code, u64 size) {
 }
 } // Anonymous namespace
 
-void SetFetchShaderBackingReads(bool enabled) {
-    backing_reads = enabled;
+void SetFetchShaderBackingReads(std::function<bool(VAddr, u64)> is_cpu_copy_current, bool verify) {
+    cpu_copy_is_current = std::move(is_cpu_copy_current);
+    verify_backing = verify;
 }
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
@@ -94,19 +102,13 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
             return cached.data;
         }
     }
-    // Fetch shaders are a few dozen instructions; a longer one is read through the guest mapping.
-    constexpr u64 MaxBackingBytes = 1024;
-    const u32* readable = ReadableCode(code, MaxBackingBytes);
-    FetchShaderData data = ParseFetchShaderCode(readable);
-    if (readable != code && data.size > MaxBackingBytes) {
-        readable = code;
-        data = ParseFetchShaderCode(code);
-    }
+    // New or changed code (rare): decoded through the guest mapping.
+    FetchShaderData data = ParseFetchShaderCode(code);
     if (cache.size() >= 4096) {
         cache.clear();
     }
     cache[code] = CachedFetchShader{
-        .code = std::vector<u32>(readable, readable + data.size / sizeof(u32)),
+        .code = std::vector<u32>(code, code + data.size / sizeof(u32)),
         .data = data,
     };
     return data;

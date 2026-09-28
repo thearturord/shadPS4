@@ -75,7 +75,10 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info);
 
-/// Reads fetch shader code through the physical backing (shader_backing_reads).
-void SetFetchShaderBackingReads(bool enabled);
+/// shader_backing_reads: the per-draw check of known fetch shader code reads through the
+/// physical backing when `is_cpu_copy_current(address, size)` says the CPU copy of those bytes is
+/// current. Empty to disable.
+void SetFetchShaderBackingReads(std::function<bool(VAddr, u64)> is_cpu_copy_current,
+                                bool verify = false);
 
 } // namespace Shader::Gcn

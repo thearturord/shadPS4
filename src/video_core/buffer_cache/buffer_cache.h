@@ -187,6 +187,10 @@ public:
     /// Returns true if an asynchronous download of part of the range has not landed yet.
     bool IsDownloadInFlight(VAddr device_addr, u64 size);
 
+    /// True if guest memory holds the current contents of the range: no GPU write that isn't
+    /// downloaded, and no download of it on its way. Command processor thread only.
+    bool IsCpuCopyCurrent(VAddr device_addr, u64 size);
+
     /// Waits until asynchronous downloads of the range have landed in guest memory.
     void WaitForDownloads(VAddr device_addr, u64 size);
 

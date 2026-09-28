@@ -249,9 +249,13 @@ public:
 
     /// Host pointer to the physical backing of [address, address + size), or nullptr if the range
     /// isn't inside one physically backed area. Reading through it skips the page protection of
-    /// the guest mapping (no readback fault), and it sees the CPU-side contents only: use it for
-    /// data the GPU never writes, like shader code. Cached per thread like CopyMemoryFast.
+    /// the guest mapping (no readback fault), and it sees the CPU-side contents only: use it only
+    /// for bytes whose CPU copy is known to be current. Cached per thread like CopyMemoryFast.
     const u8* BackingPointer(VAddr address, u64 size);
+
+    /// Diagnostic: compares bytes read through BackingPointer with the guest mapping (which may
+    /// fault and read back) and logs the first differences with the mapping they are in.
+    bool VerifyBackingRead(VAddr address, const u8* backing, u64 size, const char* what);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 

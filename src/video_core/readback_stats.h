@@ -93,6 +93,17 @@ enum class CpTime : u32 {
     VulkanSubmit, ///< vkQueueSubmit.
     VulkanOther,  ///< Command buffer begin/end/allocation, object creation, queries.
     StreamMemcpy, ///< The memory copy inside stream copies (nested in BufStreamCopy).
+    // Steps of readback handling at fences (nested in Fence/SubmitEnd):
+    FenceImageCopies, ///< Recording linear image readback copies.
+    FencePrefetch,    ///< Recording readback copies of buffer ranges the CPU reads back.
+    FenceSubmit,      ///< Submitting the command buffer so the readbacks start on the GPU.
+    // Steps of the pipeline lookup (nested in PipelineLookup):
+    PipelineStages,  ///< Shader program lookups and specialization of each stage.
+    PipelineMap,     ///< Hashing the pipeline key and looking it up.
+    PipelineCompile, ///< Creating pipelines not seen before.
+    // Steps of render target handling:
+    RtPrepare, ///< Color and depth target image lookups (PrepareRenderState, nested in Prepare).
+    RtViews,   ///< Render target view lookups (nested in RenderTargets).
     Count,
 };
 
@@ -276,6 +287,7 @@ enum class Reuse : u32 {
     StreamRepeatSameBytes,  ///< Bytes of stream copies with identical data (reported in MB).
     StreamReused,           ///< Stream copies skipped by readback_stream_reuse_enabled.
     StreamReuseResets,      ///< Reuse tables dropped by a command processor write to guest memory.
+    RtReused,               ///< Render target lookups skipped by rt_lookup_reuse_enabled.
     Count,
 };
 void OnReuse(Reuse reuse, u64 amount = 1);
@@ -341,6 +353,16 @@ void OnGpuThreadIdle(u64 idle_ns);
 
 /// Records which shader (or fill/copy) last wrote a guest memory range on the GPU.
 void RecordWriter(VAddr base, u64 size, u64 shader_hash, u32 stage);
+
+/// Number of presents since the start (frame index for per-frame statistics).
+u64 FrameIndex();
+
+/// Records a prefetch download of a hot buffer range (a range the CPU faulted on before).
+/// `repeat` is set when the same range was already downloaded earlier in the same frame.
+void OnPrefetch(VAddr range_start, u64 range_size, u64 bytes, bool repeat);
+
+/// Records a CPU fault that made (or kept) a buffer range hot for prefetching.
+void OnHotRangeFault(VAddr range_start, u64 range_size);
 
 /// Records a buffer readback caused by a CPU access to GPU modified memory.
 void OnBufferReadback(VAddr fault_addr, u64 bytes, u64 finish_ns, u64 blocked_ns,

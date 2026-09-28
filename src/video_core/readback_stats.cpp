@@ -104,6 +104,11 @@ struct Counters {
     std::array<std::atomic<u64>, 6> submit_hist{};
     std::array<std::atomic<u64>, static_cast<size_t>(Hazard::Count)> hazards{};
     std::array<std::atomic<u64>, static_cast<size_t>(Reuse::Count)> reuse{};
+    std::atomic<u64> prefetch_downloads{};
+    std::atomic<u64> prefetch_bytes{};
+    std::atomic<u64> prefetch_repeat_downloads{};
+    std::atomic<u64> prefetch_repeat_bytes{};
+    std::atomic<u64> hot_range_faults{};
     std::atomic<u64> vk_submits{};
     std::atomic<u64> async_fences{};
     std::atomic<u64> async_fence_submits{};
@@ -166,8 +171,12 @@ constexpr std::array<const char*, static_cast<size_t>(CpTime::Count)> CpTimeName
     "dynamic state", "begin pass",     "stream copy",     "buffer lookup",
     "gpu mark",      "tex find image", "tex view/layout", "tex sampler",
     "stats",         "vk cmd",         "vk submit",       "vk other",
-    "stream memcpy",
+    "stream memcpy", "fence images",  "fence prefetch",  "fence submit",
+    "pipe stages",   "pipe map",       "pipe compile",    "rt prepare",
+    "rt views",
 };
+static_assert(std::ranges::none_of(CpTimeNames, [](const char* name) { return name == nullptr; }),
+              "every CpTime category needs a name");
 
 struct BufferRegionStat {
     VAddr region{};
@@ -200,6 +209,18 @@ struct ThreadCpuStat {
     u32 samples{};
 };
 
+struct PrefetchStat {
+    VAddr base{};
+    u64 size{};
+    u64 downloads{};
+    u64 bytes{};
+    u64 repeat_downloads{};
+    u64 repeat_bytes{};
+    u64 frames{};
+    u64 last_frame{~0ULL};
+    u64 faults{};
+};
+
 struct ImageStat {
     VAddr addr{};
     u32 width{};
@@ -218,6 +239,8 @@ u64 writer_seq{};
 std::unordered_map<VAddr, BufferStat> buffer_stats;
 std::unordered_map<u64, ShaderStat> shader_stats;
 std::unordered_map<VAddr, ImageStat> image_stats;
+std::unordered_map<VAddr, PrefetchStat> prefetch_stats;
+std::atomic<u64> total_presents{};
 std::unordered_map<u64, WaitStat> wait_stats;
 std::unordered_map<u64, ShaderCallStat> shader_call_stats;
 std::unordered_map<VAddr, BufferRegionStat> buffer_region_stats;
@@ -300,6 +323,7 @@ void WriteTopReport(u64 elapsed_ns) {
     std::vector<BufferStat> buffers;
     std::vector<ShaderStat> shaders;
     std::vector<ImageStat> images;
+    std::vector<PrefetchStat> prefetches;
     std::vector<WaitStat> waits;
     std::vector<ShaderCallStat> shader_calls;
     {
@@ -321,7 +345,11 @@ void WriteTopReport(u64 elapsed_ns) {
         for (const auto& [_, stat] : image_stats) {
             images.push_back(stat);
         }
+        for (const auto& [_, stat] : prefetch_stats) {
+            prefetches.push_back(stat);
+        }
     }
+    std::ranges::sort(prefetches, [](const auto& a, const auto& b) { return a.bytes > b.bytes; });
     std::ranges::sort(buffers,
                       [](const auto& a, const auto& b) { return a.blocked_ns > b.blocked_ns; });
     std::ranges::sort(shaders,
@@ -368,6 +396,23 @@ void WriteTopReport(u64 elapsed_ns) {
         out += fmt::format("{:#18x} {:>6} {:>6} {:>5} {:>8} {:>10.2f} {:>12.1f}\n", img.addr,
                            img.width, img.height, img.num_bits, img.count, Mb(img.bytes),
                            Ms(img.finish_ns));
+    }
+
+    out += "\n== Prefetched buffer ranges (hot ranges downloaded at fences), by MB ==\n";
+    out += "per_frame = downloads per frame the range was downloaded in; repeat = downloads of a\n"
+           "range already downloaded earlier in the same frame; faults = CPU faults on the range\n";
+    out += fmt::format("{:>18} {:>8} {:>10} {:>9} {:>10} {:>10} {:>11} {:>8}\n", "base", "size",
+                       "downloads", "per_frame", "MB", "repeat_MB", "repeat_pct", "faults");
+    for (size_t i = 0; i < std::min<size_t>(prefetches.size(), 40); ++i) {
+        const auto& p = prefetches[i];
+        out += fmt::format(
+            "{:#18x} {:>8} {:>10} {:>9.1f} {:>10.2f} {:>10.2f} {:>10.1f}% {:>8}\n", p.base, p.size,
+            p.downloads,
+            p.frames ? static_cast<double>(p.downloads) / static_cast<double>(p.frames) : 0.0,
+            Mb(p.bytes), Mb(p.repeat_bytes),
+            p.bytes ? 100.0 * static_cast<double>(p.repeat_bytes) / static_cast<double>(p.bytes)
+                    : 0.0,
+            p.faults);
     }
 
     out += "\n== Command stream waits (WaitRegMem), by blocked time ==\n";
@@ -564,6 +609,15 @@ void SampleThreads(u64 interval_ns, bool heavy_second) {
 #endif
 }
 
+/// The report is diagnostics only: a failure is logged instead of taking the emulator down.
+void SafeWriteTopReport(u64 elapsed_ns) {
+    try {
+        WriteTopReport(elapsed_ns);
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render, "Readback stats: writing readback_top.txt failed: {}", e.what());
+    }
+}
+
 void ReporterThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:ReadbackStats");
 
@@ -583,6 +637,8 @@ void ReporterThread(std::stop_token stoken) {
            "rec_descriptors_ms,rec_dynamic_state_ms,rec_begin_pass_ms,buf_stream_copy_ms,"
            "buf_lookup_ms,buf_gpu_mark_ms,tex_find_image_ms,tex_view_layout_ms,tex_sampler_ms,"
            "stats_overhead_ms,vk_cmd_ms,vk_submit_ms,vk_other_ms,stream_memcpy_ms,"
+           "fence_image_copies_ms,fence_prefetch_ms,fence_submit_ms,pipeline_stages_ms,"
+           "pipeline_map_ms,pipeline_compile_ms,rt_prepare_ms,rt_views_ms,"
            "cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
            "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits,"
            "upload_MB,hot_pages_new,hot_decays,buffers_created,buffers_merged,merge_MB,"
@@ -592,7 +648,8 @@ void ReporterThread(std::stop_token stoken) {
            "draw_rt_regs_same,draw_user_data_same,draw_all_same,dispatches_checked,"
            "dispatch_pipeline_same,dispatch_user_data_same,stream_rep_tick_same,"
            "stream_rep_tick_changed,stream_rep_old_same,stream_rep_old_changed,"
-           "stream_rep_same_MB,stream_reused,stream_reuse_resets\n";
+           "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,prefetch_downloads,"
+           "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -670,6 +727,10 @@ void ReporterThread(std::stop_token stoken) {
                                   ? fmt::format(",{:.2f}", Mb(value))
                                   : fmt::format(",{}", value);
             }
+            cp_columns += fmt::format(
+                ",{},{:.2f},{},{:.2f},{}", take(counters.prefetch_downloads),
+                Mb(take(counters.prefetch_bytes)), take(counters.prefetch_repeat_downloads),
+                Mb(take(counters.prefetch_repeat_bytes)), take(counters.hot_range_faults));
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -703,10 +764,10 @@ void ReporterThread(std::stop_token stoken) {
         csv.flush();
 
         if (++ticks % 5 == 0) {
-            WriteTopReport(now - start_ns);
+            SafeWriteTopReport(now - start_ns);
         }
     }
-    WriteTopReport(NowNs() - start_ns);
+    SafeWriteTopReport(NowNs() - start_ns);
 }
 
 } // Anonymous namespace
@@ -730,7 +791,45 @@ void Stop() {
     reporter.join();
 }
 
+u64 FrameIndex() {
+    return total_presents.load(std::memory_order_relaxed);
+}
+
+void OnPrefetch(VAddr range_start, u64 range_size, u64 bytes, bool repeat) {
+    counters.prefetch_downloads.fetch_add(1, std::memory_order_relaxed);
+    counters.prefetch_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (repeat) {
+        counters.prefetch_repeat_downloads.fetch_add(1, std::memory_order_relaxed);
+        counters.prefetch_repeat_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    const u64 frame = FrameIndex();
+    std::scoped_lock lk{maps_mutex};
+    auto& stat = prefetch_stats[range_start];
+    stat.base = range_start;
+    stat.size = range_size;
+    ++stat.downloads;
+    stat.bytes += bytes;
+    if (repeat) {
+        ++stat.repeat_downloads;
+        stat.repeat_bytes += bytes;
+    }
+    if (stat.last_frame != frame) {
+        stat.last_frame = frame;
+        ++stat.frames;
+    }
+}
+
+void OnHotRangeFault(VAddr range_start, u64 range_size) {
+    counters.hot_range_faults.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lk{maps_mutex};
+    auto& stat = prefetch_stats[range_start];
+    stat.base = range_start;
+    stat.size = range_size;
+    ++stat.faults;
+}
+
 void OnPresent() {
+    total_presents.fetch_add(1, std::memory_order_relaxed);
     counters.presents.fetch_add(1, std::memory_order_relaxed);
 }
 

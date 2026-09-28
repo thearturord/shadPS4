@@ -223,6 +223,83 @@ per second that each submitted a command buffer (~125 ms/s).
   on GPU results (readbacks, fences, `WaitRegMem`) inside every frame, so GPU frame time is partly
   on the critical path: command thread GPU waits ~16 -> ~2 ms/s, idle ~45 -> ~12 ms/s.
 
+### 13. Fence cost split and prefetch mode (open, check later)
+- The profiler splits fence time into `fence_image_copies_ms`, `fence_prefetch_ms` and
+  `fence_submit_ms` (the rest of `cp_fence_ms` is bookkeeping).
+- Light area, 1440p, profiled (mode 1 = current behavior): fences cost the command thread ~86
+  ms/s: buffer prefetch 38.8, submits 35.4 (~970/s), bookkeeping 10.3, linear image copies 1.4.
+  Prefetch downloads ~245 MB/s, 8x the linear images (~29 MB/s).
+- `readback_prefetch_mode` (0 = off, 1 = read and write faults, default, 2 = read faults only).
+  Same area, mode 1 vs mode 2:
+
+  | Per second | Mode 1 | Mode 2 |
+  | :--- | :--- | :--- |
+  | FPS average | 42.5 | 45.7 (slowest seconds 24-36) |
+  | Draws | 30.2k | 35.0k (areas not fully identical) |
+  | Prefetch / submit time | 38.8 / 35.4 ms | 16.8 / 24.6 ms |
+  | Prefetched data | 245 MB | 137 MB |
+  | Command thread waiting on the GPU | 54 ms | 121 ms |
+  | Game threads blocked on readbacks | 63 ms | 147 ms |
+
+- The CPU really writes into 64 KB windows the GPU just wrote (600-1,800 write faults per window,
+  real data read back), so prefetching them is useful work. Mode 2 does less work at fences but
+  doubles the waiting. **Pending:** decide by feel and by the low-FPS areas below. If mode 2
+  stutters, keep mode 1 and make the prefetch cheaper instead (less often for write-faulted
+  windows, or only the parts the GPU rewrote).
+- Fresh game, mode 2, 1440p, profiled: the spear renders correctly with stream reuse (pending
+  test passed). Stutters in the first minutes were pipeline compilation (299 new pipelines, up to
+  ~1.1 s/s in pipeline lookup), not readbacks; they go away once the pipeline cache has them.
+  After that: median 42 FPS (34-50), lowest steady stretch ~35-37 FPS at ~66k draws/s, readback
+  waits steady at ~80-130 ms/s (game threads) with no spikes; frame pacing felt smooth.
+- Same low-FPS stretch with mode 1: 38-47 FPS (mode 2: 35-37) at ~70-77k draws/s, game threads
+  blocked ~30-40 ms/s (mode 2: ~80-95), command thread GPU waits ~28-35 ms/s (mode 2: ~65-80),
+  waited readbacks ~40-50/s (mode 2: ~150). Mode 1 prefetches more (prefetch ~32-37 ms/s, submits
+  ~40-48 ms/s) but avoids more waiting than it costs. **Decision: mode 1 stays the default.** The
+  earlier light-area result favoring mode 2 compared different areas.
+- Profiler split, heavy stretch (~66k draws/s, ~42 FPS): prefetch ~4,450 downloads/s (306 MB/s),
+  63% of them re-download a range already downloaded earlier in the same frame; ranges are kept
+  hot by only ~3 faults/s. Pipeline lookup ~96 ms/s (shader lookup and specialization 70, key 15,
+  table 8, compiles 4). Render targets ~59 ms/s (image lookups 25, view lookups 14, rest 20).
+- `readback_prefetch_lifetime` (default 600 guest submissions, ~14 s): 60 (~1.4 s) cut prefetch
+  to 3,088 downloads/s (204 MB/s), fence prefetch 42 -> 29 ms/s, submits 48 -> 40 ms/s, for ~15
+  more faults/s (+~5 ms/s waits). Same FPS (within noise), smooth. Kept at 60 in the TLG config.
+  Most remaining prefetch is same-frame repeats (119 MB/s); cutting them is riskier (downloading
+  once per frame made later accesses fault before).
+- `rt_lookup_reuse_enabled`: a draw whose render target registers match the previous draw, with
+  no image registered or removed since (texture cache generation counter), reuses the previous
+  target images instead of FindImage. Target image lookups ~25 -> ~10 ms/s in the heavy stretch
+  (~195k slot lookups/s skipped), FPS unchanged within noise. First run crashed once at an area
+  transition (Havok thread, 0xc0000096 privileged instruction at 0x5424611, never seen before);
+  the retry through the same transition was clean. **Watch:** if that crash shows up again,
+  retry with `rt_lookup_reuse_enabled: false` to rule it out.
+- Thread use in that run (heavy stretch): command processor ~89% avg (99.5% max), game workers
+  ~26-31% each, ps4render ~17%, GPU ~36% busy. The command thread is still the limit, but single
+  1-2% savings now sit inside run-to-run noise.
+- **Next:** make prefetch cheaper while keeping mode 1's low waits. Some stretches prefetch
+  550-700 MB/s (60-74 ms/s of command thread time): windows the GPU rewrites at nearly every
+  fence are downloaded every time. Save backup of the current progress:
+  `%APPDATA%\shadPS4\savedata_backups\CUSA03627_2026-09-28_progress\home_1000_CUSA03627`
+  (copy its contents back to `%APPDATA%\shadPS4\home\1000\savedata\CUSA03627` to restore).
+
+### Lessons from other emulators
+Consoles with memory shared by CPU and GPU (GameCube/Wii, Xbox 360, Switch) have the same problem.
+- **Dolphin** ("deferred EFB copies"): queue readbacks and write them to memory only when the game
+  signals it needs them, instead of idling the GPU at each one. Our async fences do the same.
+- **Xenia**: readbacks are off by default because each one is a mid-frame sync with a large cost.
+  Not an option for TLG, which breaks without them.
+- **Ryujinx, March 2023**: keeping all GPU buffers in shared system RAM ("host mapped") was fast
+  on some PCs and very slow on others, worst with an AMD CPU and an NVIDIA GPU (large storage
+  buffers saturate PCIe). That matches our shared memory experiment (Ryzen 5700X3D + RTX 4090).
+  Their fix places buffers one by one: small buffers read back often in system RAM, everything
+  else in VRAM (`BufferBackingState.cs`).
+- **Ryujinx, May 2023**: textures read back often are copied to CPU memory as soon as the GPU
+  finishes them, and linear textures are written by the GPU straight into guest memory imported
+  with `VK_EXT_external_memory_host`, skipping a copy. Breath of the Wild (linear texture readbacks
+  for foot placement and water level, like TLG) +30%, Skyward Sword HD +25%.
+
+Sources: dolphin-emu.org progress report November 2018, Xenia options wiki, Ryujinx progress
+reports March and May 2023 (web.archive.org).
+
 ## Known limits and next steps
 - The GPU command thread is still ~99% busy. Compute queues still wait on held-back fences
   (~1.5 s/s of wall time across queues). About 40k write faults/s (~130 ms/s) and ~90 ms/s of

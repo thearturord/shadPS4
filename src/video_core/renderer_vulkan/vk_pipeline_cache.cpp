@@ -14,9 +14,9 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -331,8 +331,13 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto [it, is_new] = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineMap};
+        return graphics_pipelines.try_emplace(graphics_key);
+    }();
     if (is_new) {
+        VideoCore::ReadbackStats::CpTimer compile_timer{
+            VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -362,8 +367,13 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    const auto [it, is_new] = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineMap};
+        return compute_pipelines.try_emplace(compute_key);
+    }();
     if (is_new) {
+        VideoCore::ReadbackStats::CpTimer compile_timer{
+            VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -436,7 +446,11 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    const bool stages_ok = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineStages};
+        return RefreshGraphicsStages();
+    }();
+    if (!stages_ok) {
         return false;
     }
 
@@ -610,8 +624,11 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineStages};
+        std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
+            GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    }
     return true;
 }
 

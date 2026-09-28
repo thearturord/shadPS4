@@ -45,7 +45,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       readback_batching{EmulatorSettings.IsReadbackBatchingEnabled()},
-      async_fences{EmulatorSettings.IsReadbackAsyncFencesEnabled()} {
+      async_fences{EmulatorSettings.IsReadbackAsyncFencesEnabled()},
+      rt_reuse_enabled{EmulatorSettings.IsRtLookupReuseEnabled()} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -286,7 +287,26 @@ bool Rasterizer::FilterDraw() {
     return true;
 }
 
+template <typename... Ts>
+bool Rasterizer::TargetInputsMatch(CachedTarget& cache, const Ts&... parts) {
+    std::array<u8, 256> inputs;
+    u32 size = 0;
+    static_assert((sizeof(Ts) + ...) <= inputs.size());
+    ((std::memcpy(inputs.data() + size, &parts, sizeof(parts)), size += sizeof(parts)), ...);
+    const bool match = cache.valid && cache.size == size &&
+                       cache.generation == texture_cache.ImageGeneration() &&
+                       std::memcmp(cache.inputs.data(), inputs.data(), size) == 0;
+    if (!match) {
+        // The caller does a full lookup and marks the cache valid afterwards.
+        cache.valid = false;
+        cache.size = size;
+        std::memcpy(cache.inputs.data(), inputs.data(), size);
+    }
+    return match;
+}
+
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    VideoCore::ReadbackStats::CpTimer rt_timer{VideoCore::ReadbackStats::CpTime::RtPrepare};
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -302,11 +322,24 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const u32 target_mask = regs.color_target_mask.GetMask(cb);
         if (skip_cb_binding || !col_buf || !target_mask || (key.mrt_mask & (1 << cb)) == 0) {
             image_id = {};
+            rt_cache[cb].valid = false;
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        if (rt_reuse_enabled && TargetInputsMatch(rt_cache[cb], col_buf, hint)) {
+            // Same registers and no image registered or removed since: FindImage would find the
+            // same image again (image_id and desc still hold its result).
+            VideoCore::ReadbackStats::OnReuse(VideoCore::ReadbackStats::Reuse::RtReused);
+            bound_images.emplace_back(image_id);
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, col_buf, hint);
+            image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            if (rt_reuse_enabled) {
+                rt_cache[cb].valid = true;
+                rt_cache[cb].generation = texture_cache.ImageGeneration();
+            }
+        }
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -316,13 +349,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        auto& cache = rt_cache[AmdGpu::NUM_COLOR_BUFFERS];
+        if (rt_reuse_enabled && TargetInputsMatch(cache, regs.depth_buffer, regs.depth_view,
+                                                  regs.depth_control, htile_address, hint)) {
+            VideoCore::ReadbackStats::OnReuse(VideoCore::ReadbackStats::Reuse::RtReused);
+            bound_images.emplace_back(image_id);
+            texture_cache.TouchFoundImage(image_id);
+        } else {
+            std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                              htile_address, hint);
+            image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+            if (rt_reuse_enabled) {
+                cache.valid = true;
+                cache.generation = texture_cache.ImageGeneration();
+            }
+        }
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
         db_desc.first = {};
+        rt_cache[AmdGpu::NUM_COLOR_BUFFERS].valid = false;
     }
 }
 
@@ -1214,12 +1260,16 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         auto* image = &texture_cache.GetImage(image_id);
         if (image->binding.needs_rebind) {
+            rt_cache[cb].valid = false;
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
         texture_cache.UpdateImage(image_id);
         image->SetBackingSamples(key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        const auto& image_view = [&]() -> const auto& {
+            VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::RtViews};
+            return texture_cache.FindRenderTarget(image_id, desc);
+        }();
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
@@ -1263,7 +1313,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (auto image_id = db_desc.first; image_id) {
         auto& desc = db_desc.second;
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
+        const auto& image_view = [&]() -> const auto& {
+            VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::RtViews};
+            return texture_cache.FindDepthTarget(image_id, desc);
+        }();
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
@@ -1456,8 +1509,14 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) 
     const u64 max_bytes =
         buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download).SizeBytes() / 2;
     VideoCore::ReadbackBatch batch{scheduler, max_bytes};
-    texture_cache.RecordImageDownloads(batch);
-    buffer_cache.PrefetchHotRanges(batch, true);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::FenceImageCopies};
+        texture_cache.RecordImageDownloads(batch);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::FencePrefetch};
+        buffer_cache.PrefetchHotRanges(batch, true);
+    }
     const bool has_copies = !batch.Empty();
     if (!has_copies && !scheduler.HasPriorityOperations()) {
         // Nothing to read back and nothing in flight: keep the old immediate behavior.
@@ -1484,6 +1543,7 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, bool must_sync) 
         },
         tick);
     if (needs_submit) {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::FenceSubmit};
         scheduler.Flush();
     }
 }
@@ -1509,8 +1569,14 @@ void Rasterizer::ProcessReadbacksSync() {
     const u64 max_bytes =
         buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Download).SizeBytes() / 2;
     VideoCore::ReadbackBatch batch{scheduler, max_bytes};
-    texture_cache.RecordImageDownloads(batch);
-    buffer_cache.PrefetchHotRanges(batch);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::FenceImageCopies};
+        texture_cache.RecordImageDownloads(batch);
+    }
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::FencePrefetch};
+        buffer_cache.PrefetchHotRanges(batch);
+    }
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {

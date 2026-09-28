@@ -97,6 +97,14 @@ public:
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
 
+    /// Changes whenever the set of registered images changes.
+    u64 ImageGeneration() const noexcept {
+        return image_generation.load(std::memory_order_acquire);
+    }
+
+    /// Does what FindImage does for an image found again: marks it as recently used.
+    void TouchFoundImage(ImageId image_id);
+
     /// Records downloads of all pending images into a batch instead of waiting per image.
     void RecordImageDownloads(ReadbackBatch& batch);
 
@@ -357,6 +365,9 @@ private:
     bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    /// Bumped whenever an image is registered or unregistered: a lookup result stays valid while
+    /// it is unchanged (rt_lookup_reuse_enabled).
+    std::atomic<u64> image_generation{};
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

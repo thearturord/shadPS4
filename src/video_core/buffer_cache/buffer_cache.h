@@ -208,6 +208,7 @@ private:
     struct HotRange {
         VAddr end;
         u64 last_fault_epoch;
+        u64 last_prefetch_frame{~0ULL}; ///< Readback stats: frame of the last prefetch.
     };
 
     using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
@@ -288,6 +289,10 @@ private:
     /// readback_stream_reuse_enabled: stream copies of the current command buffer by range.
     /// A copy is only reused while the command buffer, and the stream buffer pass, are the same.
     const bool stream_reuse_enabled;
+    /// readback_prefetch_mode: 0 = no prefetch, 1 = read and write faults, 2 = read faults only.
+    const u32 prefetch_mode;
+    /// readback_prefetch_lifetime: fences a hot range stays prefetched after its last fault.
+    const u32 prefetch_lifetime;
     tsl::robin_map<u64, u64> stream_reuse;
     u64 stream_reuse_tick{};
     u64 stream_reuse_wraps{};

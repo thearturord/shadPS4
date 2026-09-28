@@ -168,6 +168,20 @@ private:
     u64 recorded_work{};
     u64 last_barrier_work{~0ULL};
 
+    /// rt_lookup_reuse_enabled: the register inputs of the last target lookup of each color slot
+    /// (and the depth target, last entry) and the texture cache generation it was made at.
+    struct CachedTarget {
+        bool valid{};
+        u64 generation{};
+        u32 size{};
+        std::array<u8, 256> inputs{};
+    };
+    std::array<CachedTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_cache{};
+    const bool rt_reuse_enabled;
+    /// True if the inputs match the cached lookup; otherwise stores them for the next draw.
+    template <typename... Ts>
+    bool TargetInputsMatch(CachedTarget& cache, const Ts&... parts);
+
     struct ReuseState {
         const GraphicsPipeline* draw_pipeline{};
         const ComputePipeline* dispatch_pipeline{};

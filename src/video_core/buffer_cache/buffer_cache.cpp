@@ -34,6 +34,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()},
+      prefetch_mode{EmulatorSettings.GetReadbackPrefetchMode()},
+      prefetch_lifetime{EmulatorSettings.GetReadbackPrefetchLifetime()},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
@@ -141,11 +143,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             // marking the CPU write: a page can't be both, it would need write-only protection.
             memory_tracker->UnmarkRegionAsGpuModified(window_start, window_size);
         }
-        if (result.bytes != 0) {
+        if (result.bytes != 0 && (prefetch_mode == 1 || (prefetch_mode == 2 && !is_write))) {
             // Remember ranges the CPU reads back so they can be prefetched at the next fence.
             auto& hot_range = hot_ranges[window_start];
             hot_range.end = window_end;
             hot_range.last_fault_epoch = hot_epoch;
+            if (ReadbackStats::IsEnabled()) {
+                ReadbackStats::OnHotRangeFault(window_start, window_end - window_start);
+            }
         }
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -195,15 +200,15 @@ void BufferCache::AdvanceHotEpoch() {
 void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark) {
     // Ranges that stop faulting are prefetched until they expire, then re-learned on the next
     // fault. Expiry keeps ranges the game no longer reads from costing downloads forever.
-    constexpr u64 HotRangeLifetime = 600;
     ApplyPendingUnmarks();
     for (auto it = hot_ranges.begin(); it != hot_ranges.end();) {
-        if (hot_epoch - it->second.last_fault_epoch > HotRangeLifetime) {
+        if (hot_epoch - it->second.last_fault_epoch > prefetch_lifetime) {
             it = hot_ranges.erase(it);
             continue;
         }
         const VAddr range_start = it->first;
         const VAddr range_end = it->second.end;
+        HotRange& hot = it->second;
         ++it;
         // Prefetched at every fence where the range is GPU modified again. Limiting this to once
         // per frame made later writes in the frame fault, each costing a synchronous GPU wait.
@@ -220,6 +225,12 @@ void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark) 
             const u64 total_size_bytes = CollectDownloadCopies(buffer, start, end - start, copies);
             if (total_size_bytes == 0) {
                 return;
+            }
+            if (ReadbackStats::IsEnabled()) {
+                const u64 frame = ReadbackStats::FrameIndex();
+                ReadbackStats::OnPrefetch(range_start, range_end - range_start, total_size_bytes,
+                                          hot.last_prefetch_frame == frame);
+                hot.last_prefetch_frame = frame;
             }
             batch.Reserve(total_size_bytes);
             batch.Add(total_size_bytes, false,

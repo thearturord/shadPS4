@@ -876,6 +876,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image_generation.fetch_add(1, std::memory_order_release);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
@@ -887,6 +888,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    image_generation.fetch_add(1, std::memory_order_release);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -1124,6 +1126,13 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+}
+
+void TextureCache::TouchFoundImage(ImageId image_id) {
+    std::scoped_lock lock{mutex};
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = gc_tick;
+    TouchImage(image);
 }
 
 void TextureCache::TouchImage(const Image& image) {

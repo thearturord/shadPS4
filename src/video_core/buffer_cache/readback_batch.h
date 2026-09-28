@@ -64,6 +64,7 @@ public:
             return;
         }
         const u64 start = ReadbackStats::NowNs();
+        ReadbackStats::WaitScope wait_scope{ReadbackStats::WaitReason::ReadbackBatch};
         scheduler.Finish();
         if (ReadbackStats::IsEnabled()) {
             ReadbackStats::OnBatch(num_buffers, num_images, bytes, ReadbackStats::NowNs() - start);

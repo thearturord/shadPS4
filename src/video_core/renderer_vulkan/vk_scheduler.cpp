@@ -167,7 +167,9 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const u64 start = VideoCore::ReadbackStats::NowNs();
     master_semaphore.Wait(tick);
+    VideoCore::ReadbackStats::OnGpuWait(VideoCore::ReadbackStats::NowNs() - start);
 }
 
 void Scheduler::WaitPriorityOperations() {
@@ -191,6 +193,10 @@ void Scheduler::WaitPriorityOperations() {
         }
         std::this_thread::yield();
     }
+    VideoCore::ReadbackStats::OnGpuWait(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count()));
 }
 
 void Scheduler::PopPendingOperations() {

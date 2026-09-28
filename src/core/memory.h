@@ -247,6 +247,12 @@ public:
 
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
+    /// Host pointer to the physical backing of [address, address + size), or nullptr if the range
+    /// isn't inside one physically backed area. Reading through it skips the page protection of
+    /// the guest mapping (no readback fault), and it sees the CPU-side contents only: use it for
+    /// data the GPU never writes, like shader code. Cached per thread like CopyMemoryFast.
+    const u8* BackingPointer(VAddr address, u64 size);
+
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
 
     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);

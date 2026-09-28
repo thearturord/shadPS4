@@ -8,6 +8,7 @@
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
@@ -26,6 +27,43 @@ namespace Vulkan {
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
+
+namespace {
+
+/// AmdGpu::GetParams, reading the binary header through the physical backing when possible
+/// (shader_backing_reads): shaders often share pages with data the GPU writes, and reading them
+/// through the guest mapping then faults and waits for a readback of the whole page.
+template <typename Program>
+Shader::ShaderParams ReadShaderParams(const Program& pgm, bool backing_reads) {
+    if (backing_reads) {
+        const auto* code = pgm.template Address<u32*>();
+        const VAddr code_addr = reinterpret_cast<VAddr>(code);
+        auto* memory = Core::Memory::Instance();
+        constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+        if (const u8* head = memory->BackingPointer(code_addr, 2 * sizeof(u32))) {
+            std::array<u32, 2> words;
+            std::memcpy(words.data(), head, sizeof(words));
+            if (words[0] == token_mov_vcchi) {
+                const VAddr info_addr = code_addr + (u64(words[1]) + 1) * 2 * sizeof(u32);
+                if (const u8* info_ptr =
+                        memory->BackingPointer(info_addr, sizeof(AmdGpu::BinaryInfo))) {
+                    AmdGpu::BinaryInfo info;
+                    std::memcpy(&info, info_ptr, sizeof(info));
+                    if (info.Valid()) {
+                        return {
+                            .user_data = pgm.user_data,
+                            .code = std::span{code, info.length / sizeof(u32)},
+                            .hash = info.shader_hash,
+                        };
+                    }
+                }
+            }
+        }
+    }
+    return AmdGpu::GetParams(pgm);
+}
+
+} // Anonymous namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -260,7 +298,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+      desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes},
+      stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()},
+      shader_backing_reads{EmulatorSettings.IsShaderBackingReadsEnabled()} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -519,7 +559,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = ReadShaderParams(*pgm, shader_backing_reads);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
@@ -623,7 +663,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = ReadShaderParams(cs_pgm, shader_backing_reads);
     {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineStages};
         std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
@@ -668,7 +708,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = [&] {
+    const Shader::RuntimeInfo& runtime_info = [&]() -> const Shader::RuntimeInfo& {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageRuntimeInfo};
         return BuildRuntimeInfo(hw_stage, sw_stage);
     }();
@@ -677,12 +717,14 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        auto compile_info = runtime_info;
+        const auto module = CompileModule(program->info, compile_info, params.code, 0, binding);
+        auto spec = Shader::StageSpecialization(program->info, compile_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
+        program->last_perm = 0;
         return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
                                perm_hash);
     }
@@ -695,6 +737,25 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFlatBuf};
         info.RefreshFlatBuf();
     }
+
+    // Most lookups pick the same variant as the previous one: check it first, without building
+    // a new specialization (stage_lookup_reuse).
+    size_t fast_perm = ~size_t{0};
+    if (stage_lookup_reuse != 0 && program->last_perm < program->modules.size()) {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
+        if (program->modules[program->last_perm].spec.Matches(info, runtime_info, binding)) {
+            fast_perm = program->last_perm;
+            VideoCore::ReadbackStats::OnReuse(VideoCore::ReadbackStats::Reuse::StageFastPath);
+        }
+    }
+    if (fast_perm != ~size_t{0} && stage_lookup_reuse != 2) {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFind};
+        info.AddBindings(binding);
+        const auto& found = program->modules[fast_perm];
+        return std::make_tuple(&info, found.module, found.spec.fetch_shader_data,
+                               HashCombine(params.hash, fast_perm));
+    }
+
     auto spec = [&] {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
         return Shader::StageSpecialization(info, runtime_info, profile, binding);
@@ -721,11 +782,29 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (found == program->last_perm) {
             VideoCore::ReadbackStats::OnReuse(Reuse::StageSameAsLast);
         }
-        program->last_perm = found;
+    }
+    if (fast_perm != ~size_t{0}) {
+        // Verify mode: the fast check must agree with the full lookup.
+        const size_t full_perm =
+            it == program->modules.end()
+                ? program->modules.size()
+                : static_cast<size_t>(std::distance(program->modules.begin(), it));
+        if (full_perm != fast_perm) {
+            VideoCore::ReadbackStats::OnReuse(
+                VideoCore::ReadbackStats::Reuse::StageFastPathMismatch);
+            if (logged_stage_mismatches.insert(params.hash).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "stage_lookup_reuse mismatch: {} shader {:#x} fast variant {} full "
+                            "lookup {}{}",
+                            hw_stage, params.hash, fast_perm, full_perm,
+                            it == program->modules.end() ? " (new variant)" : "");
+            }
+        }
     }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto compile_info = runtime_info;
+        module = CompileModule(new_info, compile_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
@@ -735,6 +814,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
+    program->last_perm = perm_idx;
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
 }

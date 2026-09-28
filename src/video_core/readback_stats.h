@@ -41,7 +41,16 @@ extern thread_local u64 cp_since;
 extern thread_local u64 cp_packets;
 extern thread_local u32 cp_yield_kind;
 extern std::atomic<u64> cp_time_ns[];
+extern thread_local u32 wait_reason;
+extern thread_local u64 wait_addr;
+extern thread_local u64 wait_size;
+extern thread_local u64 call_hash;
+extern thread_local u32 wait_origin;
+extern thread_local u32 fault_origin;
 } // namespace Detail
+
+/// Origin of a wait that no command processor step caused (a guest thread's fault).
+inline constexpr u32 GuestWaitOrigin = ~0U;
 
 [[nodiscard]] inline bool IsEnabled() noexcept {
     return Detail::enabled.load(std::memory_order_relaxed);
@@ -67,6 +76,28 @@ inline void CpPacket(u32 queue, u32 opcode) noexcept {
         ++Detail::cp_packets;
     }
 }
+
+/// Why a thread waits for the GPU (profiler: CSV columns and the GPU waits report section).
+enum class WaitReason : u32 {
+    Other,              ///< Finish or wait without a recorded reason.
+    ReadbackCpRead,     ///< Buffer readback: the command processor read GPU-written memory.
+    ReadbackCpWrite,    ///< ... wrote to GPU-written memory.
+    ReadbackGuestRead,  ///< Buffer readback for a read fault of a guest thread.
+    ReadbackGuestWrite, ///< ... for a write fault of a guest thread.
+    InflightDownload,   ///< Waiting for an asynchronous readback that was already submitted.
+    InflightCpRead,     ///< ... for a read of the command processor.
+    InflightCpWrite,    ///< ... for a write of the command processor.
+    InflightGuestRead,  ///< ... for a read fault of a guest thread.
+    InflightGuestWrite, ///< ... for a write fault of a guest thread.
+    ImageReadback,      ///< Synchronous linear image readback.
+    ReadbackBatch,      ///< Readbacks of a synchronous fence or submission end (one GPU wait).
+    SyncFence,          ///< Fence handled synchronously (earlier async fences drain).
+    GdsStore,           ///< EOS GDS store: GDS is read after the GPU finished.
+    StreamBuffer,       ///< Stream or staging buffer space still in use by the GPU.
+    FaultBuffer,        ///< Fault buffer processing.
+    Count,
+};
+inline constexpr u32 NumWaitReasons = static_cast<u32>(WaitReason::Count);
 
 /// Command processor time categories. Time is exclusive: a step nested in another one (an
 /// upload inside a draw, say) only counts for the inner step.
@@ -222,6 +253,62 @@ inline void CpWaitYield(bool flip) noexcept {
     }
 }
 
+/// Tags the GPU waits in its scope with a reason and the guest memory range involved. The
+/// innermost scope wins.
+class WaitScope {
+public:
+    /// `origin` is the command processor step (CpTime) that caused the wait, by default the
+    /// one running now; GuestWaitOrigin for work done for a guest thread.
+    explicit WaitScope(WaitReason reason, u64 addr = 0, u64 size = 0,
+                       u32 origin = Detail::cp_current) noexcept {
+        if (IsEnabled()) {
+            active = true;
+            prev_reason = Detail::wait_reason;
+            prev_addr = Detail::wait_addr;
+            prev_size = Detail::wait_size;
+            prev_origin = Detail::wait_origin;
+            Detail::wait_reason = static_cast<u32>(reason);
+            Detail::wait_addr = addr;
+            Detail::wait_size = size;
+            Detail::wait_origin = origin;
+        }
+    }
+    ~WaitScope() {
+        if (active) {
+            Detail::wait_reason = prev_reason;
+            Detail::wait_addr = prev_addr;
+            Detail::wait_size = prev_size;
+            Detail::wait_origin = prev_origin;
+        }
+    }
+    WaitScope(const WaitScope&) = delete;
+    WaitScope& operator=(const WaitScope&) = delete;
+
+private:
+    u32 prev_reason{};
+    u64 prev_addr{};
+    u64 prev_size{};
+    u32 prev_origin{};
+    bool active{};
+};
+
+/// Called by the page fault handler before it starts timing: remembers the command processor
+/// step that faulted, for the attribution of the readback wait that follows.
+inline void NoteFaultOrigin() noexcept {
+    if (Detail::is_cp_thread) {
+        Detail::fault_origin = Detail::cp_current;
+    }
+}
+
+/// Sets the shader of the draw or dispatch being recorded, for the attribution of GPU waits
+/// (0 = none).
+inline void SetCallShader(u64 hash) noexcept {
+    Detail::call_hash = hash;
+}
+
+/// Records time the calling thread spent waiting for the GPU, under the current WaitScope.
+void OnGpuWait(u64 ns);
+
 /// Records time the command processor spent resuming a queue that only re-checked its wait.
 void OnCpSpin(bool flip, u64 ns);
 
@@ -313,6 +400,8 @@ enum class Reuse : u32 {
     StageLookups,           ///< Shader stage lookups (GetProgram calls for known programs).
     StageVariantCompares,   ///< Variants compared to find the matching one.
     StageSameAsLast,        ///< Lookups that picked the same variant as the program's last one.
+    StageFastPath,          ///< Lookups answered by the last variant check (stage_lookup_reuse).
+    StageFastPathMismatch,  ///< Verify mode: the full lookup picked another variant.
     Count,
 };
 void OnReuse(Reuse reuse, u64 amount = 1);

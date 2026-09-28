@@ -5,6 +5,7 @@
 
 #include <variant>
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -47,7 +48,7 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
-    size_t last_perm{~size_t{0}}; ///< Readback stats: variant picked by the last lookup.
+    size_t last_perm{~size_t{0}}; ///< Variant picked by the last lookup.
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -138,7 +139,10 @@ private:
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
-    u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    u32 num_new_pipelines{};      // new pipelines added to the cache since the game start
+    const u32 stage_lookup_reuse; // 0 = off, 1 = check the last variant first, 2 = verify
+    const bool shader_backing_reads;
+    tsl::robin_set<u64> logged_stage_mismatches;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

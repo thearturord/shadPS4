@@ -970,6 +970,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
                         VideoCore::ReadbackStats::CpPhase phase{"EOS GDS store (Finish)"};
+                        VideoCore::ReadbackStats::WaitScope wait_scope{
+                            VideoCore::ReadbackStats::WaitReason::GdsStore};
                         rasterizer->Finish();
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;

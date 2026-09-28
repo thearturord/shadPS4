@@ -122,6 +122,9 @@ struct ShaderCallScope {
     }
 
     ~ShaderCallScope() {
+        if (start != 0) {
+            VideoCore::ReadbackStats::SetCallShader(0);
+        }
         if (start != 0 && report) {
             call.ns = VideoCore::ReadbackStats::NowNs() - start;
             const auto end_times = VideoCore::ReadbackStats::CpTimeSnapshot();
@@ -162,6 +165,7 @@ struct ShaderCallScope {
                 call.storage_images += image.is_written ? 1 : 0;
             }
         }
+        VideoCore::ReadbackStats::SetCallShader(call.hash);
     }
 };
 
@@ -1503,6 +1507,8 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
     if (!async_fences || must_sync) {
         // Synchronous path: readbacks complete (and earlier async fences drain, via Finish)
         // before the fence is signaled from the GPU thread.
+        VideoCore::ReadbackStats::WaitScope wait_scope{
+            VideoCore::ReadbackStats::WaitReason::SyncFence};
         ProcessReadbacksSync();
         if (async_fences && scheduler.HasPriorityOperations()) {
             scheduler.Finish();

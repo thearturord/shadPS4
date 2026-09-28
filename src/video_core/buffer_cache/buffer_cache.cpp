@@ -88,7 +88,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     const bool stats = ReadbackStats::IsEnabled();
     const u64 start = stats ? ReadbackStats::NowNs() : 0;
     DownloadResult result{};
-    liverpool->SendCommand<true>([this, device_addr, size, is_write, &result] {
+    const bool from_cp = ReadbackStats::Detail::is_cp_thread;
+    const u32 origin =
+        from_cp ? ReadbackStats::Detail::fault_origin : ReadbackStats::GuestWaitOrigin;
+    liverpool->SendCommand<true>([this, device_addr, size, is_write, from_cp, origin, &result] {
+        using ReadbackStats::WaitReason;
+        ReadbackStats::WaitScope wait_scope{
+            from_cp ? (is_write ? WaitReason::ReadbackCpWrite : WaitReason::ReadbackCpRead)
+                    : (is_write ? WaitReason::ReadbackGuestWrite : WaitReason::ReadbackGuestRead),
+            device_addr, size, origin};
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         // GPU-modified ranges come as many small scattered islands, so the download
         // is widened to a window around the request
@@ -348,6 +356,26 @@ bool BufferCache::IsDownloadInFlight(VAddr device_addr, u64 size) {
 
 void BufferCache::WaitForDownloads(VAddr device_addr, u64 size) {
     ReadbackStats::CpTimer timer{ReadbackStats::CpTime::GpuWait};
+    // Keep who asked (the readback reason of the caller), as an in-flight variant.
+    using ReadbackStats::WaitReason;
+    const auto inflight_reason = [] {
+        switch (static_cast<WaitReason>(ReadbackStats::Detail::wait_reason)) {
+        case WaitReason::ReadbackCpRead:
+            return WaitReason::InflightCpRead;
+        case WaitReason::ReadbackCpWrite:
+            return WaitReason::InflightCpWrite;
+        case WaitReason::ReadbackGuestRead:
+            return WaitReason::InflightGuestRead;
+        case WaitReason::ReadbackGuestWrite:
+            return WaitReason::InflightGuestWrite;
+        default:
+            return WaitReason::InflightDownload;
+        }
+    }();
+    ReadbackStats::WaitScope wait_scope{inflight_reason, device_addr, size,
+                                        inflight_reason == WaitReason::InflightDownload
+                                            ? ReadbackStats::Detail::cp_current
+                                            : ReadbackStats::Detail::wait_origin};
     // Asynchronous downloads are submitted when recorded. Submit anyway if an operation waits on
     // the command buffer being recorded, since the downloads land in order after it.
     if (scheduler.PriorityOperationsNeedSubmit()) {
@@ -366,6 +394,7 @@ void BufferCache::WaitForDownloads(VAddr device_addr, u64 size) {
     }
     if (ReadbackStats::IsEnabled()) {
         ReadbackStats::OnFinish(ReadbackStats::NowNs() - start);
+        ReadbackStats::OnGpuWait(ReadbackStats::NowNs() - start);
     }
 }
 

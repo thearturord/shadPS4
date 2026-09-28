@@ -111,6 +111,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
 
     if (sync) {
         const u64 start = ReadbackStats::NowNs();
+        ReadbackStats::WaitScope wait_scope{ReadbackStats::WaitReason::ImageReadback,
+                                            image.info.guest_address, download_size};
         scheduler.Finish();
         if (ReadbackStats::IsEnabled()) {
             ReadbackStats::OnImageReadback(image.info.guest_address, download_size,

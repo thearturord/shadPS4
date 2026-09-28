@@ -224,6 +224,7 @@ struct PageManager::Impl {
         const u64 start = stats ? ReadbackStats::NowNs() : 0;
         ReadbackStats::CpPhase phase{is_write ? "page fault handler (write)"
                                               : "page fault handler (read)"};
+        ReadbackStats::NoteFaultOrigin();
         ReadbackStats::CpTimer timer{ReadbackStats::CpTime::Fault};
         if (auto* events = ReadbackStats::CpEvents()) {
             ++events->faults;

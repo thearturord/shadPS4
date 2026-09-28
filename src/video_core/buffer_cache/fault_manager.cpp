@@ -79,6 +79,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
+        ReadbackStats::WaitScope wait_scope{ReadbackStats::WaitReason::FaultBuffer};
         scheduler.Wait(wait_tick);
         scheduler.PopPendingOperations();
     }

@@ -449,6 +449,12 @@ struct GPUSettings {
     // A draw whose render target registers match the previous draw reuses its target images
     // instead of looking them up in the texture cache again.
     Setting<bool> rt_lookup_reuse_enabled{false};
+    // Shader stage lookups first check the variant the program picked last time, without building
+    // a new specialization: 0 = off, 1 = on, 2 = verify (both paths, mismatches logged).
+    Setting<u32> stage_lookup_reuse{0};
+    // Shader binary headers (hash and length, read at every draw) are read through the physical
+    // backing instead of the guest mapping: no readback when the page also holds GPU-written data.
+    Setting<bool> shader_backing_reads{false};
     // GPU command processor recording: 0 = record Vulkan commands directly, 1 = record them into
     // a list replayed at submit (same thread), 2 = replay and submit on an encoder thread,
     // 3 = like 2 but waiting for each submission (diagnostic).
@@ -513,6 +519,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_prefetch_lifetime),
             make_override<GPUSettings>("rt_lookup_reuse_enabled",
                                        &GPUSettings::rt_lookup_reuse_enabled),
+            make_override<GPUSettings>("stage_lookup_reuse", &GPUSettings::stage_lookup_reuse),
+            make_override<GPUSettings>("shader_backing_reads", &GPUSettings::shader_backing_reads),
             make_override<GPUSettings>("cp_encoder_mode", &GPUSettings::cp_encoder_mode),
             make_override<GPUSettings>("cp_encoder_debug", &GPUSettings::cp_encoder_debug),
             make_override<GPUSettings>("cp_full_fence_kinds", &GPUSettings::cp_full_fence_kinds),
@@ -526,9 +534,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     direct_memory_access_enabled, readback_stats_enabled, readback_batching_enabled,
     readback_async_fences_enabled, readback_fence_wait_shortcut, readback_hot_write_pages_enabled,
     readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime,
-    rt_lookup_reuse_enabled, cp_encoder_mode, cp_encoder_debug, cp_full_fence_kinds, dump_shaders,
-    patch_shaders, vblank_frequency, full_screen, full_screen_mode, present_mode, hdr_allowed,
-    fsr_enabled, rcas_enabled, rcas_attenuation)
+    rt_lookup_reuse_enabled, stage_lookup_reuse, shader_backing_reads, cp_encoder_mode,
+    cp_encoder_debug, cp_full_fence_kinds, dump_shaders, patch_shaders, vblank_frequency,
+    full_screen, full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled,
+    rcas_attenuation)
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -815,6 +824,8 @@ public:
     SETTING_FORWARD(m_gpu, ReadbackPrefetchMode, readback_prefetch_mode)
     SETTING_FORWARD(m_gpu, ReadbackPrefetchLifetime, readback_prefetch_lifetime)
     SETTING_FORWARD_BOOL(m_gpu, RtLookupReuseEnabled, rt_lookup_reuse_enabled)
+    SETTING_FORWARD(m_gpu, StageLookupReuse, stage_lookup_reuse)
+    SETTING_FORWARD_BOOL(m_gpu, ShaderBackingReadsEnabled, shader_backing_reads)
     SETTING_FORWARD(m_gpu, CpEncoderMode, cp_encoder_mode)
     SETTING_FORWARD(m_gpu, CpEncoderDebug, cp_encoder_debug)
     SETTING_FORWARD(m_gpu, CpFullFenceKinds, cp_full_fence_kinds)

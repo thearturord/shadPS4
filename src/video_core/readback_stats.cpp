@@ -44,6 +44,12 @@ thread_local u64 cp_packets{};
 thread_local u32 cp_yield_kind{};
 thread_local CpTimeArray cp_local_ns{};
 thread_local CpEventCounters cp_events{};
+thread_local u32 wait_reason{};
+thread_local u64 wait_addr{};
+thread_local u64 wait_size{};
+thread_local u64 call_hash{};
+thread_local u32 wait_origin{};
+thread_local u32 fault_origin{};
 std::atomic<u64> cp_time_ns[static_cast<u32>(CpTime::Count)]{};
 } // namespace Detail
 
@@ -117,6 +123,9 @@ struct Counters {
     std::atomic<u64> async_fence_submits{};
     std::array<std::atomic<u64>, NumFenceKinds> fence_kinds{};
     std::array<std::atomic<u64>, NumFenceKinds> fence_kind_submits{};
+    std::array<std::atomic<u64>, NumWaitReasons> gpu_wait_ns{};    // command processor
+    std::array<std::atomic<u64>, NumWaitReasons> gpu_wait_count{}; // ... waits over 10 us
+    std::atomic<u64> other_thread_gpu_wait_ns{};
     std::atomic<u64> stream_copy_bytes{};
     std::atomic<u64> stream_waits{};
     std::atomic<u64> stream_wait_ns{};
@@ -227,6 +236,57 @@ struct PrefetchStat {
     u64 faults{};
 };
 
+/// GPU waits of the command processor by reason, origin and 64 KB block of the address.
+struct GpuWaitStat {
+    u32 reason{};
+    u32 origin{};
+    VAddr addr{};
+    u64 count{};
+    u64 ns{};
+    u64 max_ns{};
+    u64 bytes{};
+};
+
+const char* WaitReasonName(u32 reason) {
+    switch (static_cast<WaitReason>(reason)) {
+    case WaitReason::Other:
+        return "other";
+    case WaitReason::ReadbackCpRead:
+        return "rb_cp_read";
+    case WaitReason::ReadbackCpWrite:
+        return "rb_cp_write";
+    case WaitReason::ReadbackGuestRead:
+        return "rb_guest_read";
+    case WaitReason::ReadbackGuestWrite:
+        return "rb_guest_write";
+    case WaitReason::InflightDownload:
+        return "inflight_download";
+    case WaitReason::InflightCpRead:
+        return "inflight_cp_read";
+    case WaitReason::InflightCpWrite:
+        return "inflight_cp_write";
+    case WaitReason::InflightGuestRead:
+        return "inflight_guest_read";
+    case WaitReason::InflightGuestWrite:
+        return "inflight_guest_write";
+    case WaitReason::ImageReadback:
+        return "image_readback";
+    case WaitReason::ReadbackBatch:
+        return "readback_batch";
+    case WaitReason::SyncFence:
+        return "sync_fence";
+    case WaitReason::GdsStore:
+        return "gds_store";
+    case WaitReason::StreamBuffer:
+        return "stream_buffer";
+    case WaitReason::FaultBuffer:
+        return "fault_buffer";
+    case WaitReason::Count:
+        break;
+    }
+    return "?";
+}
+
 struct ImageStat {
     VAddr addr{};
     u32 width{};
@@ -246,6 +306,7 @@ std::unordered_map<VAddr, BufferStat> buffer_stats;
 std::unordered_map<u64, ShaderStat> shader_stats;
 std::unordered_map<VAddr, ImageStat> image_stats;
 std::unordered_map<VAddr, PrefetchStat> prefetch_stats;
+std::map<std::tuple<u32, u32, VAddr>, GpuWaitStat> gpu_wait_stats;
 std::atomic<u64> total_presents{};
 std::unordered_map<u64, WaitStat> wait_stats;
 std::unordered_map<u64, ShaderCallStat> shader_call_stats;
@@ -332,8 +393,12 @@ void WriteTopReport(u64 elapsed_ns) {
     std::vector<PrefetchStat> prefetches;
     std::vector<WaitStat> waits;
     std::vector<ShaderCallStat> shader_calls;
+    std::vector<GpuWaitStat> gpu_waits;
     {
         std::scoped_lock lk{maps_mutex};
+        for (const auto& [_, stat] : gpu_wait_stats) {
+            gpu_waits.push_back(stat);
+        }
         shader_calls.reserve(shader_call_stats.size());
         for (const auto& [_, stat] : shader_call_stats) {
             shader_calls.push_back(stat);
@@ -432,6 +497,43 @@ void WriteTopReport(u64 elapsed_ns) {
         out += fmt::format("{:#18x} {:>7} {:>9} {:>9} {:>9} {:>9} {:>11.1f} {:>11.1f} {:>11.1f}\n",
                            w.address, w.is_compute ? "compute" : "gfx", w.count[0], w.count[1],
                            w.count[2], w.count[3], Ms(w.ns[1]), Ms(w.ns[2]), Ms(w.ns[3]));
+    }
+
+    std::ranges::sort(gpu_waits, [](const auto& a, const auto& b) { return a.ns > b.ns; });
+    {
+        std::array<u64, NumWaitReasons> reason_ns{};
+        std::array<u64, NumWaitReasons> reason_count{};
+        for (const auto& w : gpu_waits) {
+            reason_ns[w.reason] += w.ns;
+            reason_count[w.reason] += w.count;
+        }
+        out += "\n== GPU waits of the command processor (waits over 10 us, whole run) ==\n";
+        out +=
+            fmt::format("{:>20} {:>10} {:>12} {:>10}\n", "reason", "count", "total_ms", "avg_ms");
+        for (u32 r = 0; r < NumWaitReasons; ++r) {
+            if (reason_count[r] == 0) {
+                continue;
+            }
+            out += fmt::format("{:>20} {:>10} {:>12.1f} {:>10.3f}\n", WaitReasonName(r),
+                               reason_count[r], Ms(reason_ns[r]),
+                               Ms(reason_ns[r]) / static_cast<double>(reason_count[r]));
+        }
+        out += "by reason, command processor step that caused it (guest = a guest thread's fault)\n"
+               "and 64 KB block of the address (first address seen); avg_KB = size asked for\n";
+        out += fmt::format("{:>20} {:>16} {:>18} {:>8} {:>10} {:>9} {:>9} {:>9}\n", "reason",
+                           "during", "address", "count", "total_ms", "avg_ms", "max_ms", "avg_KB");
+        for (size_t i = 0; i < std::min<size_t>(gpu_waits.size(), 40); ++i) {
+            const auto& w = gpu_waits[i];
+            const double n = static_cast<double>(std::max<u64>(w.count, 1));
+            const char* during = w.origin == GuestWaitOrigin     ? "guest"
+                                 : w.origin < CpTimeNames.size() ? CpTimeNames[w.origin]
+                                                                 : "?";
+            out +=
+                fmt::format("{:>20} {:>16} {:#18x} {:>8} {:>10.1f} {:>9.3f} {:>9.3f} "
+                            "{:>9.1f}\n",
+                            WaitReasonName(w.reason), during, w.addr, w.count, Ms(w.ns),
+                            Ms(w.ns) / n, Ms(w.max_ns), static_cast<double>(w.bytes) / 1024.0 / n);
+        }
     }
 
     std::ranges::sort(shader_calls,
@@ -656,11 +758,16 @@ void ReporterThread(std::stop_token stoken) {
            "dispatch_pipeline_same,dispatch_user_data_same,stream_rep_tick_same,"
            "stream_rep_tick_changed,stream_rep_old_same,stream_rep_old_changed,"
            "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,stage_lookups,"
-           "stage_variant_compares,stage_same_as_last,prefetch_downloads,"
+           "stage_variant_compares,stage_same_as_last,stage_fast_path,stage_fast_path_mismatch,"
+           "prefetch_downloads,"
            "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults,"
            "cmdlist_commands,cmdlist_replay_ms,fences_eop,fences_eos,fences_release,"
            "fences_held_write,fences_submit_end,fence_submits_eop,fence_submits_eos,"
-           "fence_submits_release,fence_submits_held_write,fence_submits_submit_end\n";
+           "fence_submits_release,fence_submits_held_write,fence_submits_submit_end";
+    for (u32 r = 0; r < NumWaitReasons; ++r) {
+        csv << fmt::format(",wait_{}_ms,wait_{}_n", WaitReasonName(r), WaitReasonName(r));
+    }
+    csv << ",wait_other_threads_ms\n";
     csv.flush();
 
     u64 last_ns = NowNs();
@@ -750,6 +857,11 @@ void ReporterThread(std::stop_token stoken) {
             for (auto& count : counters.fence_kind_submits) {
                 cp_columns += fmt::format(",{}", take(count));
             }
+            for (u32 r = 0; r < NumWaitReasons; ++r) {
+                cp_columns += fmt::format(",{:.2f},{}", Ms(take(counters.gpu_wait_ns[r])),
+                                          take(counters.gpu_wait_count[r]));
+            }
+            cp_columns += fmt::format(",{:.2f}", Ms(take(counters.other_thread_gpu_wait_ns)));
         }
         std::string wait_columns;
         for (u32 q = 0; q < 2; ++q) {
@@ -875,6 +987,35 @@ void OnFault(bool is_write, u64 handler_ns) {
 void OnProtect(u64 ns) {
     counters.protects.fetch_add(1, std::memory_order_relaxed);
     counters.protect_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+void OnGpuWait(u64 ns) {
+    if (!IsEnabled()) {
+        return;
+    }
+    if (!Detail::is_cp_thread) {
+        counters.other_thread_gpu_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+        return;
+    }
+    const u32 reason = std::min(Detail::wait_reason, NumWaitReasons - 1);
+    counters.gpu_wait_ns[reason].fetch_add(ns, std::memory_order_relaxed);
+    constexpr u64 MinBlockingNs = 10'000;
+    if (ns < MinBlockingNs) {
+        return;
+    }
+    counters.gpu_wait_count[reason].fetch_add(1, std::memory_order_relaxed);
+    const VAddr block = Detail::wait_addr & ~VAddr{0xFFFF};
+    std::scoped_lock lk{maps_mutex};
+    auto& stat = gpu_wait_stats[{reason, Detail::wait_origin, block}];
+    if (stat.count == 0) {
+        stat.reason = reason;
+        stat.origin = Detail::wait_origin;
+        stat.addr = Detail::wait_addr;
+    }
+    ++stat.count;
+    stat.ns += ns;
+    stat.max_ns = std::max(stat.max_ns, ns);
+    stat.bytes += Detail::wait_size;
 }
 
 void OnFinish(u64 wait_ns) {

@@ -29,6 +29,33 @@ Ryzen 7 5700X3D, RTX 4090, 60 FPS patch, Precise readbacks and linear image read
 The limit now is the GPU command processor thread (one CPU core translating ~100k draws and
 dispatches per second), not readbacks.
 
+## What was done
+
+The game reads GPU results back to the CPU every frame (Trico's feathers, animation, physics).
+On a PS4 that is free: CPU and GPU share memory. On a PC each read means copying data from the
+graphics card and waiting for it, which is what made the game slow. The work, in order:
+
+1. **Measure first.** A built-in profiler (`readback_stats_enabled`) that logs, every second,
+   readbacks, page faults, waits, and where the GPU command thread spends its time, down to
+   single shaders.
+2. **Batching.** Many readbacks waiting on the same GPU work share one wait instead of one each.
+3. **Asynchronous fences.** The game's "GPU work done" signals are delivered by a background
+   thread once the data is back, so the GPU command thread no longer stops to wait for them.
+4. **Waits on the GPU.** When a GPU command waits for an earlier GPU result, the wait is done by
+   the GPU itself instead of blocking the CPU thread (`readback_fence_wait_shortcut: 3`).
+5. **Targeted waits.** When the game touches memory that is still being copied back, it waits
+   for that one copy only, not for the whole GPU to go idle.
+6. **Bug fixes found on the way:** a hang when loading into gameplay (pages stuck in a fault
+   loop), a crash with 3D textures, and a race where a late fence could overwrite newer data.
+7. **Cheaper draw recording.** Faster lookups for the small constant buffers copied before each
+   draw, fetch shaders parsed once instead of at every draw, fewer command buffer submissions.
+8. **Stream copy reuse.** About 70% of those small constant copies repeated data already copied
+   in the same batch; they now reuse the earlier copy (`readback_stream_reuse_enabled`).
+
+Tried and dropped (measured, not worth it): real shared CPU/GPU memory (much slower on PC),
+keeping frequently written pages unprotected (moved cost onto the bottleneck thread), and
+splitting the command thread across CPU cores (too little movable work).
+
 ## Setup
 
 1. Game settings (`user/custom_configs/CUSA03627.json`, or the launcher's per-game settings):

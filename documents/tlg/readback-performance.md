@@ -33,6 +33,8 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
     "readback_batching_enabled": true,
     "readback_fence_wait_shortcut": 3,
     "readback_stream_reuse_enabled": true,
+    "readback_prefetch_lifetime": 60,
+    "rt_lookup_reuse_enabled": true,
     "readback_stats_enabled": false
   }
 }
@@ -48,6 +50,9 @@ file: launchers rewrite `<serial>.json` and drop keys they don't know.
 | `readback_fence_wait_shortcut` | With async fences: 0 = off, 1 = graphics queue `WaitRegMem` may pass for fence values still held back, 2 = graphics and compute, 3 = graphics and compute plus a GPU barrier after each such wait. |
 | `readback_hot_write_pages_enabled` | Pages the CPU rewrites after nearly every upload stay writable and are uploaded at each use. Fewer write faults, but more command thread time: keep off. |
 | `readback_stream_reuse_enabled` | A small read-only buffer bound again in the same command buffer reuses its earlier stream copy. |
+| `readback_prefetch_mode` | Which ranges are downloaded in advance at fences: 0 = none, 1 = ranges that faulted on a read or a write (default), 2 = read faults only. |
+| `readback_prefetch_lifetime` | Guest submissions (about frames) a prefetched range stays hot after its last fault. Default 600; 60 is used for TLG. |
+| `rt_lookup_reuse_enabled` | Draws with the same render target registers as the previous draw reuse its target images instead of a texture cache lookup. |
 
 ## Steps taken
 
@@ -277,9 +282,7 @@ per second that each submitted a command buffer (~125 ms/s).
   1-2% savings now sit inside run-to-run noise.
 - **Next:** make prefetch cheaper while keeping mode 1's low waits. Some stretches prefetch
   550-700 MB/s (60-74 ms/s of command thread time): windows the GPU rewrites at nearly every
-  fence are downloaded every time. Save backup of the current progress:
-  `%APPDATA%\shadPS4\savedata_backups\CUSA03627_2026-09-28_progress\home_1000_CUSA03627`
-  (copy its contents back to `%APPDATA%\shadPS4\home\1000\savedata\CUSA03627` to restore).
+  fence are downloaded every time.
 
 ### Lessons from other emulators
 Consoles with memory shared by CPU and GPU (GameCube/Wii, Xbox 360, Switch) have the same problem.

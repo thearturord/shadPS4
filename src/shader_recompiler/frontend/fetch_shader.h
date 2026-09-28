@@ -5,6 +5,7 @@
 
 #include <optional>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 #include "common/types.h"
 #include "shader_recompiler/info.h"
 
@@ -55,7 +56,9 @@ struct VertexAttribute {
 
 struct FetchShaderData {
     u32 size = 0;
-    std::vector<VertexAttribute> attributes;
+    // Inline storage: this data is copied at every vertex shader lookup (every draw), and a heap
+    // vector allocated at each copy.
+    boost::container::small_vector<VertexAttribute, 16> attributes;
     s8 vertex_offset_sgpr = -1;   ///< SGPR of vertex offset from VADDR
     s8 instance_offset_sgpr = -1; ///< SGPR of instance offset from VADDR
 

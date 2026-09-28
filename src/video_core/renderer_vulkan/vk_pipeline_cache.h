@@ -47,6 +47,7 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    size_t last_perm{~size_t{0}}; ///< Readback stats: variant picked by the last lookup.
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)

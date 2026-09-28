@@ -668,7 +668,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    auto runtime_info = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageRuntimeInfo};
+        return BuildRuntimeInfo(hw_stage, sw_stage);
+    }();
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
@@ -688,15 +691,38 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFlatBuf};
+        info.RefreshFlatBuf();
+    }
+    auto spec = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
+        return Shader::StageSpecialization(info, runtime_info, profile, binding);
+    }();
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
 
+    VideoCore::ReadbackStats::CpTimer find_timer{VideoCore::ReadbackStats::CpTime::StageFind};
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    if (VideoCore::ReadbackStats::IsEnabled()) {
+        using VideoCore::ReadbackStats::Reuse;
+        VideoCore::ReadbackStats::OnReuse(Reuse::StageLookups);
+        const auto compared =
+            it == program->modules.end()
+                ? program->modules.size()
+                : static_cast<size_t>(std::distance(program->modules.begin(), it)) + 1;
+        VideoCore::ReadbackStats::OnReuse(Reuse::StageVariantCompares, compared);
+        const auto found = it == program->modules.end()
+                               ? program->modules.size()
+                               : static_cast<size_t>(std::distance(program->modules.begin(), it));
+        if (found == program->last_perm) {
+            VideoCore::ReadbackStats::OnReuse(Reuse::StageSameAsLast);
+        }
+        program->last_perm = found;
+    }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);

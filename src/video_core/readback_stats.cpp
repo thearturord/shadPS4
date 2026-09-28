@@ -171,9 +171,10 @@ constexpr std::array<const char*, static_cast<size_t>(CpTime::Count)> CpTimeName
     "dynamic state", "begin pass",     "stream copy",     "buffer lookup",
     "gpu mark",      "tex find image", "tex view/layout", "tex sampler",
     "stats",         "vk cmd",         "vk submit",       "vk other",
-    "stream memcpy", "fence images",  "fence prefetch",  "fence submit",
+    "stream memcpy", "fence images",   "fence prefetch",  "fence submit",
     "pipe stages",   "pipe map",       "pipe compile",    "rt prepare",
-    "rt views",
+    "rt views",      "stage runtime",  "stage flatbuf",   "stage spec",
+    "stage find",
 };
 static_assert(std::ranges::none_of(CpTimeNames, [](const char* name) { return name == nullptr; }),
               "every CpTime category needs a name");
@@ -638,7 +639,8 @@ void ReporterThread(std::stop_token stoken) {
            "buf_lookup_ms,buf_gpu_mark_ms,tex_find_image_ms,tex_view_layout_ms,tex_sampler_ms,"
            "stats_overhead_ms,vk_cmd_ms,vk_submit_ms,vk_other_ms,stream_memcpy_ms,"
            "fence_image_copies_ms,fence_prefetch_ms,fence_submit_ms,pipeline_stages_ms,"
-           "pipeline_map_ms,pipeline_compile_ms,rt_prepare_ms,rt_views_ms,"
+           "pipeline_map_ms,pipeline_compile_ms,rt_prepare_ms,rt_views_ms,stage_runtime_ms,"
+           "stage_flatbuf_ms,stage_spec_ms,stage_find_ms,"
            "cp_wait_spin_ms,cp_flip_spin_ms,gpu_busy_ms,present_cpu_ms,"
            "stream_copies,stream_copy_MB,vk_submits,async_fences,async_fence_submits,"
            "upload_MB,hot_pages_new,hot_decays,buffers_created,buffers_merged,merge_MB,"
@@ -648,7 +650,8 @@ void ReporterThread(std::stop_token stoken) {
            "draw_rt_regs_same,draw_user_data_same,draw_all_same,dispatches_checked,"
            "dispatch_pipeline_same,dispatch_user_data_same,stream_rep_tick_same,"
            "stream_rep_tick_changed,stream_rep_old_same,stream_rep_old_changed,"
-           "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,prefetch_downloads,"
+           "stream_rep_same_MB,stream_reused,stream_reuse_resets,rt_reused,stage_lookups,"
+           "stage_variant_compares,stage_same_as_last,prefetch_downloads,"
            "prefetch_MB,prefetch_repeat_downloads,prefetch_repeat_MB,hot_range_faults\n";
     csv.flush();
 

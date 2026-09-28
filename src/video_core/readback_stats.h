@@ -104,6 +104,11 @@ enum class CpTime : u32 {
     // Steps of render target handling:
     RtPrepare, ///< Color and depth target image lookups (PrepareRenderState, nested in Prepare).
     RtViews,   ///< Render target view lookups (nested in RenderTargets).
+    // Steps of a shader stage lookup (GetProgram, nested in PipelineStages):
+    StageRuntimeInfo, ///< Building the stage's runtime info from registers.
+    StageFlatBuf,     ///< Re-reading the shader's user data pointers (RefreshFlatBuf).
+    StageSpec,        ///< Building the specialization (reading buffer/image/sampler sharps).
+    StageFind,        ///< Finding the matching variant and adding its bindings.
     Count,
 };
 
@@ -288,6 +293,9 @@ enum class Reuse : u32 {
     StreamReused,           ///< Stream copies skipped by readback_stream_reuse_enabled.
     StreamReuseResets,      ///< Reuse tables dropped by a command processor write to guest memory.
     RtReused,               ///< Render target lookups skipped by rt_lookup_reuse_enabled.
+    StageLookups,           ///< Shader stage lookups (GetProgram calls for known programs).
+    StageVariantCompares,   ///< Variants compared to find the matching one.
+    StageSameAsLast,        ///< Lookups that picked the same variant as the program's last one.
     Count,
 };
 void OnReuse(Reuse reuse, u64 amount = 1);

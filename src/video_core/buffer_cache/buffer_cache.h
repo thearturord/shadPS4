@@ -116,6 +116,10 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Window around a readback request: GPU-modified ranges come as many small scattered
+    /// islands, so a download is widened to the 512 KB block around the request.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer& buffer, VAddr device_addr, u64 size) const;
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -291,6 +295,15 @@ private:
     const bool stream_reuse_enabled;
     /// readback_prefetch_mode: 0 = no prefetch, 1 = read and write faults, 2 = read faults only.
     const u32 prefetch_mode;
+    /// readback_async_guest_faults: guest threads wait for their readbacks themselves.
+    const bool async_guest_faults;
+    void ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write);
+    /// End of a fault readback, on the command processor thread: drops GPU marks with nothing
+    /// left behind them, downloads what the GPU wrote to the page in the meantime (waiting), and
+    /// marks the CPU write.
+    void FinishFaultReadback(VAddr device_addr, u64 size, bool is_write, VAddr window_start,
+                             u64 window_size, u64& bytes);
+    void NoteHotRange(VAddr window_start, VAddr window_end, bool is_write);
     /// readback_prefetch_lifetime: fences a hot range stays prefetched after its last fault.
     const u32 prefetch_lifetime;
     tsl::robin_map<u64, u64> stream_reuse;

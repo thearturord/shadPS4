@@ -473,6 +473,10 @@ public:
     /// already be submitted.
     void WaitPriorityOperations();
 
+    /// True on the thread running deferred priority operations. Work done there must never wait
+    /// for another priority operation (it would wait for itself).
+    [[nodiscard]] static bool OnPriorityThread() noexcept;
+
     /// Measures GPU execution time of every command buffer (readback stats).
     void EnableGpuTiming();
 

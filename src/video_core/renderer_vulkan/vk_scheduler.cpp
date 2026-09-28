@@ -469,8 +469,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     PopPendingOperations();
 }
 
+namespace {
+thread_local bool is_priority_thread = false;
+} // Anonymous namespace
+
+bool Scheduler::OnPriorityThread() noexcept {
+    return is_priority_thread;
+}
+
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+    is_priority_thread = true;
 
     while (!stoken.stop_requested()) {
         PendingOp op;

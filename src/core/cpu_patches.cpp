@@ -26,6 +26,7 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
@@ -2478,7 +2479,12 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 }
 
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if defined(_WIN32)
+    // cpu_prepatch_tcb: patch the thread-control-block accesses now, while no guest thread runs.
+    if (EmulatorSettings.IsCpuPrepatchTcb() && !Patches.empty()) {
+        TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
+    }
+#elif !defined(__APPLE__)
     // Linux and others have an FS segment pointing to valid memory, so continue to do full
     // ahead-of-time patching for now until a better solution is worked out.
     if (!Patches.empty()) {

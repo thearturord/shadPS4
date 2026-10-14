@@ -418,6 +418,75 @@ struct GPUSettings {
     Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
+    // ---- TLG readback / command processor tuning (documents/tlg/settings-reference.md) ----
+    // Completes image readbacks and recently read back buffers with one GPU wait per fence.
+    Setting<bool> readback_batching_enabled{false};
+    // Signals end-of-pipe fences after their readbacks complete on another thread instead of
+    // blocking the GPU command thread.
+    Setting<bool> readback_async_fences_enabled{false};
+    // With async fences, lets command stream waits pass for fence values still held back:
+    // 0 = off, 1 = graphics queue only, 2 = graphics and compute queues, 3 = like 2 plus a GPU
+    // barrier after each wait that passed on a fence recorded but not finished yet.
+    Setting<u32> readback_fence_wait_shortcut{1};
+    // Small read-only buffers copied again in the same command buffer reuse the earlier copy.
+    Setting<bool> readback_stream_reuse_enabled{false};
+    // Buffer ranges the CPU faulted on are downloaded in advance at fences where the GPU wrote them
+    // again. 0 = never, 1 = ranges that faulted on a read or a write, 2 = only on a read.
+    Setting<u32> readback_prefetch_mode{1};
+    // Fences a prefetched range stays hot after its last CPU fault before it is dropped.
+    Setting<u32> readback_prefetch_lifetime{600};
+    // A draw whose render target registers match the previous draw reuses its target images.
+    Setting<bool> rt_lookup_reuse_enabled{false};
+    // Shader stage lookups first check the variant picked last time: 0 = off, 1 = on, 2 = verify.
+    Setting<u32> stage_lookup_reuse{0};
+    // Guest threads that fault on GPU written memory wait for their own readback; the command
+    // processor records and submits the download and goes on.
+    Setting<bool> readback_async_guest_faults{false};
+    // Linear images that are read back are copied into private staging buffers and written to guest
+    // memory by the priority thread once the GPU finished them (no fence waits for them).
+    Setting<bool> readback_linear_images_async{false};
+    // DMA copies into guest memory (the game's own GPU readbacks) are also copied into a private
+    // staging buffer that the priority thread writes to guest memory once the GPU finished it.
+    Setting<bool> readback_dma_async{false};
+    // File with the 512 KB windows of guest memory the game reads while GPU data is in flight
+    // (one "start end" pair per line, hex). Windows listed at start are prefetched for good, and new
+    // ones learned from read faults are added to the file. Empty = off.
+    Setting<std::string> readback_hot_file{""};
+    // GPU command processor recording: 0 = record Vulkan commands directly, 1 = record them into a
+    // list replayed at submit (same thread), 2 = replay and submit on an encoder thread,
+    // 3 = like 2 but waiting for each submission (diagnostic).
+    Setting<u32> cp_encoder_mode{0};
+    // Encoder thread diagnostics (bit mask): 1 = wait for the encoder at every fence, 2 = at the end
+    // of every guest submission, 4 = fences without readbacks wait for all earlier work.
+    Setting<u32> cp_encoder_debug{0};
+    // Priority of the command processor and encoder threads: 0 or 1 = default, 2 = above normal,
+    // 3 = highest.
+    Setting<u32> cp_thread_priority{0};
+    // Encoder thread: how many recorded command lists the command processor may hand over before it
+    // waits for the encoder (encoder mode 2).
+    Setting<u32> cp_encoder_queue_depth{8};
+    // Fence kinds that wait for all earlier work (bit mask, see VideoCore::FenceKind): 1 = graphics
+    // EOP, 2 = graphics EOS, 4 = compute ReleaseMem, 8 = label writes held behind a fence, 16 = end
+    // of a guest submission. 0 makes Trico's feathers flicker in The Last Guardian.
+    Setting<u32> cp_full_fence_kinds{31};
+    // Command processor split: 0 = one thread does everything, 1 = a front thread parses packets and a
+    // raster thread executes draws, dispatches, fences and copies in order, 2 = like 1 but the front
+    // thread waits after every operation and compares the register mirror (diagnostic).
+    Setting<u32> cp_split_mode{0};
+    // With the encoder thread: hand the recorded Vulkan commands to it every N commands instead of
+    // only at fences and flips. 0 = off.
+    Setting<u32> cp_flush_commands{0};
+    // Windows: pin the raster / front / encoder thread to this logical processor and keep other
+    // threads of the process off it and off its hyper-threading sibling. -1 = off.
+    Setting<s32> cp_raster_core{-1};
+    Setting<s32> cp_front_core{-1};
+    Setting<s32> cp_encoder_core{-1};
+    // Read-only development server on 127.0.0.1 (core/debug_server.h): live counters and policy
+    // switches as JSON. 0 = off.
+    Setting<u32> debug_server_port{0};
+    // Windows: patch every thread-control-block access (mov reg, fs:[0] and similar) of a module when it
+    // is loaded, before the guest runs, instead of the first time a thread executes it.
+    Setting<bool> cpu_prepatch_tcb{false};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -451,6 +520,30 @@ struct GPUSettings {
                                        &GPUSettings::readback_linear_images_enabled),
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
+            make_override<GPUSettings>("readback_batching_enabled", &GPUSettings::readback_batching_enabled),
+            make_override<GPUSettings>("readback_async_fences_enabled", &GPUSettings::readback_async_fences_enabled),
+            make_override<GPUSettings>("readback_fence_wait_shortcut", &GPUSettings::readback_fence_wait_shortcut),
+            make_override<GPUSettings>("readback_stream_reuse_enabled", &GPUSettings::readback_stream_reuse_enabled),
+            make_override<GPUSettings>("readback_prefetch_mode", &GPUSettings::readback_prefetch_mode),
+            make_override<GPUSettings>("readback_prefetch_lifetime", &GPUSettings::readback_prefetch_lifetime),
+            make_override<GPUSettings>("rt_lookup_reuse_enabled", &GPUSettings::rt_lookup_reuse_enabled),
+            make_override<GPUSettings>("stage_lookup_reuse", &GPUSettings::stage_lookup_reuse),
+            make_override<GPUSettings>("readback_async_guest_faults", &GPUSettings::readback_async_guest_faults),
+            make_override<GPUSettings>("readback_linear_images_async", &GPUSettings::readback_linear_images_async),
+            make_override<GPUSettings>("readback_dma_async", &GPUSettings::readback_dma_async),
+            make_override<GPUSettings>("readback_hot_file", &GPUSettings::readback_hot_file),
+            make_override<GPUSettings>("cp_encoder_mode", &GPUSettings::cp_encoder_mode),
+            make_override<GPUSettings>("cp_encoder_debug", &GPUSettings::cp_encoder_debug),
+            make_override<GPUSettings>("cp_thread_priority", &GPUSettings::cp_thread_priority),
+            make_override<GPUSettings>("cp_encoder_queue_depth", &GPUSettings::cp_encoder_queue_depth),
+            make_override<GPUSettings>("cp_full_fence_kinds", &GPUSettings::cp_full_fence_kinds),
+            make_override<GPUSettings>("cp_split_mode", &GPUSettings::cp_split_mode),
+            make_override<GPUSettings>("cp_flush_commands", &GPUSettings::cp_flush_commands),
+            make_override<GPUSettings>("cp_raster_core", &GPUSettings::cp_raster_core),
+            make_override<GPUSettings>("cp_front_core", &GPUSettings::cp_front_core),
+            make_override<GPUSettings>("cp_encoder_core", &GPUSettings::cp_encoder_core),
+            make_override<GPUSettings>("debug_server_port", &GPUSettings::debug_server_port),
+            make_override<GPUSettings>("cpu_prepatch_tcb", &GPUSettings::cpu_prepatch_tcb),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
@@ -460,7 +553,8 @@ struct GPUSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
+                                   direct_memory_access_enabled, readback_batching_enabled, readback_async_fences_enabled, readback_fence_wait_shortcut, readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime, rt_lookup_reuse_enabled, stage_lookup_reuse, readback_async_guest_faults, readback_linear_images_async, readback_dma_async, readback_hot_file, cp_encoder_mode, cp_encoder_debug, cp_thread_priority, cp_encoder_queue_depth, cp_full_fence_kinds, cp_split_mode, cp_flush_commands, cp_raster_core, cp_front_core, cp_encoder_core, debug_server_port, cpu_prepatch_tcb,
+                                   dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
                                    userfaultfd, inline_fetch_shader)
@@ -755,6 +849,30 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackBatchingEnabled, readback_batching_enabled)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAsyncFencesEnabled, readback_async_fences_enabled)
+    SETTING_FORWARD(m_gpu, ReadbackFenceWaitShortcut, readback_fence_wait_shortcut)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackStreamReuseEnabled, readback_stream_reuse_enabled)
+    SETTING_FORWARD(m_gpu, ReadbackPrefetchMode, readback_prefetch_mode)
+    SETTING_FORWARD(m_gpu, ReadbackPrefetchLifetime, readback_prefetch_lifetime)
+    SETTING_FORWARD_BOOL(m_gpu, RtLookupReuseEnabled, rt_lookup_reuse_enabled)
+    SETTING_FORWARD(m_gpu, StageLookupReuse, stage_lookup_reuse)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAsyncGuestFaultsEnabled, readback_async_guest_faults)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesAsync, readback_linear_images_async)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackDmaAsync, readback_dma_async)
+    SETTING_FORWARD(m_gpu, ReadbackHotFile, readback_hot_file)
+    SETTING_FORWARD(m_gpu, CpEncoderMode, cp_encoder_mode)
+    SETTING_FORWARD(m_gpu, CpEncoderDebug, cp_encoder_debug)
+    SETTING_FORWARD(m_gpu, CpThreadPriority, cp_thread_priority)
+    SETTING_FORWARD(m_gpu, CpEncoderQueueDepth, cp_encoder_queue_depth)
+    SETTING_FORWARD(m_gpu, CpFullFenceKinds, cp_full_fence_kinds)
+    SETTING_FORWARD(m_gpu, CpSplitMode, cp_split_mode)
+    SETTING_FORWARD(m_gpu, CpFlushCommands, cp_flush_commands)
+    SETTING_FORWARD(m_gpu, CpRasterCore, cp_raster_core)
+    SETTING_FORWARD(m_gpu, CpFrontCore, cp_front_core)
+    SETTING_FORWARD(m_gpu, CpEncoderCore, cp_encoder_core)
+    SETTING_FORWARD(m_gpu, DebugServerPort, debug_server_port)
+    SETTING_FORWARD_BOOL(m_gpu, CpuPrepatchTcb, cpu_prepatch_tcb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)

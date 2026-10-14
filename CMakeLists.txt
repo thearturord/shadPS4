@@ -1010,6 +1010,8 @@ if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
+             src/core/debug_server.cpp
+             src/core/debug_server.h
              ${FIBER_LIB})
 endif()
 
@@ -1222,6 +1224,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/cache_storage.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
+               src/video_core/readback_policy.cpp
+               src/video_core/readback_policy.h
+               src/video_core/thread_usage.cpp
+               src/video_core/thread_usage.h
                src/video_core/renderdoc.cpp
                src/video_core/renderdoc.h
 )

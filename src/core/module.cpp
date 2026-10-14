@@ -11,6 +11,8 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/debug_server.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -293,6 +295,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
+            Core::DebugServer::Start(static_cast<u16>(EmulatorSettings.GetDebugServerPort()));
         }
     }
 

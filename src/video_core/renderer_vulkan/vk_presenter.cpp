@@ -840,7 +840,25 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+// Port measurement aid (not upstream): log the present rate once per second so the fps can be read
+// from the log without an overlay.
+static void LogPresentRate() {
+    static auto last = std::chrono::steady_clock::now();
+    static u32 frames = 0;
+    ++frames;
+    const auto now = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(now - last).count();
+    if (elapsed >= 1.0) {
+        LOG_INFO(Render_Vulkan, "FPS {:.1f}", static_cast<double>(frames) / elapsed);
+        frames = 0;
+        last = now;
+    }
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    if (!is_reusing_frame) {
+        LogPresentRate();
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

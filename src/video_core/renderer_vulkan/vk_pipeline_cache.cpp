@@ -8,12 +8,15 @@
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
+#include "video_core/readback_policy.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -25,6 +28,10 @@ namespace Vulkan {
 using Shader::HwStage;
 using Shader::Output;
 using Shader::SwStage;
+
+namespace {
+
+} // Anonymous namespace
 
 constexpr static auto SpirvVersion1_6 = 0x00010600U;
 
@@ -89,7 +96,7 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
-    const auto& regs = liverpool->regs;
+    const auto& regs = *lookup_regs;
     const auto BuildCommon = [&](const auto& program) {
         info.props.fp_denorm_mode32 = program.settings.fp_denorm_mode32;
         info.props.fp_denorm_mode16_64 = program.settings.fp_denorm_mode64;
@@ -221,7 +228,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = *lookup_cs;
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -272,7 +279,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
+      desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
+      stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
+    lookup_regs = &liverpool->regs;
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -339,12 +348,23 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
+    if (!lookup_regs_pinned) {
+        lookup_regs = &liverpool->RasterRegs();
+    }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    const auto [it, is_new] = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineMap};
+        return graphics_pipelines.try_emplace(graphics_key);
+    }();
     if (is_new) {
+        VideoCore::ReadbackStats::NoteMutation(
+            VideoCore::ReadbackStats::Mutation::PipelineCompiled);
+        VideoCore::ReadbackStats::CpTimer compile_timer{
+            VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -369,11 +389,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
+    if (!lookup_regs_pinned) {
+        lookup_regs = &liverpool->RasterRegs();
+        lookup_cs = &liverpool->RasterCsRegs();
+    }
     if (!RefreshComputeKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    const auto [it, is_new] = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineMap};
+        return compute_pipelines.try_emplace(compute_key);
+    }();
     if (is_new) {
+        VideoCore::ReadbackStats::NoteMutation(
+            VideoCore::ReadbackStats::Mutation::PipelineCompiled);
+        VideoCore::ReadbackStats::CpTimer compile_timer{
+            VideoCore::ReadbackStats::CpTime::PipelineCompile};
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -392,9 +424,120 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
+Shader::Info* PipelineCache::RasterInfoFor(const Shader::Info* shared) {
+    auto it = raster_infos.find(shared);
+    if (it == raster_infos.end()) {
+        it = raster_infos.emplace(shared, std::make_unique<Shader::Info>(*shared)).first;
+    }
+    return it.value().get();
+}
+
+void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared) {
+    out.info = clone;
+    out.images.clear();
+    out.images_prepared = false;
+    out.user_data_count = static_cast<u32>(shared.user_data.size());
+    ASSERT(out.user_data_count <= out.user_data.size());
+    std::copy_n(shared.user_data.begin(), out.user_data_count, out.user_data.begin());
+    out.flat.assign(shared.flattened_ud_buf.begin(), shared.flattened_ud_buf.end());
+    out.pgm_base = shared.pgm_base;
+}
+
+void PipelineCache::PlanGraphics(const AmdGpu::Regs& regs, DrawIndirectParams params,
+                                 DrawPlan& plan) {
+    lookup_regs = &regs;
+    lookup_regs_pinned = true;
+    const GraphicsPipeline* pipeline = GetGraphicsPipeline(params);
+    lookup_regs_pinned = false;
+    plan.pipeline = pipeline;
+    if (!pipeline) {
+        return;
+    }
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (infos[i]) {
+            CapturePlan(plan.stages[i], RasterInfoFor(infos[i]), *infos[i]);
+        }
+    }
+    // Statistics: are the inputs of each stage the same as the previous draw's? (Hashing every
+    // stage's user data per draw costs the front thread time: only with cp_split_mode 2.)
+    static const bool collect_plan_stats = EmulatorSettings.GetCpSplitMode() >= 2;
+    bool all_same = true;
+    if (collect_plan_stats) {
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        const auto& stage = plan.stages[i];
+        u64 hash = 0;
+        if (stage.info) {
+            hash = reinterpret_cast<u64>(stage.info) ^ (stage.pgm_base * 0x9e3779b97f4a7c15ull);
+            for (u32 d = 0; d < stage.user_data_count; ++d) {
+                hash = (hash ^ stage.user_data[d]) * 0x100000001b3ull;
+            }
+            for (const u32 d : stage.flat) {
+                hash = (hash ^ d) * 0x100000001b3ull;
+            }
+            ++plan_stats.stages;
+            if (hash == last_stage_hash[i]) {
+                ++plan_stats.stages_same;
+            } else {
+                all_same = false;
+            }
+        } else if (last_stage_hash[i] != 0) {
+            all_same = false;
+        }
+        last_stage_hash[i] = hash;
+    }
+    ++plan_stats.draws;
+    plan_stats.draws_all_stages_same += all_same;
+    }
+
+    auto* mutable_pipeline = const_cast<GraphicsPipeline*>(pipeline);
+    if (!mutable_pipeline->StagesAdopted()) {
+        std::array<const Shader::Info*, Shader::MaxStageTypes> clones{};
+        for (u32 i = 0; i < MaxShaderStages; ++i) {
+            clones[i] = plan.stages[i].info;
+        }
+        mutable_pipeline->AdoptStageInfos(clones);
+    }
+}
+
+void PipelineCache::PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan) {
+    lookup_regs_pinned = true;
+    lookup_cs = &cs;
+    const ComputePipeline* pipeline = GetComputePipeline();
+    lookup_regs_pinned = false;
+    plan.pipeline = pipeline;
+    if (!pipeline) {
+        return;
+    }
+    CapturePlan(plan.stage, RasterInfoFor(infos[0]), *infos[0]);
+    auto* mutable_pipeline = const_cast<ComputePipeline*>(pipeline);
+    if (!mutable_pipeline->StagesAdopted()) {
+        std::array<const Shader::Info*, Shader::MaxStageTypes> clones{};
+        clones[u32(Shader::SwStage::Compute)] = plan.stage.info;
+        mutable_pipeline->AdoptStageInfos(clones);
+    }
+}
+
+void PipelineCache::ApplyPlan(const DrawPlan& plan) {
+    for (const auto& stage : plan.stages) {
+        if (!stage.info) {
+            continue;
+        }
+        stage.info->user_data = std::span<const u32>{stage.user_data.data(), stage.user_data_count};
+        stage.info->flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        stage.info->pgm_base = stage.pgm_base;
+    }
+}
+
+void PipelineCache::ApplyPlan(const DispatchPlan& plan) {
+    const auto& stage = plan.stage;
+    stage.info->user_data = std::span<const u32>{stage.user_data.data(), stage.user_data_count};
+    stage.info->flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+    stage.info->pgm_base = stage.pgm_base;
+}
+
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
-    const auto& regs = liverpool->regs;
+    const auto& regs = *lookup_regs;
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -446,7 +589,11 @@ bool PipelineCache::RefreshGraphicsKey() {
     }
 
     // Compile and bind shader stages
-    if (!RefreshGraphicsStages()) {
+    const bool stages_ok = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::PipelineStages};
+        return RefreshGraphicsStages();
+    }();
+    if (!stages_ok) {
         return false;
     }
 
@@ -494,7 +641,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 }
 
 bool PipelineCache::RefreshGraphicsStages() {
-    const auto& regs = liverpool->regs;
+    const auto& regs = *lookup_regs;
     auto& key = graphics_key;
     fetch_shader = nullptr;
 
@@ -614,7 +761,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = *lookup_cs;
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
@@ -657,14 +804,18 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    const Shader::RuntimeInfo& runtime_info = [&]() -> const Shader::RuntimeInfo& {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageRuntimeInfo};
+        return BuildRuntimeInfo(hw_stage, sw_stage);
+    }();
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        auto compile_info = runtime_info;
+        const auto module = CompileModule(program->info, compile_info, params.code, 0, binding);
+        auto spec = Shader::StageSpecialization(program->info, compile_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -679,18 +830,80 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFlatBuf};
+        info.RefreshFlatBuf();
+    }
+
+    // Most lookups pick the same variant as the previous one: check it first, without building
+    // a new specialization (stage_lookup_reuse).
+    size_t fast_perm = ~size_t{0};
+    if (stage_lookup_reuse != 0 && program->last_perm < program->modules.size()) {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
+        if (program->modules[program->last_perm].spec.Matches(info, runtime_info, binding)) {
+            fast_perm = program->last_perm;
+            VideoCore::ReadbackStats::OnReuse(VideoCore::ReadbackStats::Reuse::StageFastPath);
+        }
+    }
+    if (fast_perm != ~size_t{0} && stage_lookup_reuse != 2) {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFind};
+        info.AddBindings(binding);
+        const auto& found = program->modules[fast_perm];
+        if (auto& fetch = program->modules[fast_perm].spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return std::make_tuple(&info, found.module, HashCombine(params.hash, fast_perm));
+    }
+
+    auto spec = [&] {
+        VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
+        return Shader::StageSpecialization(info, runtime_info, profile, binding);
+    }();
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
 
     vk::ShaderModule module{};
 
+    VideoCore::ReadbackStats::CpTimer find_timer{VideoCore::ReadbackStats::CpTime::StageFind};
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    if (VideoCore::ReadbackStats::IsEnabled()) {
+        using VideoCore::ReadbackStats::Reuse;
+        VideoCore::ReadbackStats::OnReuse(Reuse::StageLookups);
+        const auto compared =
+            it == program->modules.end()
+                ? program->modules.size()
+                : static_cast<size_t>(std::distance(program->modules.begin(), it)) + 1;
+        VideoCore::ReadbackStats::OnReuse(Reuse::StageVariantCompares, compared);
+        const auto found = it == program->modules.end()
+                               ? program->modules.size()
+                               : static_cast<size_t>(std::distance(program->modules.begin(), it));
+        if (found == program->last_perm) {
+            VideoCore::ReadbackStats::OnReuse(Reuse::StageSameAsLast);
+        }
+    }
+    if (fast_perm != ~size_t{0}) {
+        // Verify mode: the fast check must agree with the full lookup.
+        const size_t full_perm =
+            it == program->modules.end()
+                ? program->modules.size()
+                : static_cast<size_t>(std::distance(program->modules.begin(), it));
+        if (full_perm != fast_perm) {
+            VideoCore::ReadbackStats::OnReuse(
+                VideoCore::ReadbackStats::Reuse::StageFastPathMismatch);
+            if (logged_stage_mismatches.insert(params.hash).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "stage_lookup_reuse mismatch: {} shader {:#x} fast variant {} full "
+                            "lookup {}{}",
+                            hw_stage, params.hash, fast_perm, full_perm,
+                            it == program->modules.end() ? " (new variant)" : "");
+            }
+        }
+    }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto compile_info = runtime_info;
+        module = CompileModule(new_info, compile_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

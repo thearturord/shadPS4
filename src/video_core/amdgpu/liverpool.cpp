@@ -3,6 +3,10 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include "common/arch.h"
+#ifdef ARCH_X86_64
+#include <immintrin.h>
+#endif
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
@@ -15,6 +19,11 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/readback_policy.h"
+#include "video_core/readback_stats.h"
+#include "video_core/readback_trace.h"
+#include "core/debug_server.h"
+#include "video_core/thread_usage.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -65,7 +74,570 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     return span.subspan(offset);
 }
 
-Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+static void WriteFenceMemory(void* address, u64 data, u32 num_bytes) {
+    auto* memory = Core::Memory::Instance();
+    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+        memcpy(address, &data, num_bytes);
+    }
+}
+
+static void NoFenceWrite(void*, u64, u32) {}
+
+/// Writes a fence value from outside the GPU thread. Memory without a GPU mapping is never page
+/// protected by the tracker, so it can be written directly (fence labels often live in plain
+/// game memory). Returns false when the write must be done on the GPU thread instead.
+static bool TryWriteOffThread(Vulkan::Rasterizer* rasterizer, void* address, const void* data,
+                              u32 num_bytes) {
+    if (Core::Memory::Instance()->TryWriteBacking(address, data, num_bytes)) {
+        return true;
+    }
+    if (rasterizer && !rasterizer->IsMapped(reinterpret_cast<VAddr>(address), num_bytes)) {
+        std::memcpy(address, data, num_bytes);
+        return true;
+    }
+    return false;
+}
+
+static bool TryWriteFenceOffThread(Vulkan::Rasterizer* rasterizer, void* address, u64 data,
+                                   u32 num_bytes) {
+    return TryWriteOffThread(rasterizer, address, &data, num_bytes);
+}
+
+/// Runs a fence signal that may execute outside the GPU thread (async readback fences). Fence
+/// writes there go through the memory backing so they can never fault into the page tracker,
+/// which may be waiting on that thread. If the backing can't be written, the whole signal is
+/// redone on the GPU thread instead.
+template <typename Write, typename Signal>
+static void RunFenceSignal(AmdGpu::Liverpool& liverpool, std::thread::id gpu_id, Write&& try_writes,
+                           Signal&& full_signal) {
+    if (std::this_thread::get_id() == gpu_id) {
+        full_signal();
+        return;
+    }
+    if (try_writes()) {
+        return;
+    }
+    liverpool.SendCommand(std::forward<Signal>(full_signal));
+}
+
+// ---- Command processor split (documents/tlg/cp-split-design.md) ----
+
+/// A draw or dispatch for the rasterizer, with everything it needs besides the registers.
+struct Liverpool::RasterCall {
+    enum class Kind : u8 { Draw, DrawIndirect, DispatchDirect, DispatchIndirect };
+    Kind kind{};
+    bool asc{};       ///< Marker names come from a compute ring (vqid argument).
+    bool no_marker{}; ///< Run without a ScopeMarker.
+    u32 vqid{};
+    const void* cmd_address{}; ///< Only printed in markers, never dereferenced.
+    const char* marker{};      ///< Format string literal.
+    bool indexed{};
+    u32 index_offset{};
+    VAddr args_addr{};
+    u32 offset{};
+    u32 stride{};
+    u32 max_count{};
+    VAddr count_addr{};
+    u16 vertex_sgpr_offset{};
+    u16 instance_sgpr_offset{};
+    u32 dispatch_size{};
+};
+
+struct Liverpool::RasterOp {
+    bool has_call{};
+    bool writes_memory{};
+    u32 write_line{}; ///< Source line of the RasterRun call that queued a writes_memory closure.
+    RasterCall call{};
+    Common::UniqueFunction<void> closure{};
+    std::vector<u32> deltas{}; ///< Register writes to apply first: {offset, count, data...}.
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+    CbDbExtent db_extent{};
+    ComputeProgram cs{};
+    std::unique_ptr<Vulkan::DrawPlan> draw_plan{};
+    std::unique_ptr<Vulkan::DispatchPlan> dispatch_plan{};
+};
+
+struct Liverpool::RasterSplit {
+    static constexpr size_t MaxQueued = 256;
+    static constexpr u32 SetDefaultsMarker = 0xFFFFFFFFu;
+
+    std::jthread thread;
+    std::jthread housekeeping; ///< Slow periodic work that must not stall the raster thread.
+    std::mutex mutex;
+    std::condition_variable_any work_cv; ///< Raster thread: work arrived.
+    std::condition_variable_any done_cv; ///< Front: space in the queue or operations done.
+    std::vector<RasterOp> queue; // swapped with the raster thread's batch: no per-op allocation
+    std::vector<std::vector<u32>> free_deltas;
+    std::atomic<u64> pushed{};
+    std::atomic<u64> done{};
+    std::atomic<u32> pending_writes{}; ///< Queued closures with writes_memory.
+    /// What the front thread is doing (for the raster thread's idle statistics): 0 working,
+    /// 1 waiting for the game to submit, 2 waiting for queued memory writes, 3 queue full.
+    std::atomic<u8> front_state{0};
+    std::array<std::atomic<u64>, 4> raster_idle_ns_by_front_state{};
+    /// Idle time by the kind of the operation that ended it: draw, indirect draw, dispatch,
+    /// indirect dispatch, closure (fence, write, flip, ...).
+    std::array<std::atomic<u64>, 5> raster_idle_ns_by_next_op{};
+    std::array<std::atomic<u64>, 5> raster_idle_count_by_next_op{};
+    /// Statistics per RasterRun call site that queues memory-writing closures: how many, and how
+    /// long the command processor waited for them before a pipeline lookup.
+    struct WriteSite {
+        std::atomic<u32> line{};
+        std::atomic<u64> pushes{};
+        std::atomic<u64> wait_ns{};
+    };
+    std::array<WriteSite, 24> write_sites;
+    u32 last_write_line{}; ///< Command processor thread: line of the newest queued write closure.
+    WriteSite* SiteFor(u32 line) {
+        for (auto& site : write_sites) {
+            u32 expected = 0;
+            if (site.line.load(std::memory_order_relaxed) == line ||
+                (site.line.compare_exchange_strong(expected, line) || expected == line)) {
+                return &site;
+            }
+        }
+        return &write_sites.back();
+    }
+    // Statistics, logged every few seconds.
+    u64 stat_ops{};
+    u64 stat_calls{};
+    u64 stat_write_drains{};
+    std::atomic<u64> stat_front_blocked{}; ///< Pushes that found the queue full.
+    std::atomic<u64> stat_raster_idle_ns{};
+    u64 stat_draws{};
+    u64 stat_draws_no_reg_change{};
+    // Raster thread wall time by kind of work (ns), logged every few seconds.
+    u64 ns_draws{};
+    u64 ns_dispatches{};
+    u64 ns_write_closures{};
+    u64 ns_other_closures{};
+    u64 ns_callbacks{};
+    u64 stat_last_log_ns{};
+    std::vector<u32> pending; ///< Front only: register writes not attached to an operation yet.
+    bool verify{};
+    u32 verify_reports{};
+
+    std::unique_ptr<Regs> regs;
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+    CbDbExtent db_extent{};
+    ComputeProgram cs{};
+};
+
+void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
+    if (!rasterizer_ && split_active) {
+        // The rasterizer goes away: finish what is queued and stop the raster thread first.
+        DrainRaster();
+        split_active = false;
+        StopRasterSplit();
+        raster_regs = &regs;
+        raster_cb_extent = &last_cb_extent;
+        raster_db_extent = &last_db_extent;
+        raster_cs = nullptr;
+        split.reset();
+    }
+    rasterizer = rasterizer_;
+    if (rasterizer && EmulatorSettings.GetCpSplitMode() != 0 && !split) {
+        StartRasterSplit();
+    }
+}
+
+void Liverpool::StartRasterSplit() {
+    split = std::make_unique<RasterSplit>();
+    auto& sp = *split;
+    sp.verify = EmulatorSettings.GetCpSplitMode() >= 2;
+    sp.regs = std::make_unique<Regs>();
+    std::memcpy(sp.regs.get(), &regs, sizeof(Regs));
+    sp.cb_extent = last_cb_extent;
+    sp.db_extent = last_db_extent;
+    sp.cs = mapped_queues[GfxQueueId].cs_state;
+    raster_regs = sp.regs.get();
+    raster_cb_extent = &sp.cb_extent;
+    raster_db_extent = &sp.db_extent;
+    raster_cs = &sp.cs;
+    split_active = true;
+    sp.thread = std::jthread{std::bind_front(&Liverpool::RasterMain, this)};
+    sp.housekeeping = std::jthread{[](std::stop_token stoken) {
+        Common::SetCurrentThreadName("shadPS4:Housekeeping");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::unique_lock lk{mutex};
+        while (!stoken.stop_requested()) {
+            if (cv.wait_for(lk, stoken, std::chrono::seconds(5), [] { return false; })) {
+                break;
+            }
+            const auto start = std::chrono::steady_clock::now();
+            if (const auto usage = VideoCore::ThreadUsageReport(); !usage.empty()) {
+                LOG_INFO(Render, "Thread CPU use (100% = one core): {}", usage);
+            }
+            const auto middle = std::chrono::steady_clock::now();
+            VideoCore::ReapplyCoreIsolation(); // threads created since (guest threads)
+            const auto end = std::chrono::steady_clock::now();
+            Core::DebugServer::RecordPeriodic(
+                "housekeeping_thread_cpu_report",
+                std::chrono::duration<double, std::milli>(middle - start).count());
+            Core::DebugServer::RecordPeriodic(
+                "housekeeping_core_isolation",
+                std::chrono::duration<double, std::milli>(end - middle).count());
+        }
+    }};
+    LOG_INFO(Render, "Command processor split: raster thread started{}",
+             sp.verify ? " (verify mode, synchronous)" : "");
+}
+
+void Liverpool::StopRasterSplit() {
+    if (!split) {
+        return;
+    }
+    split->thread.request_stop();
+    split->work_cv.notify_all();
+    split->thread.join();
+}
+
+bool Liverpool::RasterIdle() const noexcept {
+    return !split_active || split->pushed.load(std::memory_order_acquire) ==
+                                split->done.load(std::memory_order_acquire);
+}
+
+void Liverpool::WakeRaster() {
+    if (split_active) {
+        std::scoped_lock lk{split->mutex};
+        split->work_cv.notify_all();
+    }
+}
+
+void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
+    if (!split_active || count == 0) {
+        return;
+    }
+    ASSERT(dword_offset + count <= Regs::NumRegs);
+    auto& pending = split->pending;
+    const size_t old_size = pending.size();
+    pending.resize(old_size + 2 + count);
+    u32* const out = pending.data() + old_size;
+    out[0] = dword_offset;
+    out[1] = count;
+    std::memcpy(out + 2, regs.reg_array.data() + dword_offset, count * sizeof(u32));
+}
+
+void Liverpool::MirrorObject(const void* object, size_t size) {
+    if (!split_active) {
+        return;
+    }
+    const auto base = reinterpret_cast<uintptr_t>(regs.reg_array.data());
+    const auto begin = reinterpret_cast<uintptr_t>(object);
+    ASSERT(begin >= base && begin + size <= base + sizeof(Regs));
+    const u32 first = static_cast<u32>((begin - base) / sizeof(u32));
+    const u32 last = static_cast<u32>((begin + size - base + sizeof(u32) - 1) / sizeof(u32));
+    MirrorRegs(first, last - first);
+}
+
+void Liverpool::MirrorSetDefaults() {
+    if (split_active) {
+        split->pending.push_back(RasterSplit::SetDefaultsMarker);
+        split->pending.push_back(0);
+    }
+}
+
+void Liverpool::DrainRaster() {
+    if (!split_active) {
+        return;
+    }
+    auto& sp = *split;
+    const u64 target = sp.pushed.load(std::memory_order_acquire);
+    if (sp.done.load(std::memory_order_acquire) >= target) {
+        return;
+    }
+    std::unique_lock lk{sp.mutex};
+    sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
+}
+
+void Liverpool::RasterPush(RasterOp&& op, bool wait) {
+    auto& sp = *split;
+    op.deltas = std::move(sp.pending);
+    sp.pending.clear();
+    if (op.writes_memory) {
+        sp.pending_writes.fetch_add(1, std::memory_order_acq_rel);
+        sp.last_write_line = op.write_line;
+        sp.SiteFor(op.write_line)->pushes.fetch_add(1, std::memory_order_relaxed);
+    }
+    ++sp.stat_ops;
+    u64 target;
+    {
+        std::unique_lock lk{sp.mutex};
+        if (sp.queue.size() >= RasterSplit::MaxQueued) {
+            sp.stat_front_blocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (sp.queue.size() >= RasterSplit::MaxQueued) {
+            sp.front_state.store(3, std::memory_order_relaxed);
+        }
+        sp.done_cv.wait(lk, [&] { return sp.queue.size() < RasterSplit::MaxQueued; });
+        sp.front_state.store(0, std::memory_order_relaxed);
+        sp.queue.push_back(std::move(op));
+        target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
+        sp.work_cv.notify_all();
+        if (!sp.free_deltas.empty()) {
+            sp.pending = std::move(sp.free_deltas.back());
+            sp.free_deltas.pop_back();
+        }
+        if (wait || sp.verify) {
+            sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
+        }
+    }
+}
+
+void Liverpool::RasterRun(Common::UniqueFunction<void>&& func, bool wait, bool writes_memory,
+                          std::source_location site) {
+    if (!split_active) {
+        func();
+        return;
+    }
+    RasterOp op;
+    op.closure = std::move(func);
+    op.writes_memory = writes_memory;
+    op.write_line = site.line();
+    RasterPush(std::move(op), wait);
+}
+
+void Liverpool::DrainRasterWrites() {
+    auto& sp = *split;
+    if (sp.pending_writes.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    ++sp.stat_write_drains;
+    sp.front_state.store(2, std::memory_order_relaxed);
+    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+    {
+        std::unique_lock lk{sp.mutex};
+        sp.done_cv.wait(lk,
+                        [&] { return sp.pending_writes.load(std::memory_order_acquire) == 0; });
+    }
+    sp.front_state.store(0, std::memory_order_relaxed);
+    sp.SiteFor(sp.last_write_line)
+        ->wait_ns.fetch_add(VideoCore::ReadbackStats::NowNs() - wait_start,
+                            std::memory_order_relaxed);
+}
+
+void Liverpool::RasterDispatch(const RasterCall& call) {
+    if (!split_active) {
+        ExecRasterCall(call, nullptr, nullptr);
+        return;
+    }
+    auto& sp = *split;
+    // The lookup below reads descriptor tables and shader code from guest memory: closures that
+    // write guest memory (constant engine dumps, WriteData, DMA) must have run first.
+    DrainRasterWrites();
+    ++sp.stat_calls;
+    if (call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) {
+        ++sp.stat_draws;
+        sp.stat_draws_no_reg_change += sp.pending.empty();
+    }
+    RasterOp op;
+    op.has_call = true;
+    op.call = call;
+    op.cb_extent = last_cb_extent;
+    op.db_extent = last_db_extent;
+    if (call.kind == RasterCall::Kind::DispatchDirect ||
+        call.kind == RasterCall::Kind::DispatchIndirect) {
+        op.cs = GetCsRegs();
+        // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
+        op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
+    } else {
+        const Vulkan::DrawIndirectParams params =
+            call.kind == RasterCall::Kind::DrawIndirect
+                ? Vulkan::DrawIndirectParams{.vertex_sgpr_offset = call.vertex_sgpr_offset,
+                                             .instance_sgpr_offset = call.instance_sgpr_offset}
+                : Vulkan::DrawIndirectParams{};
+        op.draw_plan = rasterizer->PlanDraw(regs, params);
+    }
+    RasterPush(std::move(op), false);
+    if (sp.verify && sp.verify_reports < 20 &&
+        std::memcmp(sp.regs.get(), &regs, sizeof(Regs)) != 0) {
+        // The operation is done: everything the command processor wrote so far is in the
+        // mirror, so the two register files must be identical.
+        const auto* a = reinterpret_cast<const u32*>(sp.regs.get());
+        const auto* b = reinterpret_cast<const u32*>(&regs);
+        u32 first = 0;
+        u32 count = 0;
+        for (u32 i = 0; i < Regs::NumRegs; ++i) {
+            if (a[i] != b[i]) {
+                if (count++ == 0) {
+                    first = i;
+                }
+            }
+        }
+        ++sp.verify_reports;
+        LOG_ERROR(Render,
+                  "CP split verify: raster register mirror differs from the command processor "
+                  "registers in {} dwords, first at dword {:#x} (mirror {:#x}, command processor "
+                  "{:#x}); a register write is not mirrored",
+                  count, first, a[first], b[first]);
+    }
+}
+
+void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 queue) {
+    const auto note = [this](void* address, u32 data_size) {
+        if (rasterizer) {
+            rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(address), data_size);
+        }
+    };
+    if (!split_active) {
+        note(address, data_size);
+        if (!DeferWriteBehindFences(address, data, data_size, queue)) {
+            std::memcpy(address, data, data_size);
+        }
+        return;
+    }
+    RasterRun([note, address, data_size] { note(address, data_size); }, false, true);
+    // Whether a fence write to the label is held back is decided here, in stream order.
+    if (!DeferWriteBehindFences(address, data, data_size, queue)) {
+        RasterRun(
+            [address, words = std::vector<u32>(data, data + data_size / sizeof(u32)), data_size] {
+                std::memcpy(address, words.data(), data_size);
+            },
+            false, true);
+    }
+}
+
+void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw_plan,
+                               const Vulkan::DispatchPlan* dispatch_plan) {
+    const auto run = [&](auto&& body) {
+        if (c.no_marker) {
+            body();
+            return;
+        }
+        const void* cmd_address = c.cmd_address;
+        u32 vqid = c.vqid;
+        if (c.asc) {
+            rasterizer->ScopeMarker(c.marker, fmt::make_format_args(vqid, cmd_address), body);
+        } else {
+            rasterizer->ScopeMarker(c.marker, fmt::make_format_args(cmd_address), body);
+        }
+    };
+    switch (c.kind) {
+    case RasterCall::Kind::Draw:
+        run([&] { rasterizer->Draw(c.indexed, c.index_offset, draw_plan); });
+        break;
+    case RasterCall::Kind::DrawIndirect:
+        run([&] {
+            rasterizer->DrawIndirect(c.indexed, c.args_addr, c.offset, c.stride, c.max_count,
+                                     c.count_addr, c.vertex_sgpr_offset, c.instance_sgpr_offset,
+                                     draw_plan);
+        });
+        break;
+    case RasterCall::Kind::DispatchDirect:
+        run([&] { rasterizer->DispatchDirect(dispatch_plan); });
+        break;
+    case RasterCall::Kind::DispatchIndirect:
+        run([&] {
+            rasterizer->DispatchIndirect(c.args_addr, c.offset, c.dispatch_size, dispatch_plan);
+        });
+        break;
+    }
+    rasterizer->MaybeFlushRecorded();
+}
+
+void Liverpool::RasterMain(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuRaster");
+    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
+        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
+    }
+    gpu_id = std::this_thread::get_id();
+    s32 applied_core = -1;
+    VideoCore::ReadbackStats::MarkCpThread();
+    auto& sp = *split;
+    std::vector<RasterOp> batch;
+    std::vector<std::vector<u32>> recycled;
+    while (true) {
+        // cp_raster_core can be changed live (debug server /set?name=raster_core&value=N).
+        if (const s32 wanted = VideoCore::ReadbackPolicy::Get().raster_core.load();
+            wanted != applied_core) {
+            if (applied_core >= 0) {
+                VideoCore::ClearCoreIsolation();
+            }
+            if (wanted >= 0) {
+                VideoCore::PinThreadAndIsolateCore(static_cast<u32>(wanted));
+            }
+            applied_core = wanted;
+        }
+        {
+            std::unique_lock lk{sp.mutex};
+            Common::CondvarWait(sp.work_cv, lk, stoken,
+                                [&] { return !sp.queue.empty() || num_commands != 0; });
+            if (stoken.stop_requested() && sp.queue.empty() && num_commands == 0) {
+                return;
+            }
+            batch.swap(sp.queue);
+            sp.done_cv.notify_all(); // The queue has room again.
+        }
+        for (auto& op : batch) {
+            // Callbacks sent by other threads (fault readbacks, fences) run between operations,
+            // like they ran between packets before.
+            if (num_commands != 0) {
+                ProcessCommands();
+            }
+            const u32* p = op.deltas.data();
+            const u32* end = p + op.deltas.size();
+            while (p < end) {
+                const u32 offset = p[0];
+                const u32 count = p[1];
+                p += 2;
+                if (offset == RasterSplit::SetDefaultsMarker) {
+                    sp.regs->SetDefaults();
+                    continue;
+                }
+                std::memcpy(&sp.regs->reg_array[offset], p, count * sizeof(u32));
+                p += count;
+            }
+            if (op.has_call) {
+                sp.cb_extent = op.cb_extent;
+                sp.db_extent = op.db_extent;
+                if (op.call.kind == RasterCall::Kind::DispatchDirect ||
+                    op.call.kind == RasterCall::Kind::DispatchIndirect) {
+                    sp.cs = op.cs;
+                }
+                ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
+            } else if (op.closure) {
+                op.closure();
+                if (op.writes_memory) {
+                    sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);
+                    std::scoped_lock lk{sp.mutex};
+                    sp.done_cv.notify_all();
+                }
+            }
+            op.closure = {};
+            rasterizer->RecyclePlan(std::move(op.draw_plan));
+            rasterizer->RecyclePlan(std::move(op.dispatch_plan));
+            op.deltas.clear();
+            recycled.push_back(std::move(op.deltas));
+        }
+        if (num_commands != 0) {
+            ProcessCommands();
+        }
+        const u64 count = batch.size();
+        batch.clear();
+        {
+            std::scoped_lock lk{sp.mutex};
+            for (auto& v : recycled) {
+                if (sp.free_deltas.size() < 64) {
+                    sp.free_deltas.push_back(std::move(v));
+                }
+            }
+            sp.done.fetch_add(count, std::memory_order_acq_rel);
+            sp.done_cv.notify_all();
+        }
+        recycled.clear();
+        if (RasterIdle()) {
+            std::scoped_lock lk{submit_mutex};
+            submit_cv.notify_all();
+        }
+    }
+}
+
+
+Liverpool::Liverpool()
+    : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
+      fence_wait_shortcut{EmulatorSettings.GetReadbackFenceWaitShortcut()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
@@ -73,9 +645,293 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
 Liverpool::~Liverpool() {
     process_thread.request_stop();
     process_thread.join();
+    StopRasterSplit();
+}
+
+static u64 ReadLabel(VAddr address, u32 num_bytes) {
+    u64 value{};
+    std::memcpy(&value, reinterpret_cast<const void*>(address), num_bytes);
+    return value;
+}
+
+u64 Liverpool::RecordFence(VAddr address, u64 value, u32 num_bytes, u32 queue) {
+    // Read outside the lock, see MatchRecordedFence.
+    const u64 memory = ReadLabel(address, num_bytes);
+    std::scoped_lock lk{recorded_fence_mutex};
+    const u64 seq = ++next_fence_seq;
+    // A label reused with another size: forget the old state, waits then poll memory.
+    std::erase_if(label_states, [&](const LabelState& label) {
+        return label.address < address + num_bytes && address < label.address + label.num_bytes &&
+               (label.address != address || label.num_bytes != num_bytes);
+    });
+    auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->overridden) {
+        // Start tracking from what guest memory holds now.
+        if (it == label_states.end()) {
+            it = label_states.emplace(label_states.end());
+            it->address = address;
+            it->num_bytes = num_bytes;
+        }
+        it->overridden = false;
+        it->known_values.clear();
+        it->known_values.push_back(memory);
+    }
+    // Only the latest value can satisfy a later wait: the GPU runs the fences in the order they
+    // were recorded, so older values are overwritten before any later wait could observe them.
+    it->latest_value = value;
+    it->latest_seq = seq;
+    // Set by SetFenceTick once the raster thread has recorded the work before this fence.
+    it->gpu_tick = 0;
+    it->queue = queue;
+    ++it->pending;
+    if (it->known_values.size() < MaxKnownLabelValues) {
+        it->known_values.push_back(value);
+    }
+    return seq;
+}
+
+void Liverpool::SetFenceTick(VAddr address, u64 seq) {
+    const u64 tick = rasterizer ? rasterizer->CurrentTick() : 0;
+    std::scoped_lock lk{recorded_fence_mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it != label_states.end() && it->latest_seq == seq) {
+        it->gpu_tick = tick;
+    }
+}
+
+u64 Liverpool::GetFenceTick(VAddr address, u64 seq) {
+    std::scoped_lock lk{recorded_fence_mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->latest_seq < seq) {
+        return 0; // Retired: the work finished, nothing to order against.
+    }
+    return it->gpu_tick;
+}
+
+void Liverpool::RetireFence(VAddr address, u64 seq) {
+    std::scoped_lock lk{recorded_fence_mutex};
+    const auto it = std::ranges::find(label_states, address, &LabelState::address);
+    if (it == label_states.end() || it->latest_seq < seq) {
+        return;
+    }
+    if (--it->pending == 0) {
+        // Everything recorded has landed: guest memory is authoritative again.
+        label_states.erase(it);
+    }
+}
+
+Liverpool::FenceMatch Liverpool::MatchRecordedFence(const PM4CmdWaitRegMem& wait_reg_mem) {
+    if (wait_reg_mem.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return {};
+    }
+    const VAddr wait_address = wait_reg_mem.Address<VAddr>();
+    // Read outside the lock: the read may fault into a readback that waits on the thread
+    // retiring fences.
+    const u32 memory = *wait_reg_mem.Address();
+    std::scoped_lock lk{recorded_fence_mutex};
+    for (auto& label : label_states) {
+        if (wait_address < label.address ||
+            wait_address + sizeof(u32) > label.address + label.num_bytes) {
+            continue;
+        }
+        if (label.overridden) {
+            return {};
+        }
+        const u32 shift = static_cast<u32>(wait_address - label.address) * 8;
+        const auto slice = [shift](u64 value) { return static_cast<u32>(value >> shift); };
+        // Guest memory may only hold the value from before the first held back fence, or one
+        // of the recorded values. Anything else was written by someone else (typically the
+        // guest CPU resetting or releasing the label), and that write is newer than the
+        // recorded values: from now on waits on this label poll guest memory.
+        if (std::ranges::none_of(label.known_values,
+                                 [&](u64 known) { return slice(known) == memory; })) {
+            label.overridden = true;
+            if (logged_overrides.insert(label.address).second) {
+                LOG_INFO(Render,
+                         "Fence timeline: label {:#x} changed to {:#x} outside the recorded "
+                         "fences (held back value {:#x}, value before them {:#x}); waits on it "
+                         "poll memory until the next fence",
+                         label.address, memory, slice(label.latest_value),
+                         slice(label.known_values.front()));
+            }
+            return {};
+        }
+        const u32 value = slice(label.latest_value);
+        return {
+            .satisfied = wait_reg_mem.TestValue(value),
+            .label_address = label.address,
+            .seq = label.latest_seq,
+            .gpu_tick = label.gpu_tick,
+            .queue = label.queue,
+            .value = value,
+            .initial = slice(label.known_values.front()),
+        };
+    }
+    return {};
+}
+
+void Liverpool::OnWaitPassedOnFence(const PM4CmdWaitRegMem& wait_reg_mem, const FenceMatch& match,
+                                    u32 queue) {
+    if (fence_wait_shortcut >= 3 && rasterizer) {
+        // Recorded in order with the draws queued before and after this wait.
+        // The fence's tick is set by an earlier operation of the raster queue, so it is known
+        // when this one runs.
+        RasterRun([this, address = match.label_address, seq = match.seq] {
+            if (rasterizer->CommandStreamBarrier(GetFenceTick(address, seq))) {
+                VideoCore::ReadbackStats::OnStreamBarrier();
+            }
+        });
+    }
+    if (queue != GfxQueueId) {
+        const VAddr address = wait_reg_mem.Address<VAddr>();
+        // Capped: every new label address logged made the console sink about 3% of the front thread.
+        if (logged_compute_passes.size() < 64 && logged_compute_passes.insert(address).second) {
+            LOG_INFO(Render,
+                     "Fence timeline: compute ring {} passed a wait on {:#x} (func={} ref={:#x} "
+                     "mask={:#x}) with value {:#x} recorded by queue {}; memory holds {:#x}, "
+                     "held {:#x} before the fence",
+                     queue - 1, address, static_cast<u32>(wait_reg_mem.function.Value()),
+                     wait_reg_mem.ref, wait_reg_mem.mask, match.value, match.queue,
+                     *wait_reg_mem.Address(), match.initial);
+        }
+    }
+}
+
+void Liverpool::ReportLongWait(const PM4CmdWaitRegMem& wait_reg_mem, const char* queue,
+                               u64 wait_start, bool& reported) {
+    if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
+        return;
+    }
+    reported = true;
+    const bool is_memory = wait_reg_mem.mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+    const u32 value = is_memory ? *wait_reg_mem.Address() : regs.reg_array[wait_reg_mem.Reg()];
+    std::string pending;
+    {
+        std::scoped_lock lk{recorded_fence_mutex};
+        for (const auto& label : label_states) {
+            pending +=
+                fmt::format(" [{:#x}={:#x} q{} pending={}{}]", label.address, label.latest_value,
+                            label.queue, label.pending, label.overridden ? " overridden" : "");
+        }
+    }
+    LOG_WARNING(Render,
+                "Hang check: {} queue waiting >2s on {} {:#x}: value={:#x} func={} ref={:#x} "
+                "mask={:#x}; pending fence writes:{}",
+                queue, is_memory ? "memory" : "register",
+                is_memory ? wait_reg_mem.Address<VAddr>() : VAddr{wait_reg_mem.Reg()}, value,
+                static_cast<u32>(wait_reg_mem.function.Value()), wait_reg_mem.ref,
+                wait_reg_mem.mask, pending.empty() ? " none" : pending);
+}
+
+void Liverpool::ReportLongSpin(const char* what, const void* address, u64 wait_start,
+                               bool& reported) {
+    VideoCore::ReadbackStats::CpWaitYield(false);
+    if (reported || VideoCore::ReadbackStats::NowNs() - wait_start < 2'000'000'000ULL) {
+        return;
+    }
+    reported = true;
+    LOG_WARNING(Render, "Hang check: {} waiting >2s on {}", what, fmt::ptr(address));
+}
+
+void Liverpool::NoteFenceLatency(VideoCore::FenceKind kind, u64 queue_ns, u64 gpu_ns) {
+    auto& stat = fence_latency[std::countr_zero(static_cast<u32>(kind)) % fence_latency.size()];
+    const u64 total = queue_ns + gpu_ns;
+    stat.count.fetch_add(1, std::memory_order_relaxed);
+    stat.queue_ns.fetch_add(queue_ns, std::memory_order_relaxed);
+    stat.gpu_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
+    stat.total_ns.fetch_add(total, std::memory_order_relaxed);
+    u64 max = stat.max_total_ns.load(std::memory_order_relaxed);
+    while (total > max && !stat.max_total_ns.compare_exchange_weak(max, total)) {
+    }
+}
+
+void Liverpool::SignalFenceAfterReadbacks(Common::UniqueFunction<void>&& signal, bool must_sync,
+                                          VAddr address, u64 value, u32 num_bytes, u32 queue,
+                                          VideoCore::FenceKind kind) {
+    VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::Fence};
+    if (!rasterizer) {
+        signal();
+        return;
+    }
+    const u64 parsed_ns = VideoCore::ReadbackStats::NowNs();
+    // Wraps the signal to time the fence: parsed -> started on the raster thread -> signal runs.
+    const auto timed = [this, kind, parsed_ns](Common::UniqueFunction<void>&& inner) {
+        const u64 started_ns = VideoCore::ReadbackStats::NowNs();
+        return Common::UniqueFunction<void>{
+            [this, kind, parsed_ns, started_ns, inner = std::move(inner)]() mutable {
+                const u64 now = VideoCore::ReadbackStats::NowNs();
+                NoteFenceLatency(kind, started_ns - parsed_ns, now - started_ns);
+                inner();
+            }};
+    };
+    if (address == 0 || num_bytes == 0) {
+        RasterRun(
+            [this, signal = std::move(signal), kind, must_sync, timed]() mutable {
+                rasterizer->OnFence(timed(std::move(signal)), kind, must_sync);
+            },
+            must_sync);
+        return;
+    }
+    // The label timeline is updated here, when the packet is parsed, so command stream waits
+    // see the fence without waiting for the raster thread. The raster thread records the work
+    // before the fence and notes its tick (SetFenceTick).
+    const u64 seq = RecordFence(address, value, num_bytes, queue);
+    RasterRun(
+        [this, address, seq, signal = std::move(signal), kind, must_sync, timed]() mutable {
+            SetFenceTick(address, seq);
+            rasterizer->OnFence(
+                timed([this, address, seq, signal = std::move(signal)]() mutable {
+                    signal();
+                    RetireFence(address, seq);
+                }),
+                kind, must_sync);
+        },
+        must_sync);
+}
+
+bool Liverpool::DeferWriteBehindFences(void* address, const u32* data, u32 num_bytes, u32 queue) {
+    const VAddr begin = reinterpret_cast<VAddr>(address);
+    {
+        std::scoped_lock lk{recorded_fence_mutex};
+        const bool held_back = std::ranges::any_of(label_states, [&](const LabelState& label) {
+            return label.pending != 0 && label.address < begin + num_bytes &&
+                   begin < label.address + label.num_bytes;
+        });
+        if (!held_back) {
+            return false;
+        }
+    }
+    if (logged_deferred_writes.size() < 64 && logged_deferred_writes.insert(begin).second) {
+        LOG_INFO(Render,
+                 "Fence timeline: queue {} writes {} bytes to label {:#x} while a fence write to "
+                 "it is held back; the write is queued behind it",
+                 queue, num_bytes, begin);
+    }
+    std::vector<u32> words(data, data + num_bytes / sizeof(u32));
+    u64 value{};
+    std::memcpy(&value, words.data(), std::min<u32>(num_bytes, sizeof(u64)));
+    auto signal = [this, address, words = std::move(words)] {
+        const u32 size = static_cast<u32>(words.size() * sizeof(u32));
+        RunFenceSignal(
+            *this, gpu_id,
+            [&] { return TryWriteOffThread(rasterizer, address, words.data(), size); },
+            [address, words] {
+                const u32 size = static_cast<u32>(words.size() * sizeof(u32));
+                if (!Core::Memory::Instance()->TryWriteBacking(address, words.data(), size)) {
+                    std::memcpy(address, words.data(), size);
+                }
+            });
+    };
+    const bool is_label = num_bytes == sizeof(u32) || num_bytes == sizeof(u64);
+    SignalFenceAfterReadbacks(std::move(signal), false, is_label ? begin : 0, value,
+                              is_label ? num_bytes : 0, queue, VideoCore::FenceHeldWrite);
+    return true;
 }
 
 void Liverpool::ProcessCommands() {
+    if (split_active && std::this_thread::get_id() != gpu_id) {
+        return; // The raster thread runs the callbacks.
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -85,32 +941,53 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
+        VideoCore::ReadbackStats::CpPhase phase{"guest command (SendCommand)"};
+        VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::GuestCommand};
         callback();
     }
 }
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
+        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
+    }
     gpu_id = std::this_thread::get_id();
+    front_id = gpu_id;
+    if (const s32 core = EmulatorSettings.GetCpFrontCore(); core >= 0) {
+        VideoCore::PinThreadAndIsolateCore(static_cast<u32>(core));
+    }
+    VideoCore::ReadbackStats::MarkCpThread();
+    VideoCore::ReadbackStats::RegisterSampledThread("cp");
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
 
     while (!stoken.stop_requested()) {
+        VideoCore::ReadbackTrace::NoteMark("front_wait");
         {
+            VideoCore::ReadbackStats::CpTimer idle_timer{VideoCore::ReadbackStats::CpTime::Idle};
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            if (split_active) {
+                split->front_state.store(1, std::memory_order_relaxed);
+            }
+            Common::CondvarWait(submit_cv, lk, stoken, [this] {
+                return (!split_active && num_commands) || num_submits || submit_done;
+            });
+            if (split_active) {
+                split->front_state.store(0, std::memory_order_relaxed);
+            }
         }
         if (stoken.stop_requested()) {
             break;
         }
 
         VideoCore::StartCapture();
+        VideoCore::ReadbackTrace::NoteMark("submit_begin");
 
         curr_qid = -1;
 
-        while (num_submits || num_commands) {
+        while (num_submits || (!split_active && num_commands)) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -142,13 +1019,18 @@ void Liverpool::Process(std::stop_token stoken) {
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
-                rasterizer->OnSubmit();
-                rasterizer->Flush();
+                RasterRun([this] {
+                    VideoCore::ReadbackStats::CpPhase phase{"end of submit (readbacks, flush)"};
+                    VideoCore::ReadbackStats::CpTimer timer{
+                        VideoCore::ReadbackStats::CpTime::SubmitEnd};
+                    rasterizer->OnSubmit();
+                    rasterizer->Flush();
+                });
             }
             submit_done = false;
         }
 
-        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
+        RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle); });
     }
 }
 
@@ -180,8 +1062,19 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            memcpy(dump_const->Address<void*>(),
-                   cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            if (split_active) {
+                // A command processor write to guest memory: done in order with the draws.
+                void* dst = dump_const->Address<void*>();
+                const u8* src = cblock.constants_heap.data() + dump_const->Offset();
+                RasterRun(
+                    [dst, bytes = std::vector<u8>(src, src + dump_const->Size())] {
+                        std::memcpy(dst, bytes.data(), bytes.size());
+                    },
+                    false, true);
+            } else {
+                memcpy(dump_const->Address<void*>(),
+                       cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            }
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -256,6 +1149,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            VideoCore::ReadbackStats::CpPacket(GfxQueueId, static_cast<u32>(opcode));
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -267,7 +1161,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    RasterRun(
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -275,7 +1170,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         const auto marker_sz = nop->header.count.Value() * 2;
                         const std::string_view label{
                             reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
-                        rasterizer->ScopeMarkerBegin(label, true);
+                        RasterRun([this, label = std::string(label)] {
+                            rasterizer->ScopeMarkerBegin(label, true);
+                        });
                     }
                     break;
                 }
@@ -286,13 +1183,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             reinterpret_cast<const char*>(&nop->data_block[1]), marker_sz};
                         const u32 color = *reinterpret_cast<const u32*>(
                             reinterpret_cast<const u8*>(&nop->data_block[1]) + marker_sz);
-                        rasterizer->ScopedMarkerInsertColor(label, color, true);
+                        RasterRun([this, label = std::string(label), color] {
+                            rasterizer->ScopedMarkerInsertColor(label, color, true);
+                        });
                     }
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPop: {
                     if (guest_markers_enabled) {
-                        rasterizer->ScopeMarkerEnd(true);
+                        RasterRun([this] { rasterizer->ScopeMarkerEnd(true); });
                     }
                     break;
                 }
@@ -306,6 +1205,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                MirrorSetDefaults();
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -313,6 +1213,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                MirrorRegs(reg_addr, count - 1);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -321,6 +1222,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                MirrorRegs(reg_addr, count - 1);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -401,6 +1303,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
+                    MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset,
+                               set_size / sizeof(u32));
                 }
                 break;
             }
@@ -408,6 +1312,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
                             header + 2, (count - 1) * sizeof(u32));
+                MirrorRegs(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -417,6 +1322,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
                 regs.index_buffer_type.raw = index_type->raw;
+                MirrorObject(&regs.index_buffer_type, sizeof(regs.index_buffer_type));
                 break;
             }
             case PM4ItOpcode::DrawIndex2: {
@@ -426,15 +1332,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                MirrorObject(&regs.max_index_size, sizeof(regs.max_index_size));
+                MirrorObject(&regs.index_base_address, sizeof(regs.index_base_address));
+                MirrorObject(&regs.num_indices, sizeof(regs.num_indices));
+                MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DrawIndex2", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->Draw(true); });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::Draw;
+                call.marker = "gfx:{}:DrawIndex2";
+                call.cmd_address = header;
+                call.indexed = true;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndexOffset2: {
@@ -443,31 +1356,41 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.max_index_size = draw_index_off->max_size;
                 regs.num_indices = draw_index_off->index_count;
                 regs.draw_initiator = draw_index_off->draw_initiator;
+                MirrorObject(&regs.max_index_size, sizeof(regs.max_index_size));
+                MirrorObject(&regs.num_indices, sizeof(regs.num_indices));
+                MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexOffset2", fmt::make_format_args(cmd_address),
-                    [&] { rasterizer->Draw(true, draw_index_off->index_offset); });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::Draw;
+                call.marker = "gfx:{}:DrawIndexOffset2";
+                call.cmd_address = header;
+                call.indexed = true;
+                call.index_offset = draw_index_off->index_offset;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndexAuto: {
                 const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
+                MirrorObject(&regs.num_indices, sizeof(regs.num_indices));
+                MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DrawIndexAuto", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->Draw(false); });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::Draw;
+                call.marker = "gfx:{}:DrawIndexAuto";
+                call.cmd_address = header;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndirect: {
@@ -480,13 +1403,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndirect", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset, stride, 1, 0,
-                                                 draw_indirect->base_vtx_loc,
-                                                 draw_indirect->start_inst_loc);
-                    });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DrawIndirect;
+                call.marker = "gfx:{}:DrawIndirect";
+                call.cmd_address = header;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.stride = stride;
+                call.max_count = 1;
+                call.vertex_sgpr_offset = draw_indirect->base_vtx_loc;
+                call.instance_sgpr_offset = draw_indirect->start_inst_loc;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndirectCountMulti: {
@@ -520,14 +1447,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndirectMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(false, indirect_args_addr, offset,
-                                                 draw_indirect->stride, draw_indirect->count, 0,
-                                                 draw_indirect->base_vtx_loc,
-                                                 draw_indirect->start_inst_loc);
-                    });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DrawIndirect;
+                call.marker = "gfx:{}:DrawIndirectMulti";
+                call.cmd_address = header;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.stride = draw_indirect->stride;
+                call.max_count = draw_indirect->count;
+                call.vertex_sgpr_offset = draw_indirect->base_vtx_loc;
+                call.instance_sgpr_offset = draw_indirect->start_inst_loc;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirect: {
@@ -542,13 +1472,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirect", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(true, indirect_args_addr, offset, stride, 1, 0,
-                                                 draw_index_indirect->base_vtx_loc,
-                                                 draw_index_indirect->start_inst_loc);
-                    });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DrawIndirect;
+                call.marker = "gfx:{}:DrawIndexIndirect";
+                call.cmd_address = header;
+                call.indexed = true;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.stride = stride;
+                call.max_count = 1;
+                call.vertex_sgpr_offset = draw_index_indirect->base_vtx_loc;
+                call.instance_sgpr_offset = draw_index_indirect->start_inst_loc;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectMulti: {
@@ -562,14 +1497,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirectMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(
-                            true, indirect_args_addr, offset, draw_index_indirect->stride,
-                            draw_index_indirect->count, 0, draw_index_indirect->base_vtx_loc,
-                            draw_index_indirect->start_inst_loc);
-                    });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DrawIndirect;
+                call.marker = "gfx:{}:DrawIndexIndirectMulti";
+                call.cmd_address = header;
+                call.indexed = true;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.stride = draw_index_indirect->stride;
+                call.max_count = draw_index_indirect->count;
+                call.vertex_sgpr_offset = draw_index_indirect->base_vtx_loc;
+                call.instance_sgpr_offset = draw_index_indirect->start_inst_loc;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DrawIndexIndirectCountMulti: {
@@ -583,17 +1522,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DrawIndexIndirectCountMulti", fmt::make_format_args(cmd_address), [&] {
-                        rasterizer->DrawIndirect(
-                            true, indirect_args_addr, offset, draw_index_indirect->stride,
-                            draw_index_indirect->count,
-                            draw_index_indirect->count_indirect_enable.Value()
-                                ? draw_index_indirect->count_addr
-                                : 0,
-                            draw_index_indirect->base_vtx_loc, draw_index_indirect->start_inst_loc);
-                    });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DrawIndirect;
+                call.marker = "gfx:{}:DrawIndexIndirectCountMulti";
+                call.cmd_address = header;
+                call.indexed = true;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.stride = draw_index_indirect->stride;
+                call.max_count = draw_index_indirect->count;
+                call.count_addr = draw_index_indirect->count_indirect_enable.Value()
+                                      ? draw_index_indirect->count_addr
+                                      : 0;
+                call.vertex_sgpr_offset = draw_index_indirect->base_vtx_loc;
+                call.instance_sgpr_offset = draw_index_indirect->start_inst_loc;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
@@ -610,9 +1553,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
-                                        [&] { rasterizer->DispatchDirect(); });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DispatchDirect;
+                call.marker = "gfx:{}:DispatchDirect";
+                call.cmd_address = header;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::DispatchIndirect: {
@@ -628,21 +1573,27 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
-                const auto cmd_address = reinterpret_cast<const void*>(header);
-                rasterizer->ScopeMarker(
-                    "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
-                    [&] { rasterizer->DispatchIndirect(indirect_args_addr, offset, size); });
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DispatchIndirect;
+                call.marker = "gfx:{}:DispatchIndirect";
+                call.cmd_address = header;
+                call.args_addr = indirect_args_addr;
+                call.offset = offset;
+                call.dispatch_size = size;
+                RasterDispatch(call);
                 break;
             }
             case PM4ItOpcode::NumInstances: {
                 const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
                 regs.num_instances.num_instances = num_instances->num_instances;
+                MirrorObject(&regs.num_instances, sizeof(regs.num_instances));
                 break;
             }
             case PM4ItOpcode::IndexBase: {
                 const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
                 regs.index_base_address.base_addr_lo = index_base->addr_lo;
                 regs.index_base_address.base_addr_hi = index_base->addr_hi;
+                MirrorObject(&regs.index_base_address, sizeof(regs.index_base_address));
                 break;
             }
             case PM4ItOpcode::IndexBufferSize: {
@@ -665,14 +1616,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
+                    MirrorObject(&regs.cp_strmout_cntl, sizeof(regs.cp_strmout_cntl));
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                        }
+                        const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
+                        const s32 pairs = num_counter_pairs;
+                        RasterRun([this, results, counter_value, pairs] {
+                            if (rasterizer) {
+                                rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
+                                                             pairs * 16);
+                            }
+                            u64* out = results;
+                            for (s32 i = 0; i < pairs; ++i, out += 2) {
+                                *out = counter_value;
+                            }
+                        });
                         pixel_counter += OcclusionCounterStep;
                     }
                 }
@@ -680,34 +1641,76 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                });
-                if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                // The packet is copied: the signal may run after the command buffer is reused.
+                auto signal = [this, eos = *event_eos] {
+                    RunFenceSignal(
+                        *this, gpu_id,
+                        [&] {
+                            bool backed = true;
+                            eos.SignalFence([&](void* address, u64 data, u32 num_bytes) {
+                                backed &=
+                                    TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                            });
+                            return backed;
+                        },
+                        [eos] { eos.SignalFence(WriteFenceMemory); });
+                };
+                // GdsStore reads GDS on this thread right after, keep it synchronous.
+                const bool is_gds_store =
+                    event_eos->command == PM4CmdEventWriteEos::Command::GdsStore;
+                SignalFenceAfterReadbacks(
+                    std::move(signal), is_gds_store, is_gds_store ? 0 : event_eos->Address<VAddr>(),
+                    event_eos->DataDWord(), sizeof(u32), GfxQueueId, VideoCore::FenceGfxEos);
+                if (is_gds_store) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
-                        rasterizer->Finish();
-                        const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
-                        *event_eos->Address() = value;
+                        auto* const destination = event_eos->Address();
+                        const auto gds_index = event_eos->gds_index;
+                        RasterRun(
+                            [this, destination, gds_index] {
+                                VideoCore::ReadbackStats::CpPhase phase{"EOS GDS store (Finish)"};
+                                VideoCore::ReadbackStats::WaitScope wait_scope{
+                                    VideoCore::ReadbackStats::WaitReason::GdsStore};
+                                rasterizer->Finish();
+                                *destination = rasterizer->ReadDataFromGds(gds_index);
+                            },
+                            true);
                     }
                 }
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                // The packet is copied: the signal may run after the command buffer is reused.
+                static constexpr auto irq = [] {
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                };
+                auto signal = [this, eop = *event_eop] {
+                    RunFenceSignal(
+                        *this, gpu_id,
+                        [&] {
+                            bool backed = true;
+                            eop.SignalFence(
+                                [&](void* address, u64 data, u32 num_bytes) {
+                                    backed &= TryWriteFenceOffThread(rasterizer, address, data,
+                                                                     num_bytes);
+                                },
+                                [] {});
+                            if (backed) {
+                                // Writes landed, now raise the interrupt (if any) after them.
+                                eop.SignalFence(NoFenceWrite, irq);
+                            }
+                            return backed;
+                        },
+                        [eop] { eop.SignalFence(WriteFenceMemory, irq); });
+                };
+                const auto eop_data_sel = event_eop->data_sel.Value();
+                const u32 eop_bytes = eop_data_sel == DataSelect::Data32Low ? sizeof(u32)
+                                      : eop_data_sel == DataSelect::Data64  ? sizeof(u64)
+                                                                            : 0;
+                SignalFenceAfterReadbacks(
+                    std::move(signal), false, reinterpret_cast<VAddr>(event_eop->Address<u8>()),
+                    event_eop->DataQWord(), eop_bytes, GfxQueueId, VideoCore::FenceGfxEop);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -716,35 +1719,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 ASSERT(dma_data->command.das == 0);
-                if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
-                } else {
-                    UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                                    u32(dma_data->dst_sel));
-                }
+                RasterRun([this, dma = *dma_data] {
+                    const auto* dma_data = &dma;
+                    if (dma_data->src_sel == DmaDataSrc::Data &&
+                        dma_data->dst_sel == DmaDataDst::Gds) {
+                        rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
+                                               dma_data->data, true);
+                    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                               dma_data->dst_sel == DmaDataDst::Gds) {
+                        rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                                               dma_data->NumBytes(), true, false);
+                    } else if (dma_data->src_sel == DmaDataSrc::Data &&
+                               (dma_data->dst_sel == DmaDataDst::Memory ||
+                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                        rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                               dma_data->data, false);
+                    } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+                               (dma_data->dst_sel == DmaDataDst::Memory ||
+                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
+                                               dma_data->src_addr_lo, dma_data->NumBytes(), false,
+                                               true);
+                    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                               (dma_data->dst_sel == DmaDataDst::Memory ||
+                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
+                                               dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
+                                               false, false);
+                    } else {
+                        UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
+                                        u32(dma_data->src_sel), u32(dma_data->dst_sel));
+                    }
+                }, false, true);
                 break;
             }
             case PM4ItOpcode::WriteData: {
@@ -752,14 +1760,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
-                if (!write_data->wr_one_addr.Value()) {
-                    if (rasterizer) {
-                        rasterizer->OnFence();
-                    }
-                    std::memcpy(address, write_data->data, data_size);
-                } else {
+                if (write_data->wr_one_addr.Value()) {
                     UNREACHABLE();
                 }
+                CpWriteData(address, write_data->data, data_size, GfxQueueId);
                 break;
             }
             case PM4ItOpcode::CopyData: {
@@ -777,8 +1781,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                    bool reported = false;
+                    bool blocked = false;
                     while (!mem_semaphore->Signaled()) {
+                        blocked = true;
+                        ReportLongSpin("gfx MemSemaphore", mem_semaphore, wait_start, reported);
                         YIELD_GFX();
+                    }
+                    if (blocked) {
+                        VideoCore::ReadbackStats::OnSemaphoreWait(
+                            VideoCore::ReadbackStats::NowNs() - wait_start);
                     }
                     mem_semaphore->Decrement();
                 }
@@ -793,8 +1806,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                bool reported = false;
+                bool blocked = false;
                 while (!rewind->Valid()) {
+                    blocked = true;
+                    ReportLongSpin("gfx Rewind", rewind, wait_start, reported);
                     YIELD_GFX();
+                }
+                if (blocked) {
+                    VideoCore::ReadbackStats::OnSemaphoreWait(VideoCore::ReadbackStats::NowNs() -
+                                                              wait_start);
                 }
                 break;
             }
@@ -808,11 +1830,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    VideoCore::ReadbackStats::CpTimer timer{
+                        VideoCore::ReadbackStats::CpTime::FlipSleep};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    YIELD_GFX();
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    using VideoCore::ReadbackStats::WaitClass;
+                    const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                    bool reported = false;
+                    bool blocked = false;
+                    bool held_back = false;
+                    WaitClass wait_class{};
+                    while (true) {
+                        const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+                        if (match.satisfied && FenceShortcutEnabled(false)) {
+                            OnWaitPassedOnFence(*wait_reg_mem, match, GfxQueueId);
+                            wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                            break;
+                        }
+                        held_back |= match.satisfied;
+                        if (wait_reg_mem->Test(regs.reg_array)) {
+                            wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                            break;
+                        }
+                        blocked = true;
+                        ReportLongWait(*wait_reg_mem, "gfx", wait_start, reported);
+                        VideoCore::ReadbackStats::CpWaitYield(vo_port->IsVoLabel(wait_addr));
+                        YIELD_GFX();
+                    }
+                    if (VideoCore::ReadbackStats::IsEnabled()) {
+                        VideoCore::ReadbackStats::OnCommandWait(
+                            false, wait_reg_mem->Address<VAddr>(), wait_class,
+                            blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+                    }
                 }
                 break;
             }
@@ -861,6 +1912,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (cond_exec->command.Value() != 0) {
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
+                DrainRaster(); // The condition may be written by earlier work.
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
                     dcb = NextPacket(dcb,
@@ -944,6 +1996,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -971,23 +2024,30 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             ASSERT(dma_data->command.das == 0);
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
-                                       true);
+                RasterRun([this, dma = *dma_data] {
+                    rasterizer->FillBuffer(dma.dst_addr_lo, dma.NumBytes(), dma.data, true);
+                }, false, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        dma_data->dst_sel == DmaDataDst::Gds) {
-                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                       dma_data->NumBytes(), true, false);
+                RasterRun([this, dma = *dma_data] {
+                    rasterizer->CopyBuffer(dma.dst_addr_lo, dma.SrcAddress<VAddr>(),
+                                           dma.NumBytes(), true, false);
+                }, false, true);
             } else if (dma_data->src_sel == DmaDataSrc::Data &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                       dma_data->data, false);
+                RasterRun([this, dma = *dma_data] {
+                    rasterizer->FillBuffer(dma.DstAddress<VAddr>(), dma.NumBytes(), dma.data,
+                                           false);
+                }, false, true);
             } else if (dma_data->src_sel == DmaDataSrc::Gds &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
                         dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                       dma_data->NumBytes(), false, true);
+                RasterRun([this, dma = *dma_data] {
+                    rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.src_addr_lo,
+                                           dma.NumBytes(), false, true);
+                }, false, true);
             } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
                        (dma_data->dst_sel == DmaDataDst::Memory ||
@@ -1002,7 +2062,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
                     indirect_patches.emplace_back(header, src_addr);
                 } else {
-                    rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                    RasterRun([this, dst_addr, src_addr, num_bytes] {
+                        rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
+                    }, false, true);
                 }
             } else {
                 UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
@@ -1036,6 +2098,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset, set_size / sizeof(u32));
             }
             break;
         }
@@ -1050,7 +2113,12 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
+                RasterCall call{};
+                call.kind = RasterCall::Kind::DispatchIndirect;
+                call.no_marker = true;
+                call.args_addr = it->indirect_addr;
+                call.dispatch_size = size;
+                RasterDispatch(call);
                 break;
             }
             auto& cs_program = GetCsRegs();
@@ -1065,10 +2133,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
-            const auto cmd_address = reinterpret_cast<const void*>(header);
-            rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
-                                    fmt::make_format_args(vqid, cmd_address),
-                                    [&] { rasterizer->DispatchDirect(); });
+            RasterCall call{};
+            call.kind = RasterCall::Kind::DispatchDirect;
+            call.asc = true;
+            call.vqid = vqid;
+            call.marker = "asc[{}]:{}:DispatchDirect";
+            call.cmd_address = header;
+            RasterDispatch(call);
             break;
         }
         case PM4ItOpcode::DispatchIndirect: {
@@ -1084,24 +2155,25 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
-            const auto cmd_address = reinterpret_cast<const void*>(header);
-            rasterizer->ScopeMarker("asc[{}]:{}:DispatchIndirect",
-                                    fmt::make_format_args(vqid, cmd_address),
-                                    [&] { rasterizer->DispatchIndirect(ib_address, 0, size); });
+            RasterCall call{};
+            call.kind = RasterCall::Kind::DispatchIndirect;
+            call.asc = true;
+            call.vqid = vqid;
+            call.marker = "asc[{}]:{}:DispatchIndirect";
+            call.cmd_address = header;
+            call.args_addr = ib_address;
+            call.dispatch_size = size;
+            RasterDispatch(call);
             break;
         }
         case PM4ItOpcode::WriteData: {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            if (!write_data->wr_one_addr.Value()) {
-                if (rasterizer) {
-                    rasterizer->OnFence();
-                }
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
-            } else {
+            if (write_data->wr_one_addr.Value()) {
                 UNREACHABLE();
             }
+            CpWriteData(write_data->Address<void*>(), write_data->data, data_size, vqid + 1);
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
@@ -1109,8 +2181,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                bool reported = false;
+                bool blocked = false;
                 while (!mem_semaphore->Signaled()) {
+                    blocked = true;
+                    ReportLongSpin("compute MemSemaphore", mem_semaphore, wait_start, reported);
                     YIELD_ASC(vqid);
+                }
+                if (blocked) {
+                    VideoCore::ReadbackStats::OnSemaphoreWait(VideoCore::ReadbackStats::NowNs() -
+                                                              wait_start);
                 }
                 mem_semaphore->Decrement();
             }
@@ -1119,23 +2200,76 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                using VideoCore::ReadbackStats::WaitClass;
+                const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+                bool reported = false;
+                bool blocked = false;
+                bool held_back = false;
+                WaitClass wait_class{};
+                while (true) {
+                    const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+                    if (match.satisfied && FenceShortcutEnabled(true)) {
+                        OnWaitPassedOnFence(*wait_reg_mem, match, vqid + 1);
+                        wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                        break;
+                    }
+                    held_back |= match.satisfied;
+                    if (wait_reg_mem->Test(regs.reg_array)) {
+                        wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                        break;
+                    }
+                    blocked = true;
+                    ReportLongWait(*wait_reg_mem, "compute", wait_start, reported);
+                    VideoCore::ReadbackStats::CpWaitYield(false);
+                    YIELD_ASC(vqid);
+                }
+                if (VideoCore::ReadbackStats::IsEnabled()) {
+                    VideoCore::ReadbackStats::OnCommandWait(
+                        true, wait_reg_mem->Address<VAddr>(), wait_class,
+                        blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+                }
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            if (rasterizer) {
-                rasterizer->OnFence();
-            }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
+            // The packet is copied: the signal may run after the command buffer is reused.
+            auto signal = [this, release = *release_mem, pipe_id = queue.pipe_id] {
+                const auto irq = [pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+                };
+                const auto gds_to_mem = [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
+                };
+                RunFenceSignal(
+                    *this, gpu_id,
+                    [&] {
+                        bool backed = true;
+                        release.SignalFence(
+                            [&](void* address, u64 data, u32 num_bytes) {
+                                backed &=
+                                    TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                            },
+                            [] {}, [](VAddr, u16, u16) {});
+                        if (backed) {
+                            release.SignalFence(NoFenceWrite, irq, [](VAddr, u16, u16) {});
+                        }
+                        return backed;
+                    },
+                    [release, irq, gds_to_mem] {
+                        release.SignalFence(WriteFenceMemory, irq, gds_to_mem);
+                    });
+            };
+            // Copying from GDS records GPU work, which must happen on the raster thread.
+            const auto release_data_sel = release_mem->data_sel.Value();
+            const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32)
+                                      : release_data_sel == DataSelect::Data64  ? sizeof(u64)
+                                                                                : 0;
+            SignalFenceAfterReadbacks(std::move(signal),
+                                      release_data_sel == DataSelect::GdsMemStore,
+                                      release_mem->Address<VAddr>(), release_mem->DataQWord(),
+                                      release_bytes, vqid + 1, VideoCore::FenceComputeRelease);
             break;
         }
         case PM4ItOpcode::EventWrite: {

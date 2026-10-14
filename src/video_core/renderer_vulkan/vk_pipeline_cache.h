@@ -3,14 +3,21 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <variant>
+#include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
+#include <tsl/robin_set.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
+#include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/texture_cache/image_info.h"
+#include "video_core/texture_cache/image_view.h"
 #include "vulkan/vulkan.hpp"
 
 template <>
@@ -48,6 +55,7 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    size_t last_perm{~size_t{0}}; ///< Variant picked by the last lookup.
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -70,6 +78,38 @@ struct DrawIndirectParams {
     bool is_indirect;
 };
 
+/// Per-draw state of one shader stage, captured by the command processor thread when it looks the
+/// pipeline up (cp_split_mode). `info` is the raster thread's own copy of the stage's Info: the
+/// shared one is rewritten by the next lookup while this draw is still being recorded.
+/// cp_split_prepare_images: the pure part of one image resource of a stage, decoded on the command
+/// processor thread from the plan's own copy of the user data.
+struct PreparedImage {
+    AmdGpu::Image tsharp{};
+    u32 num_bindings{1};
+    boost::container::small_vector<VideoCore::ImageInfo, 1> infos;
+    boost::container::small_vector<VideoCore::ImageViewInfo, 1> views;
+};
+
+struct StagePlan {
+    Shader::Info* info{};
+    boost::container::small_vector<PreparedImage, 8> images;
+    bool images_prepared{};
+    std::array<u32, Shader::NUM_USER_DATA_REGS> user_data{};
+    u32 user_data_count{};
+    boost::container::small_vector<u32, 64> flat;
+    VAddr pgm_base{};
+};
+
+struct DrawPlan {
+    const GraphicsPipeline* pipeline{}; ///< Null if the pipeline lookup failed.
+    std::array<StagePlan, MaxShaderStages> stages{};
+};
+
+struct DispatchPlan {
+    const ComputePipeline* pipeline{}; ///< Null if the pipeline lookup failed.
+    StagePlan stage{};
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
@@ -87,6 +127,26 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// cp_split_mode: looks the pipeline up for the command processor's registers `regs` and
+    /// captures the per-draw state of its stages. Runs on the command processor thread, the only
+    /// thread that touches this cache then.
+    void PlanGraphics(const AmdGpu::Regs& regs, DrawIndirectParams params, DrawPlan& plan);
+    void PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan);
+    /// Raster thread: writes the captured state into the stage Infos the pipeline uses.
+    static void ApplyPlan(const DrawPlan& plan);
+    static void ApplyPlan(const DispatchPlan& plan);
+
+    /// Plan statistics since the last call: stage inputs compared with the previous draw.
+    struct PlanStats {
+        u64 draws{};
+        u64 draws_all_stages_same{};
+        u64 stages{};
+        u64 stages_same{};
+    };
+    PlanStats TakePlanStats() noexcept {
+        return std::exchange(plan_stats, PlanStats{});
+    }
+
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
@@ -102,6 +162,8 @@ public:
     }
 
 private:
+    Shader::Info* RasterInfoFor(const Shader::Info* shared);
+    static void CapturePlan(StagePlan& out, Shader::Info* clone, const Shader::Info& shared);
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -129,6 +191,15 @@ private:
     Shader::Profile profile{};
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};
+    /// Registers the current lookup reads: the raster mirror normally, the command processor's
+    /// own registers (and the compute state of the dispatching queue) when planning.
+    const AmdGpu::Regs* lookup_regs{};
+    const AmdGpu::ComputeProgram* lookup_cs{};
+    PlanStats plan_stats{};
+    std::array<u64, MaxShaderStages> last_stage_hash{};
+    bool lookup_regs_pinned{}; ///< The lookup reads lookup_regs/lookup_cs as set by the caller.
+    /// cp_split_mode: the raster thread's copy of each program's Info.
+    tsl::robin_map<const Shader::Info*, std::unique_ptr<Shader::Info>> raster_infos;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
@@ -138,7 +209,9 @@ private:
     Shader::Gcn::FetchShaderData* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
-    u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    u32 num_new_pipelines{};      // new pipelines added to the cache since the game start
+    const u32 stage_lookup_reuse; // 0 = off, 1 = check the last variant first, 2 = verify
+    tsl::robin_set<u64> logged_stage_mismatches;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

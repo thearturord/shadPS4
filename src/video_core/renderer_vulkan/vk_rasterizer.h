@@ -3,10 +3,15 @@
 
 #pragma once
 
+#include <mutex>
+#include <vector>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -46,12 +51,47 @@ public:
         return texture_cache;
     }
 
-    void Draw(bool is_indexed, u32 index_offset = 0);
+    /// With the command processor split (cp_split_mode) the pipeline lookup is done by the command
+    /// processor thread (PlanDraw / PlanDispatch) and the raster thread gets its result.
+    void Draw(bool is_indexed, u32 index_offset = 0, const DrawPlan* plan = nullptr);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
+                      const DrawPlan* plan = nullptr);
 
-    void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+    void DispatchDirect(const DispatchPlan* plan = nullptr);
+    void DispatchIndirect(VAddr address, u32 offset, u32 size,
+                          const DispatchPlan* plan = nullptr);
+
+    /// Command processor thread: looks the pipeline up for `regs`. Returns null for draws that
+    /// FilterDraw handles without a pipeline (the raster thread repeats that decision).
+    [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::Regs& regs,
+                                                     DrawIndirectParams params);
+    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
+
+    /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on
+    /// one thread and freeing it on another made them fight over the heap lock.
+    void RecyclePlan(std::unique_ptr<DrawPlan>&& plan);
+    void RecyclePlan(std::unique_ptr<DispatchPlan>&& plan);
+
+    /// cp_flush_commands: after a draw or dispatch, hands the commands recorded so far to the
+    /// encoder thread once there are enough of them.
+    void MaybeFlushRecorded();
+
+    /// A guest memory write done by the command processor itself.
+    void NoteCpGuestWrite(VAddr addr, u64 size) {
+        buffer_cache.NoteCpGuestWrite(addr, size);
+    }
+
+    /// Orders all later GPU work after everything recorded so far, for a command stream wait
+    /// that passed because its producer (a fence recorded at `producer_tick`) was already
+    /// recorded, not because it finished. Returns whether a barrier was recorded.
+    bool CommandStreamBarrier(u64 producer_tick);
+
+    [[nodiscard]] u64 CurrentTick() const noexcept;
+
+    PipelineCache::PlanStats TakePlanStats() noexcept {
+        return pipeline_cache.TakePlanStats();
+    }
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
@@ -82,7 +122,14 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
-    void OnFence();
+
+    void ProcessDownloadImages();
+
+    /// Handles readbacks at an end-of-pipe fence and runs `signal` once their data is in guest
+    /// memory. With async fences the GPU thread doesn't wait and `signal` runs on another thread;
+    /// `must_sync` forces the blocking path (for fences whose signal needs the GPU thread).
+    void OnFence(Common::UniqueFunction<void>&& signal, VideoCore::FenceKind kind,
+                 bool must_sync = false);
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
@@ -117,6 +164,28 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    const GraphicsPipeline* ResolveDrawPipeline(const DrawPlan* plan,
+                                                DrawIndirectParams params = {});
+    const ComputePipeline* ResolveDispatchPipeline(const DispatchPlan* plan);
+
+    enum class DrawClass : u8 {
+        Normal,
+        EliminateFastClear,
+        FmaskDecompress,
+        Resolve,
+        PrimitiveNone,
+        DepthStencilCopy,
+        SkipShadow, ///< Live switch skip_shadows: a depth-only draw into a shadow map sized target.
+    };
+    struct DrawClassification {
+        DrawClass kind{};
+        bool depth_copy{};
+        bool stencil_copy{};
+    };
+    /// What FilterDraw does with a draw, decided from the registers only.
+    static DrawClassification ClassifyDraw(const AmdGpu::Regs& regs);
+
+    void ProcessReadbacksSync();
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -148,6 +217,32 @@ private:
     PipelineCache pipeline_cache;
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
+    const bool readback_batching;
+    const bool async_fences;
+    u64 recorded_work{};
+    u64 last_barrier_work{~0ULL};
+
+    /// rt_lookup_reuse_enabled: the register inputs of the last target lookup of each color slot
+    /// (and the depth target, last entry) and the texture cache generation it was made at.
+    struct CachedTarget {
+        bool valid{};
+        u64 generation{};
+        u32 size{};
+        std::array<u8, 256> inputs{};
+    };
+    std::array<CachedTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_cache{};
+    const bool rt_reuse_enabled;
+    const u32 encoder_debug;
+    /// Encoder thread: fences without readbacks wait for all work recorded before them.
+    const bool full_eop_fences;
+    /// Hand recorded commands to the encoder thread every this many commands (0 = off).
+    const u32 flush_commands;
+    std::mutex plan_pool_mutex;
+    std::vector<std::unique_ptr<DrawPlan>> draw_plan_pool;
+    std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;
+    /// True if the inputs match the cached lookup; otherwise stores them for the next draw.
+    template <typename... Ts>
+    bool TargetInputsMatch(CachedTarget& cache, const Ts&... parts);
 
     struct ImageBinding {
         VideoCore::ImageId image_id;

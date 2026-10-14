@@ -82,6 +82,26 @@ struct IrqController {
         }
     }
 
+    /// Signal split in two: the persistent handlers (event queues of the game) and the one-time
+    /// subscriber (a flip). Signal() is both, in that order.
+    void SignalPersistent(InterruptId irq) {
+        auto& ctx = irq_contexts.try_emplace(irq).first->second;
+        std::unique_lock lock{ctx.m_lock};
+        for (auto& [uid, h] : ctx.persistent_handlers) {
+            h(irq);
+        }
+    }
+
+    void SignalOneTime(InterruptId irq) {
+        auto& ctx = irq_contexts.try_emplace(irq).first->second;
+        std::unique_lock lock{ctx.m_lock};
+        if (!ctx.one_time_subscribers.empty()) {
+            const auto& h = ctx.one_time_subscribers.front();
+            h(irq);
+            ctx.one_time_subscribers.pop();
+        }
+    }
+
 private:
     struct IrqContext {
         std::unordered_map<void*, IrqHandler> persistent_handlers{};

@@ -823,6 +823,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
+        program->last_perm = 0;
         return std::make_tuple(&program->info, module, perm_hash);
     }
 
@@ -916,6 +917,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
+    program->last_perm = perm_idx;
     return std::make_tuple(&program->info, module, perm_hash);
 }
 

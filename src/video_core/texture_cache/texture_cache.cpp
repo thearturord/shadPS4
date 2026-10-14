@@ -11,7 +11,9 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/page_manager.h"
+#include "video_core/readback_policy.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -78,16 +80,17 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
-    Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
-    }
+u32 TextureCache::ImageDownloadSize(const Image& image) {
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
+    return download_size;
+}
+
+Vulkan::StagingBufferRef TextureCache::RecordImageCopy(Image& image, u32 download_size,
+                                                       bool deferred) {
     const auto download =
-        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, !sync);
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, deferred);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
@@ -104,6 +107,16 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+    return download;
+}
+
+void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return;
+    }
+    const u32 download_size = ImageDownloadSize(image);
+    const auto download = RecordImageCopy(image, download_size, !sync);
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
@@ -118,6 +131,57 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
                 runtime.GetStagingPool().FreeDeferred(download);
             });
     }
+}
+
+void TextureCache::RecordImageCopyAsync(Image& image, u32 download_size) {
+    const auto download = RecordImageCopy(image, download_size, true);
+    async_recorded.store(1, std::memory_order_release);
+    // The priority thread runs its operations in the order they were deferred, so the fence of
+    // this frame is signaled only once the pixels are in guest memory.
+    scheduler.DeferPriorityOperation(
+        [this, addr = image.info.guest_address, download, download_size] {
+            download.Invalidate();
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(addr), download.mapped,
+                                                      download_size);
+            runtime.GetStagingPool().FreeDeferred(download);
+        },
+        scheduler.CurrentTick());
+}
+
+void TextureCache::RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind) {
+    const auto& policy = ReadbackPolicy::Get();
+    if (!(policy.image_download_kinds_mask.load(std::memory_order_relaxed) & fence_kind)) {
+        return; // the images stay listed for a fence of an allowed kind
+    }
+    const bool async = policy.images_async.load(std::memory_order_relaxed);
+    std::unique_lock lk{download_images_mutex};
+    for (const ImageId image_id : download_images) {
+        Image& image = slot_images[image_id];
+        if (False(image.flags & ImageFlagBits::GpuModified)) {
+            continue;
+        }
+        const u32 download_size = ImageDownloadSize(image);
+        if (async) {
+            RecordImageCopyAsync(image, download_size);
+            continue;
+        }
+        batch.Reserve(download_size);
+        const auto download = RecordImageCopy(image, download_size, true);
+        batch.Add(download_size, true,
+                  [this, device_addr = image.info.guest_address, download, download_size] {
+                      download.Invalidate();
+                      Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                                download.mapped, download_size);
+                      runtime.GetStagingPool().FreeDeferred(download);
+                  });
+    }
+    download_images.clear();
+}
+
+void TextureCache::TouchFoundImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    image.tick_accessed_last = gc_tick;
+    TouchImage(image);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -270,8 +334,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     static constexpr u64 NUM_FRAMES_BEFORE_REMOVAL = 32;
 
     auto& cache_image = slot_images[cache_image_id];
-    const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
+    // Age is counted in guest submissions (gc_tick advances once per submit), not scheduler ticks:
+    // those advance at every flush, and with async readback fences that is many times per frame.
+    const bool safe_to_delete = gc_tick - cache_image.tick_accessed_last > NUM_FRAMES_BEFORE_REMOVAL;
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -446,10 +511,15 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   static_cast<s64>(image_info.guest_size) - static_cast<s64>(expected_size),
                   (static_cast<double>(image_info.guest_size) / expected_size - 1.0) * 100.0,
 
-                  merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
-                  scheduler.CurrentTick() - cache_image.tick_accessed_last);
+                  merged_image_id.index, static_cast<int>(binding), gc_tick,
+                  gc_tick - cache_image.tick_accessed_last);
 
-        UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
+        // Seen in The Last Guardian: a 3D texture at the same address grows in depth. Replace
+        // the old image when it hasn't been used recently instead of aborting.
+        ASSERT_MSG(safe_to_delete,
+                   "Encountered unresolvable image overlap with equal memory address.");
+        FreeImage(cache_image_id);
+        return {merged_image_id, -1, -1};
     }
 
     // Right overlap, the image requested is a possible subresource of the image from cache.
@@ -584,7 +654,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
-    image.tick_accessed_last = scheduler.CurrentTick();
+    image.tick_accessed_last = gc_tick;
     TouchImage(image);
 
     // If the image requested is a subresource of the image from cache record its location.
@@ -858,6 +928,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image_generation.fetch_add(1, std::memory_order_release);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
@@ -876,6 +947,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    image_generation.fetch_add(1, std::memory_order_release);
     image_lru_cache.Free(image);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

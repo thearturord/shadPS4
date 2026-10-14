@@ -5,6 +5,7 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/types.h"
@@ -82,6 +83,8 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
 
+    /// Held allocations are released from the priority thread (FreeDeferred).
+    std::mutex mutex;
     std::array<Ring, NUM_TYPES> rings;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;

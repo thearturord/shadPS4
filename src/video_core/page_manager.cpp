@@ -426,8 +426,19 @@ struct SignalImpl : public PageManager::Impl {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
+        if (perms == Core::MemoryPermission::Write) {
+            // A page the GPU wrote (read watched) that the CPU modified too (not write watched): the
+            // trackers disagree. Used to be an assertion that ended the game. Protecting the pages
+            // completely is safe, any access then goes through the fault handler, which fixes the state.
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1) < 20) {
+                LOG_WARNING(Render,
+                            "Page tracking asked for write-only protection of {:#x} + {:#x}; "
+                            "protecting it completely instead",
+                            address, size);
+            }
+            perms = Core::MemoryPermission::None;
+        }
         impl.Protect(address, size, perms);
     }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -15,6 +16,7 @@
 
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -35,6 +37,7 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+class ReadbackBatch;
 
 class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
@@ -121,6 +124,23 @@ public:
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+
+    /// Records downloads of all pending images into a batch instead of waiting per image.
+    void RecordImageDownloads(ReadbackBatch& batch, u32 fence_kind = ~0u);
+
+    /// True once if RecordImageDownloads recorded copies for the priority thread since the last
+    /// call (their command buffer has to be submitted).
+    [[nodiscard]] bool TakeAsyncRecorded() {
+        return async_recorded.exchange(0, std::memory_order_acq_rel) != 0;
+    }
+
+    /// Changes whenever the set of registered images changes.
+    [[nodiscard]] u64 ImageGeneration() const noexcept {
+        return image_generation.load(std::memory_order_acquire);
+    }
+
+    /// Does what FindImage does for an image found again: marks it as recently used.
+    void TouchFoundImage(ImageId image_id);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -345,6 +365,17 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
+    /// Size in bytes of the data downloaded for an image.
+    static u32 ImageDownloadSize(const Image& image);
+
+    /// Records a copy of the image into staging memory. With deferred the memory is held until
+    /// the caller frees it (StagingBufferPool::FreeDeferred).
+    Vulkan::StagingBufferRef RecordImageCopy(Image& image, u32 download_size, bool deferred);
+
+    /// readback_linear_images_async: records the copy of the image into a held staging buffer; the
+    /// priority thread puts the pixels into guest memory once the GPU executed the copy.
+    void RecordImageCopyAsync(Image& image, u32 download_size);
+
     /// Register image in the page table
     void RegisterImage(ImageId image);
 
@@ -413,6 +444,10 @@ private:
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
     std::mutex download_images_mutex;
+    std::atomic<u32> async_recorded{};
+    /// Bumped whenever an image is registered or unregistered: a lookup result stays valid while
+    /// it is unchanged (rt_lookup_reuse_enabled).
+    std::atomic<u64> image_generation{};
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
 

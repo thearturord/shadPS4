@@ -1225,8 +1225,11 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/cache_storage.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
+               src/video_core/buffer_cache/readback_batch.h
                src/video_core/readback_policy.cpp
                src/video_core/readback_policy.h
+               src/video_core/readback_stats.h
+               src/video_core/readback_trace.h
                src/video_core/thread_usage.cpp
                src/video_core/thread_usage.h
                src/video_core/renderdoc.cpp

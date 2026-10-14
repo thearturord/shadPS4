@@ -46,6 +46,9 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
+    /// Waits for the given tick for at most timeout_ns. Returns true if the tick was reached.
+    bool WaitFor(u64 tick, u64 timeout_ns);
+
 protected:
     const Instance& instance;
     vk::UniqueSemaphore semaphore;    ///< Timeline semaphore.

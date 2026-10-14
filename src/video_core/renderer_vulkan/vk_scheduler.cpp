@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
 #include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/thread_usage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -80,7 +85,9 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    const auto recorder = CommandBuffer();
+    recorder.beginRendering(rendering_info);
+    recorder.record([this](vk::CommandBuffer) { replay_rendering = true; });
 }
 
 void Scheduler::EndRendering() {
@@ -88,7 +95,10 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    CommandBuffer().record([this](vk::CommandBuffer cmdbuf) {
+        cmdbuf.endRendering();
+        replay_rendering = false;
+    });
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -120,6 +130,9 @@ void Scheduler::Finish() {
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
+    // Deferred write backs (async readbacks) for work that is now complete must land in guest
+    // memory before anything that relies on Finish() reads it.
+    WaitPriorityOperations();
 }
 
 void Scheduler::Wait(u64 tick) {
@@ -129,6 +142,27 @@ void Scheduler::Wait(u64 tick) {
         Flush(info);
     }
     work_semaphore.Wait(tick);
+}
+
+void Scheduler::WaitPriorityOperations() {
+    if (num_priority_ops.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    // Normally this is a short wait for write backs of already completed GPU work. Poll so a
+    // wait that never ends gets reported (hang diagnostics).
+    const auto start = std::chrono::steady_clock::now();
+    bool reported = false;
+    u32 pending;
+    while ((pending = num_priority_ops.load(std::memory_order_acquire)) != 0) {
+        if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds{2}) {
+            reported = true;
+            LOG_WARNING(Render_Vulkan,
+                        "Hang check: waiting for {} priority operations to finish (GPU reached "
+                        "tick {}, CPU recording {})",
+                        pending, work_semaphore.KnownGpuTick(), work_semaphore.CurrentTick());
+        }
+        std::this_thread::yield();
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -144,11 +178,19 @@ void Scheduler::BeginSession() {
     EndSession();
 
     auto& session = sessions.emplace_back();
+    if (use_encoder && !direct_active) {
+        // Ticks are recorded into lists and replayed by the encoder thread: no command buffer here.
+        dynamic_state.Invalidate();
+        return;
+    }
 
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
-    session.primary = command_pool.Commit();
+    {
+        std::scoped_lock lk{command_pool_mutex};
+        session.primary = command_pool.Commit();
+    }
     Check(session.primary.begin(begin_info));
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
@@ -179,10 +221,161 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
-    Check(session.primary.end());
+    if (session.primary) {
+        Check(session.primary.end());
+    }
+}
+
+void Scheduler::SetEncoderMode(u32 mode) {
+    if (mode == 0) {
+        SyncedCommandBuffer();
+    }
+    record_commands = mode >= 1;
+    if (mode >= 2 && !use_encoder) {
+        use_encoder = true;
+        // The command buffer of the session open at construction is still open: it becomes the
+        // first direct tick, submitted by the ordering thread. Later ticks go to the encoder.
+        direct_active = true;
+        encoder_sync = mode == 3;
+        encoder_thread = std::jthread(std::bind_front(&Scheduler::EncoderThread, this));
+        LOG_INFO(Render_Vulkan, "Command processor: Vulkan encoding on an encoder thread{}",
+                 encoder_sync ? " (synchronous hand-off, diagnostic)" : "");
+    }
+}
+
+vk::CommandBuffer Scheduler::SyncedCommandBuffer() {
+    if (use_encoder && !direct_active) {
+        // Everything handed over must be submitted before commands recorded here, which are
+        // submitted by this thread at the end of the tick.
+        WaitEncoderIdle();
+        direct_active = true;
+        const vk::CommandBufferBeginInfo begin_info = {
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        };
+        auto& session = sessions.back();
+        {
+            std::scoped_lock lk{command_pool_mutex};
+            session.primary = command_pool.Commit();
+        }
+        Check(session.primary.begin(begin_info));
+        dynamic_state.Invalidate();
+    }
+    const vk::CommandBuffer cmdbuf = sessions.back().primary;
+    if (record_commands && !current_list->Empty()) {
+        current_list->Replay(cmdbuf);
+    }
+    return cmdbuf;
+}
+
+void Scheduler::WaitEncoderIdle() {
+    std::unique_lock lk{encoder_mutex};
+    encoder_cv.wait(lk, [this] { return jobs_done == jobs_handed; });
+}
+
+void Scheduler::HandOffToEncoder(SubmitInfo& info, u64 signal_value) {
+    info.AddSignal(work_semaphore.Handle(), signal_value);
+    EncoderJob job{
+        .info = info,
+        .signal_value = signal_value,
+    };
+    {
+        std::unique_lock lk{encoder_mutex};
+        // Back-pressure: the ordering thread may run at most a few ticks ahead of the encoder.
+        static const size_t max_queued =
+            std::max<size_t>(1, EmulatorSettings.GetCpEncoderQueueDepth());
+        encoder_cv.wait(lk, [this] { return encoder_jobs.size() < max_queued; });
+        job.list = std::move(current_list_owner);
+        if (free_lists.empty()) {
+            current_list_owner = std::make_unique<CommandList>();
+        } else {
+            current_list_owner = std::move(free_lists.back());
+            free_lists.pop_back();
+        }
+        current_list = current_list_owner.get();
+        encoder_jobs.push_back(std::move(job));
+        ++jobs_handed;
+    }
+    encoder_cv.notify_all();
+    if (encoder_sync) {
+        // Diagnostic mode 3: the ordering thread never runs ahead of the submission.
+        WaitEncoderIdle();
+    }
+}
+
+void Scheduler::EncoderThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:GpuEncoder");
+    if (const s32 core = EmulatorSettings.GetCpEncoderCore(); core >= 0) {
+        VideoCore::PinThreadAndIsolateCore(static_cast<u32>(core));
+    }
+    if (const u32 priority = EmulatorSettings.GetCpThreadPriority(); priority >= 2) {
+        Common::SetCurrentThreadPriority(static_cast<Common::ThreadPriority>(priority));
+    }
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    while (true) {
+        EncoderJob job;
+        {
+            std::unique_lock lk{encoder_mutex};
+            encoder_cv.wait(lk, stoken, [this] { return !encoder_jobs.empty(); });
+            if (encoder_jobs.empty()) {
+                return; // Stop requested and nothing left to submit.
+            }
+            job = std::move(encoder_jobs.front());
+            encoder_jobs.pop_front();
+        }
+        encoder_cv.notify_all();
+
+        vk::CommandBuffer cmdbuf;
+        {
+            std::scoped_lock lk{command_pool_mutex};
+            cmdbuf = command_pool.Commit();
+        }
+        Check(cmdbuf.begin(begin_info));
+        job.list->Replay(cmdbuf);
+        Check(cmdbuf.end());
+        {
+            // ImGui texture uploads submit to the queue too: done here, the ordering thread
+            // never waits for the submit lock while this thread is in the driver.
+            std::scoped_lock lk{submit_mutex};
+            SubmitCommandBuffers(std::span{&cmdbuf, 1}, job.info);
+        }
+        {
+            std::unique_lock lk{encoder_mutex};
+            free_lists.push_back(std::move(job.list));
+            ++jobs_done;
+        }
+        encoder_cv.notify_all();
+    }
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    // Recorded commands go into the command buffer before anything written directly at the end.
+    EndRendering();
+
+    if (use_encoder && !direct_active) {
+        const u64 signal_value = work_semaphore.NextTick();
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (on_submit) {
+                on_submit(info);
+            }
+        }
+        if (on_session) {
+            on_session();
+        }
+        HandOffToEncoder(info, signal_value);
+        // The next tick is replayed into a new command buffer: set all dynamic state again.
+        dynamic_state.Invalidate();
+        work_semaphore.Refresh();
+        PopPendingOperations();
+        return;
+    }
+
+    if (record_commands && !current_list->Empty()) {
+        current_list->Replay(sessions.back().primary);
+    }
+
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -214,6 +407,21 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
+    SubmitCommandBuffers(cmd_buffers, info);
+
+    work_semaphore.Refresh();
+    if (use_encoder) {
+        // A direct tick (after SyncedCommandBuffer) is done: the next ones go to the encoder.
+        direct_active = false;
+    }
+    BeginSession();
+
+    // Apply pending operations
+    PopPendingOperations();
+}
+
+void Scheduler::SubmitCommandBuffers(std::span<const vk::CommandBuffer> cmd_buffers,
+                                     SubmitInfo& info) {
     std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
         wait_stage_masks;
     wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
@@ -239,16 +447,19 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+}
 
-    work_semaphore.Refresh();
-    BeginSession();
+namespace {
+thread_local bool is_priority_thread = false;
+} // Anonymous namespace
 
-    // Apply pending operations
-    PopPendingOperations();
+bool Scheduler::OnPriorityThread() noexcept {
+    return is_priority_thread;
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuSchedPriorityPendingOpsRunner");
+    is_priority_thread = true;
 
     while (!stoken.stop_requested()) {
         PendingOp op;
@@ -264,16 +475,32 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        work_semaphore.Wait(op.gpu_tick);
+        // Wait in slices so a wait that never completes gets reported (hang diagnostics).
+        constexpr u64 ReportAfterNs = 2'000'000'000ULL;
+        bool reported = false;
+        while (!work_semaphore.WaitFor(op.gpu_tick, ReportAfterNs) && !stoken.stop_requested()) {
+            if (!reported) {
+                reported = true;
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Hang check: priority operation still waiting for GPU tick {} (GPU "
+                    "reached {}, CPU recording {}){}",
+                    op.gpu_tick, work_semaphore.KnownGpuTick(), work_semaphore.CurrentTick(),
+                    op.gpu_tick >= work_semaphore.CurrentTick() ? " - tick was never submitted"
+                                                                : "");
+            }
+        }
         if (stoken.stop_requested()) {
             break;
         }
 
         op.callback();
+        num_priority_ops.fetch_sub(1, std::memory_order_acq_rel);
+        num_priority_ops.notify_all();
     }
 }
 
-void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
+void DynamicState::Commit(const Instance& instance, const CommandRecorder& cmdbuf) {
     if (dirty_state.viewports) {
         dirty_state.viewports = false;
         cmdbuf.setViewportWithCount(viewports);

@@ -537,6 +537,15 @@ void Liverpool::ExecuteNativeDraw() {
         program = saved_program;
         return;
     }
+    if (draw.has_extents) {
+        // the extent hints the game's target bind sends in a trailing NOP packet
+        for (u32 slot = 0; slot < NUM_COLOR_BUFFERS && slot < draw.cb_extent.size(); ++slot) {
+            if ((draw.cb_extent_mask >> slot) & 1) {
+                last_cb_extent[slot].raw = draw.cb_extent[slot];
+            }
+        }
+        last_db_extent.raw = draw.db_extent;
+    }
     // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
     // for draws that take the packet path, assume the register file holds what they wrote.
     std::array<u32, Core::NativeDraw::ExecDraw::MaxRegisters> saved;

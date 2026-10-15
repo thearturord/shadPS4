@@ -494,6 +494,9 @@ struct NativeRecord {
     u32 a1{};
     u32 a2{};
     u64 caller{}; ///< Ghidra address of the draw call's return address
+    std::array<u32, 8> cb_extent{};
+    u32 cb_extent_mask{};
+    u32 db_extent{};
     u64 args_addr{};      ///< indirect draws: the argument buffer
     u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
     u32 instance_sgpr{};
@@ -750,6 +753,9 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
 }
 
 thread_local u32 synth_flags;
+thread_local std::array<u32, 8> synth_cb_extent;
+thread_local u32 synth_cb_extent_mask;
+thread_local u32 synth_db_extent;
 thread_local u64 synth_fetch_address;
 thread_local u64 synth_vs_gnm;
 thread_local u32 synth_rt_info; ///< count | view mask << 8 | empty block mask << 16
@@ -1065,6 +1071,8 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
                     for (u32 k = 0; k < 14; ++k) {
                         context_reg(base + k, Rd<u32>(block, k * 4));
                     }
+                    synth_cb_extent[slot] = Rd<u32>(block, 15 * 4);
+                    synth_cb_extent_mask |= 1u << slot;
                     return;
                 }
             }
@@ -1079,6 +1087,7 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
     // depth target: DB_Z_INFO.. DB_DEPTH_SLICE and friends from the block at view + 0x58; clear values from the resource
     {
         const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
+        synth_db_extent = dsv ? Rd<u32>(dsv + 0x58, 12 * 4) : 0;
         bool valid = false;
         if (dsv) {
             const u64 block = dsv + 0x58;
@@ -1280,7 +1289,11 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.unsupported_inputs = 0;
     slot.unsupported_mask = 0;
     synth_flags = 0;
+    synth_cb_extent_mask = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    slot.cb_extent = synth_cb_extent;
+    slot.cb_extent_mask = synth_cb_extent_mask;
+    slot.db_extent = synth_db_extent;
     slot.flags = synth_flags;
     slot.rt_info = synth_rt_info;
     slot.kind = kind;
@@ -1874,6 +1887,10 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.args_addr = slot.args_addr;
     out.offset = slot.a2;
     out.vertex_sgpr = slot.vertex_sgpr;
+    out.cb_extent = slot.cb_extent;
+    out.cb_extent_mask = slot.cb_extent_mask;
+    out.db_extent = slot.db_extent;
+    out.has_extents = slot.kind != 3;
     out.instance_sgpr = slot.instance_sgpr;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
@@ -1891,6 +1908,7 @@ constexpr u32 AuditEvery = 64;
 struct ExecContextState {
     u64 ctx{};
     u64 target_signature{}; ///< render targets as the game's own path last bound them
+    u64 target_pointers{};  ///< view pointers whose bind side effects were applied
     u32 draws{};
 };
 
@@ -1949,26 +1967,41 @@ std::atomic<u64> exec_drawn{};
 std::atomic<u64> compute_drawn{};
 std::atomic<u64> exec_fallback{};
 
+/// Why draws stayed on the game's packet path (per 5 s window, logged with the tag counters).
+enum Fallback : u32 { FbFlags, FbPostDraw, FbRing, FbTargets, FbTrustNew, FbTrustBad, FbAudit, FbCount };
+std::array<std::atomic<u64>, FbCount> fallback_counts;
+constexpr const char* FallbackNames[FbCount] = {"record flags", "post-draw flag", "record ring", "targets changed",
+                                                "call site not yet verified", "call site differs", "audit"};
+
 bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
-    if (Slot(seq).flags != 0 || (Rd<u8>(ctx, 0x13009) & 1) != 0 || (Rd<u8>(ctx, 0x48de) & 1) != 0) {
+    const auto no = [](Fallback why) {
+        fallback_counts[why].fetch_add(1, std::memory_order_relaxed);
         return false;
+    };
+    if (Slot(seq).flags != 0) {
+        return no(FbFlags);
+    }
+    if ((Rd<u8>(ctx, 0x13009) & 1) != 0 || (Rd<u8>(ctx, 0x48de) & 1) != 0) {
+        return no(FbPostDraw);
     }
     if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
-        return false;
-    }
-    auto& state = ExecState(ctx);
-    if (state.target_signature == 0 || state.target_signature != TargetSignature(ctx)) {
-        return false;
+        return no(FbRing);
     }
     CallerTrust* trust = TrustFor(caller);
     if (trust == nullptr) {
-        return false;
+        return no(FbTrustNew);
     }
     const u32 total = trust->total.load(std::memory_order_relaxed);
-    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
-        return false;
+    if (total < 16) {
+        return no(FbTrustNew);
     }
-    return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
+    if (trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
+        return no(FbTrustBad);
+    }
+    if ((trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery == 0) {
+        return no(FbAudit);
+    }
+    return true;
 }
 
 /// The resource tracking at the start of PrepareDraw: for every shader resource view the vertex and pixel shader
@@ -2005,6 +2038,67 @@ void RunResourceTracking(u64 ctx) {
     }
     if (const u64 ps = Rd<u64>(ctx, Ctx::PixelShader); valid(ps) && Rd<u8>(ps, 0x106) == 0) {
         run_stage(Rd<u64>(ps, 0xf0), Rd<u64>(ps, 0xf8), Ctx::ShaderResourceTable(1), 1);
+    }
+}
+
+/// Cheap identity of the bound render and depth views (the flags and stamps of a target bind depend on these only).
+u64 TargetPointers(u64 ctx) {
+    Hasher h;
+    const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+    h.Add(count);
+    for (u32 slot = 0; slot < 7 && slot < count; ++slot) {
+        h.Add(Rd<u64>(ctx, Ctx::RenderTargets + slot * 8));
+    }
+    h.Add(Rd<u64>(ctx, 0x130e0));
+    h.Add(Rd<u64>(ctx, Ctx::DepthStencilView));
+    return h.h | 1;
+}
+
+/// The refresh PrepareDraw runs when the targets are marked dirty: every bound render target view updates its register
+/// block through its virtual function (+0x18), the depth view through FUN_024755f0.
+void RefreshTargets(u64 ctx) {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (Rd<u8>(ctx, 0x44c8) != 0) {
+        const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+        for (u32 slot = 0; slot < count && slot < 7; ++slot) {
+            const u64 view = Rd<u64>(ctx, Ctx::RenderTargets + slot * 8);
+            if (valid(view) && valid(Rd<u64>(view, 0))) {
+                if (const u64 function = Rd<u64>(Rd<u64>(view, 0), 0x18); function != 0) {
+                    reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(function)(view);
+                }
+            }
+        }
+    }
+    if (Rd<u8>(ctx, 0x44d8) != 0) {
+        if (const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView); valid(dsv)) {
+            reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(base + 0x24755f0 - 0x1000000)(dsv);
+        }
+    }
+}
+
+/// What the game's target bind leaves in the resources and views: usage flags and the last-use stamp.
+void ApplyTargetSideEffects(u64 ctx) {
+    const u32 stamp = Rd<u32>(ctx, 0x47ac);
+    const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+    for (u32 slot = 0; slot < count && slot < 7; ++slot) {
+        const u64 view = Rd<u64>(ctx, Ctx::RenderTargets + slot * 8);
+        if (view == 0) {
+            continue;
+        }
+        if (const u64 resource = Rd<u64>(view, 0x30); resource != 0) {
+            if (Rd<u32>(resource, 0x14c) == 1) {
+                Wr<u32>(resource, 0x14c, 2);
+            }
+            Wr<u32>(resource, 0x134, Rd<u32>(resource, 0x134) | (0x40u << slot));
+        }
+        Wr<u32>(view, 0x2c, stamp);
+    }
+    if (const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView); dsv != 0) {
+        if (const u64 resource = Rd<u64>(dsv, 0x30); resource != 0) {
+            Wr<u8>(resource, 0x135, Rd<u8>(resource, 0x135) | 0x40);
+        }
+        Wr<u32>(dsv, 0x2c, stamp);
     }
 }
 
@@ -2061,6 +2155,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
     }
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.
+    if (policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
+        RefreshTargets(ctx);
+    }
     if (track && policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
         const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
         if (vertex_shader != 0 && Rd<u64>(vertex_shader, 0x420) == 0 && Rd<u64>(ctx, 0x4680) == 0 &&
@@ -2118,6 +2215,10 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
         if (exec) {
+            if (auto& state = ExecState(ctx); state.target_pointers != TargetPointers(ctx)) {
+                state.target_pointers = TargetPointers(ctx);
+                ApplyTargetSideEffects(ctx);
+            }
             ExecSideEffects(ctx, kind, a1, a2, a3);
             exec_drawn.fetch_add(1, std::memory_order_relaxed);
             return 1;
@@ -2131,6 +2232,11 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
         LOG_INFO(Core, "native draw tags: {} written, {} failed, {} skipped (class not enabled), {} drawn from records",
                  tags_written.exchange(0), tags_failed.exchange(0), tags_skipped_class.exchange(0),
                  exec_drawn.exchange(0) + compute_drawn.exchange(0));
+        std::string why;
+        for (u32 k = 0; k < FbCount; ++k) {
+            why += fmt::format(" {}: {};", FallbackNames[k], fallback_counts[k].exchange(0));
+        }
+        LOG_INFO(Core, "native draws on the packet path:{}", why);
     }
     return 0;
 }

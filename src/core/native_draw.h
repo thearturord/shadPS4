@@ -50,6 +50,10 @@ struct ExecDraw {
     u32 offset{};
     u32 vertex_sgpr{};
     u32 instance_sgpr{};
+    std::array<u32, 8> cb_extent{}; ///< render target extent hints (the game's trailing NOP of a target bind)
+    u32 cb_extent_mask{};           ///< bit per slot whose hint is set by this draw
+    u32 db_extent{};
+    bool has_extents{};
 };
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).

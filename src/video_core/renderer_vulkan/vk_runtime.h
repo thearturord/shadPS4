@@ -65,6 +65,8 @@ public:
                       const VideoCore::SubresourceRange& dst_range);
     void ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                     const vk::ClearValue& clear_value);
+    void ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range, bool clear_depth,
+                                float depth, bool clear_stencil, u32 stencil);
 
     void SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing = true);
 

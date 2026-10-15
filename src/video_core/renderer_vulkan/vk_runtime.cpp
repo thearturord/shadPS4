@@ -602,6 +602,42 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+void Runtime::ClearDepthStencilImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range, bool clear_depth,
+                                     float depth, bool clear_stencil, u32 stencil) {
+    vk::ImageAspectFlags aspect{};
+    if (clear_depth && (dst->aspect_mask & vk::ImageAspectFlagBits::eDepth)) {
+        aspect |= vk::ImageAspectFlagBits::eDepth;
+    }
+    if (clear_stencil && (dst->aspect_mask & vk::ImageAspectFlagBits::eStencil)) {
+        aspect |= vk::ImageAspectFlagBits::eStencil;
+    }
+    if (!aspect) {
+        return;
+    }
+    scheduler.EndRendering();
+
+    const bool needs_flush =
+        Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
+                vk::AccessFlagBits2::eTransferWrite, range);
+    if (needs_flush) {
+        FlushBarriers();
+    }
+
+    const vk::ImageSubresourceRange vk_range = {
+        .aspectMask = aspect,
+        .baseMipLevel = range.base.level,
+        .levelCount = range.extent.levels,
+        .baseArrayLayer = range.base.layer,
+        .layerCount = range.extent.layers,
+    };
+    const vk::ClearDepthStencilValue value{.depth = depth, .stencil = stencil};
+    scheduler.CommandBuffer().clearDepthStencilImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, value,
+                                                     vk_range);
+
+    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool copy_backing) {
     auto& backing = image->backing;
     auto& backing_images = image->backing_images;

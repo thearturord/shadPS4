@@ -174,6 +174,8 @@ private:
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
+    /// Clears the bound depth / stencil target to the clear values of the registers (native replacement of the SDK's clear quad).
+    void ClearDepthTarget();
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
     void UpdateViewportScissorState() const;
@@ -195,6 +197,7 @@ private:
         PrimitiveNone,
         DepthStencilCopy,
         SkipShadow, ///< Live switch skip_shadows: a depth-only draw into a shadow map sized target.
+        DepthClear, ///< The SDK's full-screen triangle with the depth / stencil clear bits set: a clear of the target.
     };
     struct DrawClassification {
         DrawClass kind{};

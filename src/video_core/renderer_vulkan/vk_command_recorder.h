@@ -561,6 +561,18 @@ public:
         list->Record([=](vk::CommandBuffer c) { c.clearColorImage(image, layout, &value, n, r); });
     }
 
+    void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout, const vk::ClearDepthStencilValue& value,
+                                vk::ArrayProxy<const vk::ImageSubresourceRange> ranges) const {
+        if (!list) {
+            cmdbuf.clearDepthStencilImage(image, layout, value, ranges);
+            return;
+        }
+        const u32 n = ranges.size();
+        const auto* r = list->Copy(ranges.data(), n);
+        const vk::ClearDepthStencilValue copy = value;
+        list->Record([=](vk::CommandBuffer c) { c.clearDepthStencilImage(image, layout, &copy, n, r); });
+    }
+
     void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
                       const void* data) const {
         if (!list) {

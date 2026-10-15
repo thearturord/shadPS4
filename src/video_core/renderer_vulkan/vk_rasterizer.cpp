@@ -124,6 +124,13 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs
     if (regs.primitive_type == AmdGpu::PrimitiveType::None) {
         return {DrawClass::PrimitiveNone};
     }
+    // The SDK's clear: a full-screen triangle (embedded vertex shader, three vertices, no color target) with the depth /
+    // stencil clear bits of DB_RENDER_CONTROL set. Its pixels carry nothing; the render pass clear does the work.
+    if ((regs.depth_render_control.depth_clear_enable || regs.depth_render_control.stencil_clear_enable) &&
+        regs.reg_array[AmdGpu::Regs::ShRegWordOffset + 0x49] != 0 && regs.num_indices == 3 &&
+        regs.color_target_mask.raw == 0 && regs.depth_buffer.DepthValid()) {
+        return {DrawClass::DepthClear};
+    }
 
     const bool cb_disabled =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
@@ -165,13 +172,14 @@ bool Rasterizer::FilterDraw() {
             if (last_log_ns != 0) {
                 LOG_INFO(Render_Vulkan,
                          "draw classes per 5 s: eliminate fast clear {}, fmask decompress {}, resolve {}, primitive none {}, "
-                         "depth/stencil copy {}, skipped shadow {}, normal {}",
+                         "depth/stencil copy {}, skipped shadow {}, depth clear {}, normal {}",
                          class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)],
                          class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)],
                          class_counts[static_cast<size_t>(DrawClass::Resolve)],
                          class_counts[static_cast<size_t>(DrawClass::PrimitiveNone)],
                          class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)],
                          class_counts[static_cast<size_t>(DrawClass::SkipShadow)],
+                         class_counts[static_cast<size_t>(DrawClass::DepthClear)],
                          class_counts[static_cast<size_t>(DrawClass::Normal)]);
             }
             class_counts = {};
@@ -206,6 +214,9 @@ bool Rasterizer::FilterDraw() {
         return false;
     case DrawClass::SkipShadow:
         VideoCore::ReadbackPolicy::Get().skipped_draws.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    case DrawClass::DepthClear:
+        ClearDepthTarget();
         return false;
     case DrawClass::Normal:
         break;
@@ -441,6 +452,23 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
     runtime.ClearImage(&image, desc.view_info.range, clear_value);
+    ScopeMarkerEnd();
+}
+
+void Rasterizer::ClearDepthTarget() {
+    auto& regs = liverpool->RasterRegs();
+    const auto htile_address = regs.depth_htile_data_base.GetAddress();
+    VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view, regs.depth_control, htile_address,
+                                            liverpool->RasterDbExtent());
+    const auto image_id = texture_cache.FindImage(desc);
+    auto& image = texture_cache.GetImage(image_id);
+    const bool clear_depth = regs.depth_render_control.depth_clear_enable && regs.depth_buffer.DepthValid();
+    const bool clear_stencil = regs.depth_render_control.stencil_clear_enable && regs.depth_buffer.StencilValid();
+    texture_cache.TouchMeta(htile_address, desc.view_info.range.base.layer, false);
+    ScopeMarkerBegin(fmt::format("ClearDepthTarget:{:#x}", regs.depth_buffer.DepthAddress()));
+    runtime.ClearDepthStencilImage(&image, desc.view_info.range, clear_depth, regs.depth_clear, clear_stencil,
+                                   regs.stencil_clear);
+    image.usage.depth_target = true;
     ScopeMarkerEnd();
 }
 

@@ -590,19 +590,37 @@ DeviceAddresses ResolveDevice() {
     return d;
 }
 
-constexpr u32 TableRingDwords = 4u << 20; // 16 MB of scratch descriptor tables
-std::unique_ptr<u32[]> table_ring;
-std::once_flag table_ring_once;
-std::atomic<u64> table_cursor{0};
+/// Descriptor tables the user data of a record points to live as long as the record: each record slot owns an arena
+/// (the slot is reused only after the record is consumed, and a consumer that finds the slot reused drops the record).
+constexpr u32 TableArenaDwords = 4096;
+constexpr u32 RecordSlotCount = RecordSlots;
+std::unique_ptr<u32[]> table_arena;
+std::once_flag table_arena_once;
+thread_local u64 table_seq;
+thread_local u32 table_used;
+thread_local bool table_overflow;
+
+void BeginTables(u64 seq) {
+    table_seq = seq;
+    table_used = 0;
+    table_overflow = false;
+}
 
 u32* AllocTable(u32 dwords) {
-    std::call_once(table_ring_once, [] { table_ring = std::make_unique<u32[]>(TableRingDwords); });
-    u64 start = table_cursor.fetch_add(dwords, std::memory_order_relaxed) % TableRingDwords;
-    if (start + dwords > TableRingDwords) {
-        table_cursor.fetch_add(TableRingDwords - start, std::memory_order_relaxed);
-        start = 0;
+    std::call_once(table_arena_once, [] {
+        table_arena = std::make_unique_for_overwrite<u32[]>(static_cast<size_t>(RecordSlotCount) * TableArenaDwords);
+    });
+    const u32 size = (dwords + 3) & ~3u;
+    if (table_used + size > TableArenaDwords) {
+        // does not fit: the record is marked unsupported and its tables go to a scratch buffer nobody reads
+        table_overflow = true;
+        thread_local std::vector<u32> spill;
+        spill.assign(size, 0);
+        return spill.data();
     }
-    return table_ring.get() + start;
+    u32* table = table_arena.get() + (table_seq % RecordSlotCount) * TableArenaDwords + table_used;
+    table_used += size;
+    return table;
 }
 
 // Descriptors of the objects bound in the context's tables (api stage 0 = vertex, 1 = pixel).
@@ -1286,6 +1304,7 @@ NativeRecord& Slot(u64 seq) {
 /// Guest thread: builds the record of a draw. Returns its number.
 u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -1297,7 +1316,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.cb_extent = synth_cb_extent;
     slot.cb_extent_mask = synth_cb_extent_mask;
     slot.db_extent = synth_db_extent;
-    slot.flags = synth_flags;
+    slot.flags = synth_flags | (table_overflow ? SpecialPipeline : 0u);
     slot.rt_info = synth_rt_info;
     slot.kind = kind;
     slot.caller = caller;
@@ -1369,6 +1388,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
 /// program registers the compute constant update engine writes, and the dispatch arguments.
 u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -1406,7 +1426,7 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
                            n, slot);
     }
-    slot.flags = synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.flags = (table_overflow ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
@@ -1430,6 +1450,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         return 0;
     }
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -1550,7 +1571,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             }
         }
     }
-    if (!ok) {
+    if (!ok || table_overflow) {
         return 0;
     }
     // what the flush of the constant update engine puts into user data: pointers into the table and two immediates
@@ -1593,6 +1614,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
 /// beyond the shader bind, so the record carries the program registers too.
 u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -1660,7 +1682,7 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
             }
         }
     }
-    slot.flags = synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.flags = (table_overflow ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
@@ -2201,6 +2223,7 @@ std::atomic<u64> track_native{}, track_eliminated{}, track_game_second{}, track_
 
 bool EmitFastClearEliminate(u64 ctx, u64 resource) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
@@ -2235,14 +2258,17 @@ bool EmitFastClearEliminate(u64 ctx, u64 resource) {
 void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
     if (native && Rd<u64>(resource, 0x138) != 0) {
         track_game_second.fetch_add(1, std::memory_order_relaxed);
+        Live().track_game_second.fetch_add(1, std::memory_order_relaxed);
     } else if (native && (Rd<u32>(resource, 0x144) - 1u) < 2) {
         track_game_depth.fetch_add(1, std::memory_order_relaxed);
+        Live().track_game_depth.fetch_add(1, std::memory_order_relaxed);
     }
     if (!native || Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
         game_track(ctx, resource);
         return;
     }
     track_native.fetch_add(1, std::memory_order_relaxed);
+    Live().track_native.fetch_add(1, std::memory_order_relaxed);
     if (Rd<u32>(resource, 0x124) == 1) {
         return;
     }
@@ -2256,6 +2282,7 @@ void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_t
             return;
         }
         track_eliminated.fetch_add(1, std::memory_order_relaxed);
+        Live().track_fce.fetch_add(1, std::memory_order_relaxed);
         Wr<u32>(resource, 0x14c, 3);
     }
 }
@@ -2564,12 +2591,14 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool fol
     }
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
+        Live().gfx_tags.fetch_add(1, std::memory_order_relaxed);
         if (exec) {
             if (auto& state = ExecState(ctx); state.target_pointers != TargetPointers(ctx)) {
                 state.target_pointers = TargetPointers(ctx);
                 ApplyTargetSideEffects(ctx);
             }
             exec_drawn.fetch_add(1, std::memory_order_relaxed);
+            Live().gfx_exec.fetch_add(1, std::memory_order_relaxed);
             if (follow) {
                 PrepareDrawSideEffects(ctx);
                 skip_cue_flush = true;
@@ -2688,9 +2717,11 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
         return 0;
     }
     tags_written.fetch_add(1, std::memory_order_relaxed);
+    Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
     if (!exec) {
         return 0;
     }
+    Live().compute_exec.fetch_add(1, std::memory_order_relaxed);
     ComputeSideEffects(ctx);
     Wr<u32>(ctx, 0x34, Rd<u32>(ctx, 0x34) + 1);
     Wr<u32>(ctx, 0x3c, Rd<u32>(ctx, 0x3c) + static_cast<u32>(x) * static_cast<u32>(y) * static_cast<u32>(z));
@@ -2727,9 +2758,11 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
         return 0;
     }
     tags_written.fetch_add(1, std::memory_order_relaxed);
+    Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
     if (!exec) {
         return 0;
     }
+    Live().compute_exec.fetch_add(1, std::memory_order_relaxed);
     compute_drawn.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
@@ -2797,7 +2830,7 @@ void AscSideEffects(u64 jcc, u64 x, u64 y, u64 z) {
 
 /// Dispatch of the async compute context: PrepareDispatch, the constant update engine flush and the dispatch packet.
 /// With execution the record replaces all of it (the packets are only written when the game's own path runs).
-u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret) {
+u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || jcc == 0 || x == 0 || y == 0 || z == 0 ||
         policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
@@ -2807,6 +2840,7 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret) {
     const u64 seq = MakeAscRecord(jcc, x, y, z, ret);
     if (seq == 0) {
         asc_no_record.fetch_add(1, std::memory_order_relaxed);
+        Live().asc_no_record.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
@@ -2817,7 +2851,7 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret) {
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
-    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    const bool exec = allow_exec && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
     }
@@ -2828,15 +2862,29 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret) {
     tags_written.fetch_add(1, std::memory_order_relaxed);
     if (!exec) {
         asc_packet_path.fetch_add(1, std::memory_order_relaxed);
+        Live().asc_packet.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    {
+        static std::atomic<u32> exec_log{0};
+        if (const u32 n = exec_log.fetch_add(1); n < 1500 && (n < 40 || ret - ImageBase() + 0x1000000 != 0x2471253)) {
+            const u64 cs_obj = Rd<u64>(jcc, 0x1d10);
+            LOG_INFO(Core, "asc exec #{}: site {:#x} jcc {:#x} shader {:#x} groups {}x{}x{} masks s{:#x} cb{:#x} srv{:#x} uav{:#x}", n,
+                     ret - ImageBase() + 0x1000000, jcc, Rd<u64>(cs_obj, 0x120), x, y, z, Rd<u32>(cs_obj, 0xe4), Rd<u32>(cs_obj, 0xe0),
+                     Rd<u32>(cs_obj, 0xf0), Rd<u32>(cs_obj, 0x100));
+        }
     }
     AscSideEffects(jcc, x, y, z);
     asc_drawn.fetch_add(1, std::memory_order_relaxed);
+    Live().asc_exec.fetch_add(1, std::memory_order_relaxed);
     return 1;
 }
 
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
+}
+u64 PS4_SYSV_ABI TagAscDispatchRecordOnly(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
+    return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret, false);
 }
 
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -2905,6 +2953,9 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_cue_flush") {
         return reinterpret_cast<u64>(&CueFlushHook);
     }
+    if (name == "tag_asc_dispatch_record_only") {
+        return reinterpret_cast<u64>(&TagAscDispatchRecordOnly);
+    }
     if (name == "tag_asc_dispatch") {
         return reinterpret_cast<u64>(&TagAscDispatch);
     }
@@ -2933,6 +2984,11 @@ u64 FindHandler(const std::string& name) {
         return reinterpret_cast<u64>(&TagAuto);
     }
     return 0;
+}
+
+LiveCounters& Live() {
+    static LiveCounters counters;
+    return counters;
 }
 
 VAddr ImageBase() {

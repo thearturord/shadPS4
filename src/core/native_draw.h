@@ -24,6 +24,19 @@ u64 FindHandler(const std::string& name);
 /// Draw count of a record whose draw packet is not known yet (matches any count).
 constexpr u32 UnknownDrawCount = 0xfffffffe;
 
+/// Cumulative counters of the native path (read by the debug server's /native endpoint; the log lines use their own).
+struct LiveCounters {
+    std::atomic<u64> gfx_tags{}, gfx_exec{};
+    std::atomic<u64> compute_tags{}, compute_exec{};
+    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{};
+    std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
+    /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
+    /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
+    std::array<std::atomic<u64>, 6> packets{};
+    std::atomic<u64> asc_packets{};
+};
+LiveCounters& Live();
+
 void SetImageBase(VAddr base);
 /// Load address of the game's main module (0 until known).
 VAddr ImageBase();

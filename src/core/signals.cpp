@@ -148,6 +148,30 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (pExp != nullptr && pExp->ContextRecord != nullptr && pExp->ExceptionRecord != nullptr) {
+            const auto& c = *pExp->ContextRecord;
+            const auto& r = *pExp->ExceptionRecord;
+            std::string bytes;
+            if (address != nullptr && !IsBadReadPtr(address, 16)) {
+                for (int i = 0; i < 16; ++i) {
+                    bytes += fmt::format("{:02x} ", reinterpret_cast<const u8*>(address)[i]);
+                }
+            }
+            LOG_CRITICAL(Debug,
+                         "access {} address {:#x}; rip {:#x} rsp {:#x} rbp {:#x} rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} "
+                         "rdi {:#x} r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}; code bytes {}",
+                         r.NumberParameters > 0 ? r.ExceptionInformation[0] : 0, r.NumberParameters > 1 ? r.ExceptionInformation[1] : 0,
+                         c.Rip, c.Rsp, c.Rbp, c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13,
+                         c.R14, c.R15, bytes);
+            const u64* stack = reinterpret_cast<const u64*>(c.Rsp);
+            std::string frames;
+            if (!IsBadReadPtr(stack, 8 * 12)) {
+                for (int i = 0; i < 12; ++i) {
+                    frames += fmt::format("{:#x} ", stack[i]);
+                }
+            }
+            LOG_CRITICAL(Debug, "stack top: {}", frames);
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

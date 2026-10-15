@@ -18,6 +18,7 @@
 #include "common/path_util.h"
 #include "core/debug_server.h"
 #include "core/memory.h"
+#include "core/native_draw.h"
 #include "video_core/readback_policy.h"
 #include "video_core/thread_profiler.h"
 #include "video_core/thread_usage.h"
@@ -88,6 +89,32 @@ nlohmann::json Status(const Params&) {
     j["fps_1s"] = FpsOver(1.0);
     j["fps_5s"] = FpsOver(5.0);
     j["game_serial"] = MemoryPatcher::g_game_serial;
+    return j;
+}
+
+nlohmann::json Native(const Params&) {
+    auto& live = NativeDraw::Live();
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    nlohmann::json j;
+    j["note"] = "cumulative counters of the native renderer since start; take differences for rates";
+    j["mode"] = policy.native_draw_mode.load();
+    j["exec"] = policy.native_draw_exec.load();
+    j["audit_every"] = policy.native_audit_every.load();
+    j["gfx_tags"] = live.gfx_tags.load();
+    j["gfx_exec"] = live.gfx_exec.load();
+    j["compute_tags"] = live.compute_tags.load();
+    j["compute_exec"] = live.compute_exec.load();
+    j["asc_exec"] = live.asc_exec.load();
+    j["asc_packet"] = live.asc_packet.load();
+    j["asc_no_record"] = live.asc_no_record.load();
+    j["track_native"] = live.track_native.load();
+    j["track_fce"] = live.track_fce.load();
+    j["track_game"] = live.track_game_second.load() + live.track_game_depth.load();
+    auto& packets = j["packets"] = nlohmann::json::array();
+    for (const auto& p : live.packets) {
+        packets.push_back(p.load());
+    }
+    j["asc_packets"] = live.asc_packets.load();
     return j;
 }
 
@@ -295,6 +322,7 @@ nlohmann::json Index(const Params&) {
 void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
+    Register("/native", "native renderer counters (cumulative)", Native);
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);

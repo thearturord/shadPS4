@@ -1451,6 +1451,7 @@ void CountGameCommand(const PM4Header* header, PM4ItOpcode opcode, u32 count) {
     }
     ++opcodes[group][static_cast<u32>(opcode) & 255];
     ++packets[group];
+    Core::NativeDraw::Live().packets[group].fetch_add(1, std::memory_order_relaxed);
     if (opcode == PM4ItOpcode::SetContextReg || opcode == PM4ItOpcode::SetShReg ||
         opcode == PM4ItOpcode::SetUconfigReg || opcode == PM4ItOpcode::SetConfigReg) {
         const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
@@ -1515,6 +1516,7 @@ void CountComputeQueueCommand(PM4ItOpcode opcode) {
     static u64 last_log_ns = 0;
     ++opcodes[static_cast<u32>(opcode) & 255];
     ++total;
+    Core::NativeDraw::Live().asc_packets.fetch_add(1, std::memory_order_relaxed);
     const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
                         .count();

@@ -312,6 +312,64 @@ void Liverpool::WakeRaster() {
 }
 
 void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
+    if (!overlay.list.empty()) {
+        OverlayForget(dword_offset, count); // the command packets wrote the truth for these registers
+    }
+    MirrorRegsRaw(dword_offset, count);
+}
+
+void Liverpool::OverlaySet(u32 index, u32 value) {
+    u32& current = regs.reg_array[index];
+    if (current == value) {
+        return;
+    }
+    if (!overlay.truth) {
+        overlay.truth = std::make_unique<u32[]>(Regs::NumRegs);
+        overlay.bits.assign((Regs::NumRegs + 63) / 64, 0);
+    }
+    u64& word = overlay.bits[index >> 6];
+    if ((word >> (index & 63) & 1) == 0) {
+        overlay.truth[index] = current;
+        word |= 1ull << (index & 63);
+        overlay.list.push_back(index);
+        if (overlay.list.size() > 32768) {
+            // duplicates pile up only when packets keep rewriting overlaid registers: start over from the truth
+            current = value;
+            MirrorRegsRaw(index, 1);
+            OverlayRestore();
+            return;
+        }
+    }
+    current = value;
+    MirrorRegsRaw(index, 1);
+}
+
+void Liverpool::OverlayRestore() {
+    for (const u32 index : overlay.list) {
+        u64& word = overlay.bits[index >> 6];
+        if ((word >> (index & 63) & 1) != 0) {
+            word &= ~(1ull << (index & 63));
+            regs.reg_array[index] = overlay.truth[index];
+            MirrorRegsRaw(index, 1);
+        }
+    }
+    overlay.list.clear();
+}
+
+void Liverpool::OverlayForget(u32 dword_offset, u32 count) {
+    for (u32 index = dword_offset; index < dword_offset + count; ++index) {
+        overlay.bits[index >> 6] &= ~(1ull << (index & 63));
+    }
+}
+
+void Liverpool::OverlayForgetAll() {
+    for (const u32 index : overlay.list) {
+        overlay.bits[index >> 6] &= ~(1ull << (index & 63));
+    }
+    overlay.list.clear();
+}
+
+void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
     if (!split_active || count == 0) {
         return;
     }
@@ -338,6 +396,7 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 }
 
 void Liverpool::MirrorSetDefaults() {
+    OverlayForgetAll(); // the registers were reset to their defaults
     if (split_active) {
         split->pending.push_back(RasterSplit::SetDefaultsMarker);
         split->pending.push_back(0);
@@ -424,6 +483,10 @@ void Liverpool::DrainRasterWrites() {
 }
 
 void Liverpool::RasterDispatch(const RasterCall& call_in) {
+    if (!native_exec_scope && !overlay.list.empty() &&
+        (call_in.kind == RasterCall::Kind::Draw || call_in.kind == RasterCall::Kind::DrawIndirect)) {
+        OverlayRestore(); // a draw of the packet path: the registers its packets built on
+    }
     RasterCall call = call_in;
     if (native_tag_pending.valid) {
         // The tag belongs to the draw or dispatch the game called. The game's own tracking may issue internal draws
@@ -577,19 +640,14 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
     // for draws that take the packet path, assume the register file holds what they wrote.
-    std::array<u32, Core::NativeDraw::ExecDraw::MaxRegisters> saved;
+    // The registers stay as the draw leaves them; the next draw writes only what differs, and a draw of the packet
+    // path first gets the registers its own packets built (RasterDispatch).
     for (u32 i = 0; i < draw.count; ++i) {
-        const u32 index = draw.regs[i].index;
-        saved[i] = regs.reg_array[index];
-        regs.reg_array[index] = draw.regs[i].value;
-        MirrorRegs(index, 1);
+        OverlaySet(draw.regs[i].index, draw.regs[i].value);
     }
-    const u32 saved_initiator = regs.draw_initiator;
-    regs.draw_initiator = 0;
-    MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
+    OverlaySet(static_cast<u32>(&regs.draw_initiator - regs.reg_array.data()), 0);
     if (index_count != ~0u) {
-        regs.num_indices = index_count; // restored with the other registers
-        MirrorObject(&regs.num_indices, sizeof(regs.num_indices));
+        OverlaySet(static_cast<u32>(&regs.num_indices - regs.reg_array.data()), index_count);
     }
     RasterCall call{};
     if (draw.kind == 2) {
@@ -608,17 +666,14 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         call.indexed = draw.kind == 0;
         call.index_offset = draw.start_index;
     }
+    native_exec_scope = true;
     RasterDispatch(call);
+    native_exec_scope = false;
     if (draw.cb_extents_only) {
+        // the fast clear eliminate registers (color control in eliminate mode) must not reach the next draw
         last_cb_extent = saved_cb_extent;
+        OverlayRestore();
     }
-    for (u32 i = draw.count; i-- > 0;) {
-        const u32 index = draw.regs[i].index;
-        regs.reg_array[index] = saved[i];
-        MirrorRegs(index, 1);
-    }
-    regs.draw_initiator = saved_initiator;
-    MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
 }
 
 void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 queue) {

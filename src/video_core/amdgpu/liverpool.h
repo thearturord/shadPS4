@@ -266,8 +266,25 @@ private:
     [[nodiscard]] bool RasterIdle() const noexcept;
     /// Register writes made by the command processor: copied to the raster mirror.
     void MirrorRegs(u32 dword_offset, u32 count);
+    void MirrorRegsRaw(u32 dword_offset, u32 count);
     void MirrorObject(const void* object, size_t size);
     void MirrorSetDefaults();
+
+    /// Registers of executed native draws stay in the register file (and the raster mirror) between draws; only the
+    /// registers that differ from the previous draw are written. `truth` keeps what the command packets wrote for
+    /// every register that currently holds a record's value, so the packet path (and a fast clear eliminate) gets
+    /// its own state back before it runs (front thread only).
+    struct NativeOverlay {
+        std::unique_ptr<u32[]> truth;
+        std::vector<u64> bits;
+        std::vector<u32> list;
+    };
+    NativeOverlay overlay;
+    bool native_exec_scope{}; ///< the draw being dispatched is an executed record
+    void OverlaySet(u32 index, u32 value);
+    void OverlayRestore();
+    void OverlayForget(u32 dword_offset, u32 count);
+    void OverlayForgetAll();
     /// Wakes the raster thread (it runs SendCommand callbacks) when the split is active.
     void WakeRaster();
 

@@ -2109,6 +2109,47 @@ void RunResourceTracking(u64 ctx) {
     }
 }
 
+/// The game's PrepareDispatch (0x2479b70) with the resource tracking done natively: the tracking of the compute
+/// shader's views, then the game's own mode switch, shader cache update and user data flush, which write the command
+/// packets that the dispatch record replaces.
+void PrepareDispatchNative(u64 ctx) {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
+    const auto at = [&](u64 address) { return base + address - 0x1000000; };
+    if (!native) {
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(at(0x2479b70))(ctx);
+        return;
+    }
+    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(at(0x2479db0));
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const u64 cs = Rd<u64>(ctx, 0x4670);
+    const auto track_view = [&](u64 view) {
+        if (view != 0 && valid(view)) {
+            if (const u64 resource = Rd<u64>(view, 0x30); valid(resource)) {
+                TrackResource(ctx, resource, true, track);
+            }
+        }
+    };
+    for (u32 bits = Rd<u32>(cs, 0x100), slot = 0; bits != 0; bits >>= 1, ++slot) {
+        if ((bits & 1) != 0) {
+            track_view(Rd<u64>(ctx, 0x2098 + slot * 8));
+        }
+    }
+    for (u32 slot = 0; slot < 128; ++slot) {
+        if (((Rd<u64>(cs, slot < 64 ? 0xf0 : 0xf8) >> (slot & 63)) & 1) != 0) {
+            track_view(Rd<u64>(ctx, 0x1980 + slot * 8));
+        }
+    }
+    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u32)>(at(0x247b920))(ctx, 0x8000);
+    const u64 gnm = Rd<u64>(cs, 0x120);
+    if (gnm != 0 && Rd<u64>(ctx, 0x12eb8) != gnm) {
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u8)>(at(0x24a22a0))(ctx + 0x6d50, gnm + 0x28, Rd<u8>(gnm, 3));
+    }
+    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64)>(at(0x24a1370))(ctx + 0x4aa8, gnm, ctx + 0x6d50);
+    Wr<u32>(cs, 0x2c, Rd<u32>(ctx, 0x47ac));
+    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u32, u32, u64)>(at(0x247dad0))(ctx, 0, 5, cs + 0x30);
+}
+
 /// Cheap identity of the bound render and depth views (the flags and stamps of a target bind depend on these only).
 u64 TargetPointers(u64 ctx) {
     Hasher h;
@@ -2377,8 +2418,7 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     // PrepareDispatch first (resource tracking, descriptor updates, the program packets); the wrapper runs it again
     // when the dispatch is not executed natively, which finds nothing left to do
     if (Rd<u64>(ctx, 0x4670) != 0) {
-        const VAddr base = image_base.load(std::memory_order_relaxed);
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(base + 0x2479b70 - 0x1000000)(ctx);
+        PrepareDispatchNative(ctx);
     }
     const u64 seq = MakeComputeRecord(ctx, x, y, z, ret);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];

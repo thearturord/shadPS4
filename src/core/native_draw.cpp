@@ -774,6 +774,7 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
 }
 
 thread_local u32 synth_flags;
+thread_local u32 inline_instances; ///< instance count the game set before an inlined draw (0 = the draw functions' reset to 1)
 thread_local std::array<u32, 8> synth_cb_extent;
 thread_local u32 synth_cb_extent_mask;
 thread_local u32 synth_db_extent;
@@ -1339,7 +1340,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
             if (!unknown_count) {
                 slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
             }
-            slot.regs[n++] = {UconfigBase + 0x24d, unknown_count ? Rd<u32>(ctx, 0x4724) : 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
+            slot.regs[n++] = {UconfigBase + 0x24d, inline_instances != 0 ? inline_instances : 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
         }
         if (kind == 2) {
             // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
@@ -1488,6 +1489,10 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         }
         const u32 index = offset & 0x3fff;
         if ((offset & 0x8000) != 0) {
+            if (index + dwords > 16) { // only 16 user data registers exist
+                ok = false;
+                return;
+            }
             for (u32 k = 0; k < dwords; ++k) {
                 cs_reg(0x40 + index + k, source[k]);
             }
@@ -1581,6 +1586,10 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         if (start == 0xff) {
             return;
         }
+        if (start + 2 > 16 || checks >= slot.checks.size()) { // outside the 16 user data registers: not a layout we know
+            ok = false;
+            return;
+        }
         slot.checks[checks] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 20 + checks, dwords, address, 0, {~0ull, ~0ull}};
         ++checks;
     };
@@ -1589,6 +1598,14 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
     for (u32 k = 0; k < 4; ++k) {
         const u32 offset = Rd<u16>(offs, table_offsets[k]);
         pointer(Rd<u8>(offs, 8 + k), table_address + offset * 4ull, offset < table_dwords ? table_dwords - offset : 0);
+    }
+    for (const u32 start : {Rd<u8>(offs, 0xc), Rd<u8>(offs, 0xd), Rd<u8>(offs, 0xe)}) {
+        if (start != 0xff && start + 2 > 16) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        return 0;
     }
     if (const u32 start = Rd<u8>(offs, 0xc); start != 0xff) {
         const u64 global_table = Rd<u64>(jcc, 0x118);
@@ -2518,9 +2535,9 @@ void PrepareDrawSideEffects(u64 ctx) {
     }
 }
 
-/// `follow`: the draw is an inlined copy of a draw function; PrepareDraw is what is hooked, the game writes the draw
-/// packet itself (its count is only known there). The tag then says "execute when the draw packet comes".
-u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool follow = false) {
+/// `inline_draw`: the draw is an inlined copy of a draw function; PrepareDraw is what is hooked. With execution the hook
+/// skips PrepareDraw and makes the caller skip the draw (it does the counters the caller would have done).
+u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inline_draw = false) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
         return 0;
@@ -2587,7 +2604,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool fol
     words[12] = 0;
     const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
     if (exec) {
-        words[2] |= ExecFlag | (follow ? VideoCore::NativeTagFollowFlag : 0u);
+        words[2] |= ExecFlag;
     }
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
@@ -2599,10 +2616,12 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool fol
             }
             exec_drawn.fetch_add(1, std::memory_order_relaxed);
             Live().gfx_exec.fetch_add(1, std::memory_order_relaxed);
-            if (follow) {
+            if (inline_draw) {
                 PrepareDrawSideEffects(ctx);
-                skip_cue_flush = true;
-                return 0x8000000000000001ull; // PrepareDraw returns true
+                // what the inlined caller does after a successful PrepareDraw and draw packet
+                Wr<u32>(ctx, 0x30, Rd<u32>(ctx, 0x30) + 1);
+                Wr<u32>(ctx, 0x38, Rd<u32>(ctx, 0x38) + Rd<u32>(ctx, 0x4724) * static_cast<u32>(a1));
+                return 0x8000000000000000ull; // PrepareDraw returns false: the caller does not draw
             }
             ExecSideEffects(ctx, kind, a1, a2, a3);
             return 1;
@@ -2901,12 +2920,19 @@ u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 }
 /// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
 /// draw in a render pass function, which is where this hook acts.
-u64 PS4_SYSV_ABI PrepareDrawHook(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+u64 PS4_SYSV_ABI PrepareDrawHook(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret, u64 caller_rsp) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     if (ctx != 0 && base != 0 && ret - base + 0x1000000 == 0x1c727a7 &&
         VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
-        if (const u64 result = Tag(ctx, Core::NativeDraw::UnknownDrawCount, 0, 0, ret, 1, true, true); result != 0) {
-            return result;
+        // the vertex count sits in the caller's frame ([rsp + 0x108], stored just before the call)
+        const u64 count = Rd<u32>(caller_rsp, 0x108);
+        if (count != 0 && count < 0x1000000) {
+            inline_instances = Rd<u32>(ctx, 0x4724);
+            const u64 result = Tag(ctx, count, 0, 0, ret, 1, true, true);
+            inline_instances = 0;
+            if (result != 0) {
+                return result;
+            }
         }
     }
     return PrepareNote(ctx, a1, a2, a3, a4, a5, ret);

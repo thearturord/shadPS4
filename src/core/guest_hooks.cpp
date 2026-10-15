@@ -200,7 +200,7 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
 }
 
 /// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
-/// handler(rdi, rsi, rdx, rcx, r8, r9, return address). A non-zero result skips the hooked function (the stub
+/// handler(rdi, rsi, rdx, rcx, r8, r9, return address, rsp of the caller). A non-zero result skips the hooked function (the stub
 /// returns to its caller; with bit 63 set the rest of the result is returned as its value); zero runs the displaced instructions and continues in the function.
 void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original, size_t displaced,
                   const u8* resume) {
@@ -216,18 +216,18 @@ void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original,
         c.push(r9);
         c.push(r10);
         c.push(r11);
-        // 8 bytes for the seventh argument, 128 bytes for xmm0-7; with the 80 bytes above and the return
-        // address, rsp is 16-byte aligned at the call.
-        c.sub(rsp, 136);
+        // 16 bytes for the seventh and eighth argument, 128 bytes for xmm0-7; with the 80 bytes above and the
+        // return address, rsp is 16-byte aligned at the call.
+        c.sub(rsp, 152);
         for (int i = 0; i < 8; ++i) {
-            c.movdqu(ptr[rsp + 8 + 16 * i], Xbyak::Xmm(i));
+            c.movdqu(ptr[rsp + 16 + 16 * i], Xbyak::Xmm(i));
         }
     };
     const auto restore = [&] {
         for (int i = 0; i < 8; ++i) {
-            c.movdqu(Xbyak::Xmm(i), ptr[rsp + 8 + 16 * i]);
+            c.movdqu(Xbyak::Xmm(i), ptr[rsp + 16 + 16 * i]);
         }
-        c.add(rsp, 136);
+        c.add(rsp, 152);
         c.pop(r11);
         c.pop(r10);
         c.pop(r9);
@@ -240,8 +240,10 @@ void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original,
         c.popfq();
     };
     save();
-    c.mov(rax, ptr[rsp + 136 + 80]); // return address of the hooked function
+    c.mov(rax, ptr[rsp + 152 + 80]); // return address of the hooked function
     c.mov(ptr[rsp], rax);
+    c.lea(rax, ptr[rsp + 152 + 80 + 8]); // rsp of the caller (after the return)
+    c.mov(ptr[rsp + 8], rax);
     c.mov(rax, hook.handler);
     c.call(rax);
     c.test(rax, rax);
@@ -256,7 +258,7 @@ void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original,
     c.test(rax, r10);
     c.jz(plain);
     c.btr(rax, 63);
-    c.mov(ptr[rsp + 136 + 64], rax);
+    c.mov(ptr[rsp + 152 + 64], rax);
     c.L(plain);
     restore();
     c.ret();

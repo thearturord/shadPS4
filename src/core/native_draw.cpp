@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <bit>
+#include <cmath>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -470,7 +472,7 @@ bool WriteDwords(u64 ctx, const u32* words, u32 count) {
 // compared with the register file the rasterizer got from the command packets.
 constexpr u32 ContextBase = 0xA000;
 constexpr u32 UconfigBase = 0xC000;
-constexpr u32 MaxSynthRegs = 96;
+constexpr u32 MaxSynthRegs = 256;
 
 struct SynthReg {
     u32 index; ///< index in the register file (dword offset)
@@ -483,7 +485,7 @@ struct NativeRecord {
     std::array<SynthReg, MaxSynthRegs> regs{};
 };
 
-constexpr u32 RecordSlots = 16384;
+constexpr u32 RecordSlots = 8192;
 std::unique_ptr<NativeRecord[]> records;
 std::once_flag records_once;
 std::atomic<u64> next_seq{1};
@@ -582,6 +584,108 @@ u32 Synthesize(u64 ctx, SynthReg* out) {
         const u32 topology = Rd<u32>(ctx, Ctx::Topology);
         const u32 value = topology < 10 ? (Rd<u32>(dev.topology_table, topology * 4) & 0x3f) : 9u;
         uconfig_reg(0x242, value);
+    }
+    // render targets: CB_COLORi_* (15 registers per target from 0x318; a bound target writes 14 words of the block at
+    // view + 0x54, an unbound one clears CB_COLORi_INFO). Target 7 is the object at ctx + 0x130e0.
+    {
+        const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+        const auto emit_target = [&](u32 slot, u64 view) {
+            const u32 base = 0x318 + 0xf * slot;
+            if (view) {
+                const u64 block = view + 0x54;
+                if (Rd<u32>(block, 0) != 0) {
+                    for (u32 k = 0; k < 14; ++k) {
+                        context_reg(base + k, Rd<u32>(block, k * 4));
+                    }
+                    return;
+                }
+            }
+            context_reg(base + 4, 0);
+        };
+        for (u32 slot = 0; slot < 7; ++slot) {
+            emit_target(slot, slot < count ? Rd<u64>(ctx, Ctx::RenderTargets + slot * 8) : 0);
+        }
+        emit_target(7, Rd<u64>(ctx, 0x130e0));
+    }
+    // depth target: DB_Z_INFO.. DB_DEPTH_SLICE and friends from the block at view + 0x58; clear values from the resource
+    {
+        const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
+        bool valid = false;
+        if (dsv) {
+            const u64 block = dsv + 0x58;
+            valid = Rd<u32>(block, 8) != 0 || Rd<u32>(block, 12) != 0;
+            if (valid) {
+                for (u32 k = 0; k < 8; ++k) {
+                    context_reg(0x10 + k, Rd<u32>(block, k * 4));
+                }
+                context_reg(0xf, Rd<u32>(block, 11 * 4));
+                context_reg(0x2, Rd<u32>(block, 8 * 4));
+                context_reg(0x5, Rd<u32>(block, 9 * 4));
+                context_reg(0x2af, Rd<u32>(block, 10 * 4));
+            }
+            if (const u64 resource = Rd<u64>(dsv, 0x30); resource && Rd<u64>(resource, 0x48) != 0) {
+                context_reg(0xb, Rd<u32>(resource, 0x158));
+                context_reg(0xa, Rd<u8>(resource, 0x15c));
+                context_reg(0x2b0, Rd<u32>(resource, 0x178));
+                context_reg(0x2b1, Rd<u32>(resource, 0x17c));
+            }
+        }
+        if (!valid) {
+            context_reg(0x10, 0);
+            context_reg(0x11, 0);
+        }
+    }
+    // viewport (Gnmx setupScreenViewport): scale / offset, z range, screen scissor and guard band
+    {
+        const float x = Rd<float>(ctx, Ctx::Viewport + 0);
+        const float y = Rd<float>(ctx, Ctx::Viewport + 4);
+        const float w = Rd<float>(ctx, Ctx::Viewport + 8);
+        const float h = Rd<float>(ctx, Ctx::Viewport + 12);
+        const float z_near = Rd<float>(ctx, Ctx::Viewport + 16);
+        const float z_far = Rd<float>(ctx, Ctx::Viewport + 20);
+        const auto to_u32 = [](float f) { return static_cast<u32>(static_cast<s64>(f)); };
+        const u32 left = to_u32(x);
+        const u32 top = to_u32(y);
+        const u32 right = to_u32(x + w);
+        const u32 bottom = to_u32(y + h);
+        const s32 height = static_cast<s32>(bottom) - static_cast<s32>(top);
+        const float x_scale = static_cast<float>(static_cast<s32>(right - left)) * 0.5f;
+        const float height_f = static_cast<float>(height);
+        const float y_scale = height_f * -0.5f;
+        const float x_offset = static_cast<float>(left) + x_scale;
+        const float y_offset = static_cast<float>(top) + height_f * 0.5f;
+        const auto bits = [](float f) { return std::bit_cast<u32>(f); };
+        context_reg(0xb4, 0);
+        context_reg(0xb5, 0x3f800000);
+        context_reg(0x10f, bits(x_scale));
+        context_reg(0x110, bits(x_offset));
+        context_reg(0x111, bits(y_scale));
+        context_reg(0x112, bits(y_offset));
+        context_reg(0x113, bits(z_far - z_near));
+        context_reg(0x114, bits(z_near));
+        context_reg(0x206, 0x43f);
+        context_reg(0xc, (top << 16) | (left & 0xffff));
+        context_reg(0xd, (static_cast<u32>(bottom) << 16) | (right & 0xffff));
+        const auto grid = [](float offset) {
+            const s32 v = static_cast<s32>(std::floor(offset * 0.0625f + 0.5f));
+            return v > 0x1fb ? 0x1fcu : (static_cast<u32>(v) & 0xfffffffcu);
+        };
+        const u32 qx = grid(x_offset);
+        const u32 qy = grid(y_offset);
+        context_reg(0x8d, ((qy & 0x1fc) << 16) | (qx & 0x1fc));
+        const float limit = std::bit_cast<float>(0x46fffffeu);
+        const auto guard = [&](float offset, float abs_scale, u32 q) {
+            const float q16 = static_cast<float>(static_cast<s32>(q << 4));
+            const float t0 = (offset - abs_scale) - q16;
+            const float t1 = (limit - abs_scale) - offset;
+            const float a = 32768.0f + t0;
+            const float b = q16 + t1;
+            return (a < b ? a : b) / abs_scale;
+        };
+        context_reg(0x2fa, bits(guard(y_offset, std::fabs(y_scale), qy)));
+        context_reg(0x2fb, 0x3f800000);
+        context_reg(0x2fc, bits(guard(x_offset, std::fabs(x_scale), qx)));
+        context_reg(0x2fd, 0x3f800000);
     }
     return n;
 }

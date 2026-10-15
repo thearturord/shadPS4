@@ -141,6 +141,7 @@ struct Liverpool::RasterCall {
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
     u32 dispatch_size{};
+    VideoCore::NativeTag tag{}; ///< From the game's native draw hook, draws only.
 };
 
 struct Liverpool::RasterOp {
@@ -421,7 +422,12 @@ void Liverpool::DrainRasterWrites() {
                             std::memory_order_relaxed);
 }
 
-void Liverpool::RasterDispatch(const RasterCall& call) {
+void Liverpool::RasterDispatch(const RasterCall& call_in) {
+    RasterCall call = call_in;
+    if (call.kind == RasterCall::Kind::Draw && native_tag_pending.valid) {
+        call.tag = native_tag_pending;
+    }
+    native_tag_pending.valid = false;
     if (!split_active) {
         ExecRasterCall(call, nullptr, nullptr);
         return;
@@ -520,9 +526,11 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     };
     switch (c.kind) {
     case RasterCall::Kind::Draw:
+        rasterizer->SetNativeTag(c.tag);
         run([&] { rasterizer->Draw(c.indexed, c.index_offset, draw_plan); });
         break;
     case RasterCall::Kind::DrawIndirect:
+        rasterizer->NativeInvalidate();
         run([&] {
             rasterizer->DrawIndirect(c.indexed, c.args_addr, c.offset, c.stride, c.max_count,
                                      c.count_addr, c.vertex_sgpr_offset, c.instance_sgpr_offset,
@@ -530,9 +538,11 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         });
         break;
     case RasterCall::Kind::DispatchDirect:
+        rasterizer->NativeInvalidate();
         run([&] { rasterizer->DispatchDirect(dispatch_plan); });
         break;
     case RasterCall::Kind::DispatchIndirect:
+        rasterizer->NativeInvalidate();
         run([&] {
             rasterizer->DispatchIndirect(c.args_addr, c.offset, c.dispatch_size, dispatch_plan);
         });
@@ -632,6 +642,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     sp.ns_dispatches += op_ns;
                 }
             } else if (op.closure) {
+                rasterizer->NativeInvalidate();
                 op.closure();
                 (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
                     VideoCore::ReadbackStats::NowNs() - op_start;
@@ -748,6 +759,23 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                         {"front_wait_ms", site.wait_ns.exchange(0) / 1'000'000}};
                 }
                 Core::DebugServer::Publish("write_drains_by_call_site", std::move(sites));
+            }
+            {
+                const auto native = rasterizer->TakeNativeStats();
+                Core::DebugServer::Publish(
+                    "native_draw_raster",
+                    {{"tagged_draws", native.tagged},
+                     {"untagged_draws", native.untagged},
+                     {"dynamic_state_skipped", native.dynamic_skipped},
+                     {"bind_pipeline_skipped", native.bind_skipped},
+                     {"note", "counts per ~5 s interval"}});
+                if (native.tagged != 0) {
+                    LOG_INFO(Render,
+                             "Native draw path: {} tagged draws, {} untagged, {} dynamic state "
+                             "updates skipped, {} pipeline binds skipped",
+                             native.tagged, native.untagged, native.dynamic_skipped,
+                             native.bind_skipped);
+                }
             }
             Core::DebugServer::Publish(
                 "raster_thread_ms",
@@ -1312,6 +1340,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
 
                 switch (nop->data_block[0]) {
+                case PM4CmdNop::PayloadType::NativeDrawTag: {
+                    if (nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
+                        native_tag_pending.valid = true;
+                        native_tag_pending.meta = nop->data_block[1];
+                        std::memcpy(&native_tag_pending.k1, &nop->data_block[2], sizeof(u64));
+                        std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
+                        std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
+                    }
+                    break;
+                }
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.

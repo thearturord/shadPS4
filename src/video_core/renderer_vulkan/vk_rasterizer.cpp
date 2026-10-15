@@ -422,6 +422,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
 
     scheduler.PopPendingOperations();
 
+    // Native draw path: the game said (through the tag in the command stream) which state groups this draw
+    // shares with the previous one. Nothing is reused unless the previous executed operation was a tagged draw
+    // in the same command buffer.
+    const VideoCore::NativeTag tag = std::exchange(native_tag, {});
+    const bool use_tag =
+        tag.valid &&
+        VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >= 2;
+    const NativeLast last = native_last;
+    native_last.valid = false;
+    if (tag.valid) {
+        ++native_stats.tagged;
+    } else {
+        ++native_stats.untagged;
+    }
+
     if (!FilterDraw()) {
         return;
     }
@@ -431,6 +446,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!pipeline) {
         return;
     }
+    const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
+    const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
+    const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -448,7 +466,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     }
 
     pipeline->BindResources(set_writes, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    if (same_dynamic_state) {
+        ++native_stats.dynamic_skipped;
+    } else {
+        UpdateDynamicState(pipeline, is_indexed);
+    }
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -456,7 +478,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    if (same_pipeline) {
+        ++native_stats.bind_skipped;
+    } else {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    }
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -469,6 +495,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     ++recorded_work;
 
     ResetBindings(false);
+    if (use_tag) {
+        native_last = {
+            .valid = true, .k2 = tag.k2, .pipeline = pipeline, .tick = scheduler.CurrentTick()};
+    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,

@@ -12,6 +12,8 @@
 #include "common/logging/log.h"
 #include "core/debug_server.h"
 #include "core/native_draw.h"
+#include "video_core/native_draw_tag.h"
+#include "video_core/readback_policy.h"
 
 namespace Core::NativeDraw {
 
@@ -94,6 +96,7 @@ constexpr const char* GroupNames[NumGroups] = {"shaders",         "layout_ib_top
 
 struct Signature {
     std::array<u64, NumGroups> group{};
+    u64 pipeline_key = 0; ///< vertex shader, pixel shader, layout, topology (not the index buffer)
     bool valid = false;
 };
 
@@ -200,6 +203,14 @@ Signature Compute(u64 ctx, u64 a1, u64 a2, u64 a3, u32 kind) {
         h.Add(a3);
         h.Add(Rd<u32>(ctx, Ctx::InstanceCount));
         s.group[Args] = h.h;
+    }
+    {
+        Hasher h;
+        h.Add(vs);
+        h.Add(ps);
+        h.Add(layout);
+        h.Add(Rd<u32>(ctx, Ctx::Topology));
+        s.pipeline_key = h.h;
     }
     s.valid = true;
     return s;
@@ -419,6 +430,88 @@ u64 Probe(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     return 0;
 }
 
+// ---- writing the tag into the game's draw command buffer ------------------------------------------------------------
+// The context's command writer is at ctx + 0x47c0: +0x08 end, +0x10 current position, +0x18 function that makes room
+// (writer, dwords, argument) -> bool, +0x20 its argument. This mirrors how the game reserves space for its own packets.
+template <typename T>
+inline void Wr(u64 base, u64 offset, T value) {
+    std::memcpy(reinterpret_cast<void*>(base + offset), &value, sizeof(T));
+}
+
+bool WriteDwords(u64 ctx, const u32* words, u32 count) {
+    const u64 writer = ctx + 0x47c0;
+    u64 cur = Rd<u64>(writer, 0x10);
+    const u64 end = Rd<u64>(writer, 0x08);
+    if (cur == 0 || cur > end) {
+        return false;
+    }
+    if (((end - cur) >> 2) < count) {
+        using MakeRoom = u8(PS4_SYSV_ABI*)(u64 writer, u32 dwords, u64 argument);
+        const auto make_room = reinterpret_cast<MakeRoom>(Rd<u64>(writer, 0x18));
+        if (!make_room || !make_room(writer, count, Rd<u64>(writer, 0x20))) {
+            return false;
+        }
+        cur = Rd<u64>(writer, 0x10);
+    }
+    std::memcpy(reinterpret_cast<void*>(cur), words, count * sizeof(u32));
+    Wr<u64>(writer, 0x10, cur + count * sizeof(u32));
+    return true;
+}
+
+std::atomic<u64> tags_written{};
+std::atomic<u64> tags_skipped_class{};
+std::atomic<u64> tags_failed{};
+std::atomic<u64> last_tag_log_ns{0};
+
+u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
+        return 0;
+    }
+    const Class cls = Classify(ret);
+    if (((policy.native_draw_classes.load(std::memory_order_relaxed) >> cls) & 1) == 0) {
+        tags_skipped_class.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const Signature sig = Compute(ctx, a1, a2, a3, kind);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    const u64 k1 = sig.pipeline_key;
+    Hasher h2, h3;
+    h2.Add(sig.group[Targets]);
+    h2.Add(sig.group[States]);
+    h3.Add(sig.group[ShaderResources]);
+    h3.Add(sig.group[Samplers]);
+    const u64 k2 = h2.h;
+    const u64 k3 = h3.h;
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(cls) | (kind << 8);
+    std::memcpy(&words[3], &k1, sizeof(u64));
+    std::memcpy(&words[5], &k2, sizeof(u64));
+    std::memcpy(&words[7], &k3, sizeof(u64));
+    words[9] = 0;
+    words[10] = 0;
+    if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_written.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 t = NowNs();
+    u64 last = last_tag_log_ns.load(std::memory_order_relaxed);
+    if (t - last > 5'000'000'000ull && last_tag_log_ns.compare_exchange_strong(last, t) && last != 0) {
+        LOG_INFO(Core, "native draw tags: {} written, {} failed, {} skipped (class not enabled)",
+                 tags_written.exchange(0), tags_failed.exchange(0), tags_skipped_class.exchange(0));
+    }
+    return 0;
+}
+
+u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return Tag(ctx, a1, a2, a3, ret, 0);
+}
+u64 PS4_SYSV_ABI TagAuto(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return Tag(ctx, a1, a2, a3, ret, 1);
+}
+
 u64 PS4_SYSV_ABI ProbeIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Probe(ctx, a1, a2, a3, ret, 0);
 }
@@ -440,6 +533,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_indirect") {
         return reinterpret_cast<u64>(&ProbeIndirect);
+    }
+    if (name == "tag_indexed") {
+        return reinterpret_cast<u64>(&TagIndexed);
+    }
+    if (name == "tag_auto") {
+        return reinterpret_cast<u64>(&TagAuto);
     }
     return 0;
 }

@@ -31,6 +31,8 @@ void InitFromSettings() {
     s.dma_async = EmulatorSettings.IsReadbackDmaAsync();
     s.flush_commands = EmulatorSettings.GetCpFlushCommands();
     s.raster_core = EmulatorSettings.GetCpRasterCore();
+    s.native_draw_mode = EmulatorSettings.GetNativeDrawMode();
+    s.native_draw_classes = EmulatorSettings.GetNativeDrawClasses();
 }
 
 bool Set(std::string_view name, s64 value) {
@@ -63,6 +65,10 @@ bool Set(std::string_view name, s64 value) {
         s.flush_commands = static_cast<u32>(value);
     } else if (name == "raster_core") {
         s.raster_core = static_cast<s32>(value);
+    } else if (name == "native_draw_mode") {
+        s.native_draw_mode = static_cast<u32>(value);
+    } else if (name == "native_draw_classes") {
+        s.native_draw_classes = static_cast<u32>(value);
     } else {
         return false;
     }
@@ -94,6 +100,8 @@ nlohmann::json Dump() {
             {"readbacks_mode_override", s.readbacks_mode_override.load()},
             {"flush_commands", s.flush_commands.load()},
             {"raster_core", s.raster_core.load()},
+            {"native_draw_mode", s.native_draw_mode.load()},
+            {"native_draw_classes", s.native_draw_classes.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};
 }

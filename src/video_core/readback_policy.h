@@ -62,6 +62,9 @@ struct State {
     std::atomic<u32> flush_commands{0};
     /// cp_raster_core: logical processor of the raster thread, -1 = not pinned. Applied live.
     std::atomic<s32> raster_core{-1};
+    /// native_draw_mode / native_draw_classes (see emulator_settings.h). Applied live.
+    std::atomic<u32> native_draw_mode{0};
+    std::atomic<u32> native_draw_classes{3};
 };
 
 State& Get();

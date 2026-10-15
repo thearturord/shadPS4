@@ -9,6 +9,7 @@
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "common/unique_function.h"
+#include "video_core/native_draw_tag.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/readback_stats.h"
@@ -113,6 +114,24 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+
+    /// Native draw path: the tag the game wrote for the draw about to be executed (raster thread only).
+    void SetNativeTag(const VideoCore::NativeTag& tag) {
+        native_tag = tag;
+    }
+    /// Anything other than a tagged draw ran: the reuse state is stale.
+    void NativeInvalidate() {
+        native_last.valid = false;
+    }
+    struct NativeStats {
+        u64 tagged{};
+        u64 untagged{};
+        u64 dynamic_skipped{};
+        u64 bind_skipped{};
+    };
+    NativeStats TakeNativeStats() {
+        return std::exchange(native_stats, {});
+    }
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -203,6 +222,15 @@ private:
 
 private:
     friend class VideoCore::BufferCache;
+
+    VideoCore::NativeTag native_tag{};
+    struct NativeLast {
+        bool valid{};
+        u64 k2{};
+        const GraphicsPipeline* pipeline{};
+        u64 tick{};
+    } native_last{};
+    NativeStats native_stats{};
 
     const Instance& instance;
     Scheduler& scheduler;

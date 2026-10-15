@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/native_draw_tag.h"
+
 #include <source_location>
 #include <condition_variable>
 #include <coroutine>
@@ -233,6 +235,8 @@ private:
     struct RasterSplit;
     struct RasterCall;
     struct RasterOp;
+    /// Tag written by the game in front of the next draw (front thread only).
+    VideoCore::NativeTag native_tag_pending{};
     void StartRasterSplit();
     void StopRasterSplit();
     void RasterMain(std::stop_token stoken);

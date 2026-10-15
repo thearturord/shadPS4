@@ -507,10 +507,22 @@ void Liverpool::ExecuteNativeDraw() {
     regs.draw_initiator = 0;
     MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
     RasterCall call{};
-    call.kind = RasterCall::Kind::Draw;
-    call.marker = "gfx:{}:NativeDraw";
-    call.indexed = draw.kind == 0;
-    call.index_offset = draw.start_index;
+    if (draw.kind == 2) {
+        call.kind = RasterCall::Kind::DrawIndirect;
+        call.marker = "gfx:{}:NativeDrawIndexIndirect";
+        call.indexed = true;
+        call.args_addr = draw.args_addr;
+        call.offset = draw.offset;
+        call.stride = sizeof(DrawIndexedIndirectArgs);
+        call.max_count = 1;
+        call.vertex_sgpr_offset = static_cast<u16>(draw.vertex_sgpr);
+        call.instance_sgpr_offset = static_cast<u16>(draw.instance_sgpr);
+    } else {
+        call.kind = RasterCall::Kind::Draw;
+        call.marker = "gfx:{}:NativeDraw";
+        call.indexed = draw.kind == 0;
+        call.index_offset = draw.start_index;
+    }
     RasterDispatch(call);
     for (u32 i = draw.count; i-- > 0;) {
         const u32 index = draw.regs[i].index;

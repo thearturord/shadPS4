@@ -40,6 +40,10 @@ struct ExecDraw {
     u32 count{};
     u32 kind{};        ///< 0 = indexed, 1 = auto
     u32 start_index{}; ///< indexed draws
+    u64 args_addr{};   ///< indirect draws (kind 2)
+    u32 offset{};
+    u32 vertex_sgpr{};
+    u32 instance_sgpr{};
 };
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.

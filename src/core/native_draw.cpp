@@ -492,6 +492,9 @@ struct NativeRecord {
     u32 kind{};
     u32 a1{};
     u32 a2{};
+    u64 args_addr{};      ///< indirect draws: the argument buffer
+    u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
+    u32 instance_sgpr{};
     u32 rt_info{};
     u32 flags{}; ///< RecordFlag bits: why this draw cannot run natively
     /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
@@ -1111,8 +1114,32 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
         SynthesizeUserData(ctx, 1, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
-        slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
-        slot.regs[n++] = {UconfigBase + 0x24d, Rd<u32>(ctx, 0x4724)};
+        if (kind != 2) {
+            slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
+            slot.regs[n++] = {UconfigBase + 0x24d, Rd<u32>(ctx, 0x4724)};
+        }
+        if (kind == 2) {
+            // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
+            // base vertex / start instance (nibbles of a byte in the vertex shader)
+            if (const u64 view = Rd<u64>(ctx, 0x58); view != 0 && a1 != 0 && slot.vs_gnm != 0 &&
+                                                       Rd<u32>(ctx, 0x4acc) == 0) {
+                slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
+                slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
+                slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
+                slot.regs[n++] = {ContextBase + 0x29e, Rd<u32>(view, 0x68)};
+                const u64 args = Rd<u64>(a1, 0x30);
+                slot.args_addr = (args & 0xfffffff8ull) | ((args >> 32) & 0xff) << 32;
+                const u32 locations = Rd<u8>(slot.vs_gnm, 0x27);
+                constexpr u32 VertexStageSgprBase = 0x4c;
+                slot.vertex_sgpr = (locations & 0xf) == 0 ? 0 : (locations & 0xf) + VertexStageSgprBase;
+                slot.instance_sgpr = (locations >> 4) == 0 ? 0 : (locations >> 4) + VertexStageSgprBase;
+                if (Rd<u32>(ctx, 0x60) != 0x39) {
+                    slot.flags |= SpecialPipeline;
+                }
+            } else {
+                slot.flags |= SpecialPipeline;
+            }
+        }
         if (kind == 0) {
             if (const u64 view = Rd<u64>(ctx, 0x58); view != 0) {
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
@@ -1434,6 +1461,10 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.count = n;
     out.kind = slot.kind;
     out.start_index = slot.a2;
+    out.args_addr = slot.args_addr;
+    out.offset = slot.a2;
+    out.vertex_sgpr = slot.vertex_sgpr;
+    out.instance_sgpr = slot.instance_sgpr;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
 
@@ -1523,6 +1554,18 @@ bool ExecEligible(u64 ctx, u64 seq) {
 
 /// What the game's draw functions and PrepareDraw leave in the engine's objects besides command packets.
 void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
+    if (kind == 2) {
+        Wr<u32>(ctx, 0x4720, 0);
+        const u32 stamp = Rd<u32>(ctx, 0x47ac);
+        for (const u64 object : {Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader),
+                                 Rd<u64>(ctx, Ctx::BlendState), Rd<u64>(ctx, Ctx::RasterizerState),
+                                 Rd<u64>(ctx, Ctx::DepthStencilState)}) {
+            if (object != 0) {
+                Wr<u32>(object, 0x2c, stamp);
+            }
+        }
+        return;
+    }
     if (Rd<u32>(ctx, 0x4724) != 1) {
         Wr<u32>(ctx, 0x4724, 1);
     }
@@ -1628,6 +1671,9 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 0);
 }
+u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return Tag(ctx, a1, a2, a3, ret, 2);
+}
 u64 PS4_SYSV_ABI TagAuto(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 1);
 }
@@ -1650,6 +1696,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_auto") {
         return reinterpret_cast<u64>(&ProbeAuto);
+    }
+    if (name == "tag_indirect") {
+        return reinterpret_cast<u64>(&TagIndirect);
     }
     if (name == "prepare_note") {
         return reinterpret_cast<u64>(&PrepareNote);

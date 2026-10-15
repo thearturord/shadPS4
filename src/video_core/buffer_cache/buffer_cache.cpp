@@ -513,6 +513,9 @@ void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark, 
     // Ranges that stop faulting are prefetched until they expire, then re-learned on the next
     // fault. Expiry keeps ranges the game no longer reads from costing downloads forever.
     ApplyPendingUnmarks();
+    if (ReadbackPolicy::ReadbacksMode() == 0) {
+        return;
+    }
     const auto& policy = ReadbackPolicy::Get();
     if (!(policy.prefetch_kinds_mask.load(std::memory_order_relaxed) & fence_kind) ||
         policy.prefetch_mode_override.load(std::memory_order_relaxed) == 0) {
@@ -902,6 +905,10 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    std::unique_lock queue_lock{Vulkan::Scheduler::submit_mutex, std::defer_lock};
+    if (!Vulkan::Scheduler::submit_lock_held) {
+        queue_lock.lock();
+    }
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 

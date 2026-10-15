@@ -355,11 +355,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     if (use_encoder && !direct_active) {
         const u64 signal_value = work_semaphore.NextTick();
-        {
-            std::scoped_lock lk{submit_mutex};
-            if (on_submit) {
-                on_submit(info);
-            }
+        if (on_submit) {
+            on_submit(info); // takes submit_mutex itself when it uses the queue
         }
         if (on_session) {
             on_session();
@@ -377,6 +374,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     std::scoped_lock lk{submit_mutex};
+    struct HeldGuard {
+        HeldGuard() noexcept { submit_lock_held = true; }
+        ~HeldGuard() { submit_lock_held = false; }
+    } held;
     const u64 signal_value = work_semaphore.NextTick();
 
 #if TRACY_GPU_ENABLED

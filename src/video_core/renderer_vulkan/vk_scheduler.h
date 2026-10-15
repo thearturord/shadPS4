@@ -511,6 +511,9 @@ public:
     [[nodiscard]] static bool OnPriorityThread() noexcept;
 
     static std::mutex submit_mutex;
+    /// True on a thread that holds submit_mutex inside SubmitExecution (the submit callback must
+    /// not lock it again).
+    static inline thread_local bool submit_lock_held = false;
 
 private:
     void EndSession();

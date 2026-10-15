@@ -424,6 +424,12 @@ void OnFrame() {
         hook->last_count = total;
     }
     DebugServer::Publish("hooks", std::move(published_calls));
+    if (frame == 600) {
+        for (const auto& hook : hooks) {
+            LOG_INFO(Core, "guest hooks, total calls after 600 frames: {} = {}", hook->name,
+                     hook->counter()->load(std::memory_order_relaxed));
+        }
+    }
     if (frame % 60 == 0) {
         counts_file.flush();
         if (args_file.is_open()) {

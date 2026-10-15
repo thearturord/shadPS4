@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <thread>
+#include "common/arch.h"
 #include "common/debug.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"

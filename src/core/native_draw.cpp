@@ -14,6 +14,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
+#include <string>
 #include "common/logging/log.h"
 #include "core/debug_server.h"
 #include "core/native_draw.h"
@@ -472,6 +473,7 @@ bool WriteDwords(u64 ctx, const u32* words, u32 count) {
 // compared with the register file the rasterizer got from the command packets.
 constexpr u32 ContextBase = 0xA000;
 constexpr u32 UconfigBase = 0xC000;
+constexpr u32 ShBase = 0x2C00;
 constexpr u32 MaxSynthRegs = 256;
 
 struct SynthReg {
@@ -482,6 +484,8 @@ struct SynthReg {
 struct NativeRecord {
     std::atomic<u64> seq{0};
     u32 count{};
+    u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
+    u64 ps_gnm{};
     std::array<SynthReg, MaxSynthRegs> regs{};
 };
 
@@ -509,7 +513,7 @@ DeviceAddresses ResolveDevice() {
     return d;
 }
 
-u32 Synthesize(u64 ctx, SynthReg* out) {
+u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
     const DeviceAddresses dev = ResolveDevice();
     if (dev.device == 0) {
         return 0;
@@ -517,6 +521,7 @@ u32 Synthesize(u64 ctx, SynthReg* out) {
     u32 n = 0;
     const auto context_reg = [&](u32 offset, u32 value) { out[n++] = {ContextBase + offset, value}; };
     const auto uconfig_reg = [&](u32 offset, u32 value) { out[n++] = {UconfigBase + offset, value}; };
+    const auto sh_reg = [&](u32 offset, u32 value) { out[n++] = {ShBase + offset, value}; };
 
     // blend state: CB_BLENDi_CONTROL, CB_BLEND_FACTORS..., CB_TARGET_MASK, blend constant
     {
@@ -687,6 +692,63 @@ u32 Synthesize(u64 ctx, SynthReg* out) {
         context_reg(0x2fc, bits(guard(x_offset, std::fabs(x_scale), qx)));
         context_reg(0x2fd, 0x3f800000);
     }
+    // vertex stage (sceGnmSetVsShader): program address, resource words, outputs, and the fetch shader address in the
+    // first two user data registers; the fetch shader object is cached next to the vertex shader's stage block
+    {
+        const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
+        const u64 gnm = vs ? Rd<u64>(vs, 0x120) : 0;
+        *vs_gnm_out = gnm;
+        if (gnm) {
+            const u64 regs = gnm + 8;
+            const u64 fetch_obj = Rd<u64>(vs + 0x30, 0xe0);
+            const u32 modifier = fetch_obj ? Rd<u32>(fetch_obj, 0x40) : 0;
+            const u64 fetch_addr = fetch_obj ? Rd<u64>(fetch_obj, 0x30) : 0;
+            const u32 r2 = Rd<u32>(regs, 8);
+            sh_reg(0x48, Rd<u32>(regs, 0));
+            sh_reg(0x49, 0);
+            sh_reg(0x4a, modifier == 0 ? r2 : (r2 & 0xfcfffc3fu) | modifier);
+            sh_reg(0x4b, Rd<u32>(regs, 12));
+            context_reg(0x207, Rd<u32>(regs, 24));
+            context_reg(0x1b1, Rd<u32>(regs, 16));
+            context_reg(0x1c3, Rd<u32>(regs, 20));
+            if (fetch_addr) {
+                sh_reg(0x4c, static_cast<u32>(fetch_addr));
+                sh_reg(0x4d, static_cast<u32>(fetch_addr >> 32));
+            }
+            if (fetch_obj) {
+                context_reg(0x2a8, Rd<u32>(fetch_obj, 0x48));
+                context_reg(0x2a9, Rd<u32>(fetch_obj, 0x4c));
+            }
+        }
+    }
+    // pixel stage (sceGnmSetPsShader350)
+    {
+        const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
+        const u64 gnm = ps ? Rd<u64>(ps, 0x120) : 0;
+        *ps_gnm_out = gnm;
+        if (gnm) {
+            const u64 regs = gnm + 8;
+            sh_reg(8, Rd<u32>(regs, 0));
+            sh_reg(9, 0);
+            sh_reg(10, Rd<u32>(regs, 8));
+            sh_reg(11, Rd<u32>(regs, 12));
+            context_reg(0x1c4, Rd<u32>(regs, 16));
+            context_reg(0x1c5, Rd<u32>(regs, 20));
+            context_reg(0x1b3, Rd<u32>(regs, 24));
+            context_reg(0x1b4, Rd<u32>(regs, 28));
+            context_reg(0x1b6, Rd<u32>(regs, 32));
+            context_reg(0x1b8, Rd<u32>(regs, 36));
+            context_reg(0x203, Rd<u32>(regs, 40));
+            context_reg(0x8f, Rd<u32>(regs, 44));
+        } else {
+            sh_reg(8, 0);
+            sh_reg(9, 0);
+            context_reg(0x203, 0);
+            context_reg(0x8f, 0xf);
+        }
+        const bool flag = (ps != 0 && Rd<u8>(ps, 0x107) != 0) || Rd<u8>(ctx, 0x130e8) != 0;
+        context_reg(0x293, flag ? 0x6030000u : 0x6020000u);
+    }
     return n;
 }
 
@@ -700,7 +762,7 @@ u64 MakeRecord(u64 ctx) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
-    slot.count = Synthesize(ctx, slot.regs.data());
+    slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -733,6 +795,8 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     // copy: the guest thread may reuse the slot while this is compared
     std::array<SynthReg, MaxSynthRegs> regs = slot.regs;
     const u32 count = slot.count;
+    const u64 vs_gnm = slot.vs_gnm;
+    const u64 ps_gnm = slot.ps_gnm;
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
         ++verify_stats.draws_missing;
@@ -755,6 +819,29 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         }
     }
     s.draws_with_mismatch += any;
+    if (any || true) {
+        // the first draws of each distinct vertex/pixel shader pair: input table and the actual user data
+        static std::unordered_map<u64, u32> dumped;
+        const u64 pair = vs_gnm * 31 + ps_gnm;
+        if (dumped.size() < 60 && vs_gnm && dumped.emplace(pair, 0).second) {
+            const auto dump_inputs = [&](u64 gnm, u64 inputs_offset) {
+                std::string text;
+                const u32 n_inputs = Rd<u8>(gnm, 3);
+                for (u32 i = 0; i < n_inputs && i < 40; ++i) {
+                    const u64 e = gnm + inputs_offset + i * 4;
+                    text += fmt::format("[{} s{} r{} f{}]", Rd<u8>(e, 0), Rd<u8>(e, 1), Rd<u8>(e, 2), Rd<u8>(e, 3));
+                }
+                return text;
+            };
+            std::string vs_ud, ps_ud;
+            for (u32 i = 0; i < 16; ++i) {
+                vs_ud += fmt::format(" {:x}", reg_array[ShBase + 0x4c + i]);
+                ps_ud += fmt::format(" {:x}", reg_array[ShBase + 0x0c + i]);
+            }
+            LOG_INFO(Core, "native shader dump: vs {:#x} inputs {} | actual vs user data{} | ps {:#x} inputs {} | actual ps user data{}",
+                     vs_gnm, dump_inputs(vs_gnm, 0x28), vs_ud, ps_gnm, ps_gnm ? dump_inputs(ps_gnm, 0x3c) : std::string{}, ps_ud);
+        }
+    }
 
     const u64 now = NowNs();
     if (now - s.last_log_ns > 5'000'000'000ull) {

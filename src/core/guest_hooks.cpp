@@ -20,6 +20,7 @@
 #include "core/cpu_patches.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
+#include "core/native_draw.h"
 #include "core/memory.h"
 
 #ifdef _WIN32
@@ -37,7 +38,7 @@ constexpr u64 RingEntrySize = 64;
 constexpr size_t MinDisplacedBytes = 5; // size of a near jump
 constexpr size_t MaxDisplacedBytes = 15;
 
-enum class Mode { Count, Args, Snap };
+enum class Mode { Count, Args, Snap, Call };
 
 struct Deref {
     u32 reg{};  // index into rdi, rsi, rdx, rcx, r8, r9
@@ -50,6 +51,7 @@ struct Hook {
     std::vector<Deref> derefs;
     std::vector<Deref> snaps; ///< Mode Snap: values read at call time from [reg + offset].
     u64 entry_size{RingEntrySize};
+    u64 handler{}; ///< Mode Call: address of the host function (PS4_SYSV_ABI).
     u64 offset{};
     Mode mode{Mode::Count};
     u8* entry{};
@@ -197,6 +199,61 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
     c.popfq();
 }
 
+/// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
+/// handler(rdi, rsi, rdx, rcx, r8, r9, return address). A non-zero result skips the hooked function (the stub
+/// returns to its caller); zero runs the displaced instructions and continues in the function.
+void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original, size_t displaced,
+                  const u8* resume) {
+    Xbyak::Label handled;
+    const auto save = [&] {
+        c.pushfq();
+        c.push(rax);
+        c.push(rcx);
+        c.push(rdx);
+        c.push(rsi);
+        c.push(rdi);
+        c.push(r8);
+        c.push(r9);
+        c.push(r10);
+        c.push(r11);
+        // 8 bytes for the seventh argument, 128 bytes for xmm0-7; with the 80 bytes above and the return
+        // address, rsp is 16-byte aligned at the call.
+        c.sub(rsp, 136);
+        for (int i = 0; i < 8; ++i) {
+            c.movdqu(ptr[rsp + 8 + 16 * i], Xbyak::Xmm(i));
+        }
+    };
+    const auto restore = [&] {
+        for (int i = 0; i < 8; ++i) {
+            c.movdqu(Xbyak::Xmm(i), ptr[rsp + 8 + 16 * i]);
+        }
+        c.add(rsp, 136);
+        c.pop(r11);
+        c.pop(r10);
+        c.pop(r9);
+        c.pop(r8);
+        c.pop(rdi);
+        c.pop(rsi);
+        c.pop(rdx);
+        c.pop(rcx);
+        c.pop(rax);
+        c.popfq();
+    };
+    save();
+    c.mov(rax, ptr[rsp + 136 + 80]); // return address of the hooked function
+    c.mov(ptr[rsp], rax);
+    c.mov(rax, hook.handler);
+    c.call(rax);
+    c.test(rax, rax);
+    c.jnz(handled, Xbyak::CodeGenerator::T_NEAR);
+    restore();
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
+    c.L(handled);
+    restore();
+    c.ret();
+}
+
 bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     if (hook.offset + 16 > image_size) {
         LOG_ERROR(Core, "guest hook '{}': offset {:#x} is outside the image", hook.name, hook.offset);
@@ -213,7 +270,8 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     std::memcpy(original, entry, displaced);
 
     const u64 storage_size =
-        RingHeaderSize + (hook.mode != Mode::Count ? hook.ring_entries * hook.entry_size : 0) + 64;
+        RingHeaderSize +
+        (hook.mode == Mode::Snap || hook.mode == Mode::Args ? hook.ring_entries * hook.entry_size : 0) + 64;
     hook.storage = std::make_unique<u8[]>(storage_size);
     std::memset(hook.storage.get(), 0, storage_size);
     const auto raw = reinterpret_cast<u64>(hook.storage.get());
@@ -222,6 +280,10 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     const u8* stub = nullptr;
     const bool emitted = EmitInTrampolineArea(entry, [&](Xbyak::CodeGenerator& c) {
         stub = c.getCurr<const u8*>();
+        if (hook.mode == Mode::Call) {
+            EmitCallStub(c, hook, original, displaced, entry + displaced);
+            return true;
+        }
         if (hook.mode != Mode::Count) {
             EmitArgsStub(c, hook);
         } else {
@@ -252,13 +314,17 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
 #endif
     hook.entry = entry;
     LOG_INFO(Core, "guest hook '{}' installed at {:#x} ({} bytes displaced, mode {})", hook.name,
-             reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Snap ? "snap" : hook.mode == Mode::Args ? "args" : "count");
+             reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Call   ? "call"
+                 : hook.mode == Mode::Snap ? "snap"
+                 : hook.mode == Mode::Args ? "args"
+                                           : "count");
     return true;
 }
 
 } // namespace
 
 void InstallForEboot(VAddr base, u64 image_size) {
+    NativeDraw::SetImageBase(base);
     const auto path = ConfigPath();
     if (!std::filesystem::exists(path)) {
         return;
@@ -301,9 +367,19 @@ void InstallForEboot(VAddr base, u64 image_size) {
             }
             {
                 const auto mode_name = item.value("mode", std::string("count"));
-                hook->mode = mode_name == "snap"   ? Mode::Snap
+                hook->mode = mode_name == "call"   ? Mode::Call
+                             : mode_name == "snap" ? Mode::Snap
                              : mode_name == "args" ? Mode::Args
                                                    : Mode::Count;
+            }
+            if (hook->mode == Mode::Call) {
+                hook->handler = NativeDraw::FindHandler(item.value("handler", std::string()));
+                if (hook->handler == 0) {
+                    LOG_ERROR(Core, "guest hook '{}': unknown handler '{}'", hook->name,
+                              item.value("handler", std::string()));
+                    ++failed;
+                    continue;
+                }
             }
             if (hook->mode == Mode::Snap && item.contains("snap")) {
                 static const char* const snap_reg_names[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -369,8 +445,9 @@ void InstallForEboot(VAddr base, u64 image_size) {
     const auto log_dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
     counts_file.open(log_dir / "guest_hooks.csv", std::ios::trunc);
     counts_file << "frame,name,calls,total\n";
-    const bool any_args = std::any_of(hooks.begin(), hooks.end(),
-                                      [](const auto& h) { return h->mode != Mode::Count; });
+    const bool any_args = std::any_of(hooks.begin(), hooks.end(), [](const auto& h) {
+        return h->mode == Mode::Args || h->mode == Mode::Snap;
+    });
     if (std::any_of(hooks.begin(), hooks.end(),
                     [](const auto& h) { return h->mode == Mode::Snap; })) {
         snap_file.open(log_dir / "guest_hooks_snap.csv", std::ios::trunc);
@@ -457,7 +534,7 @@ void OnFrame() {
         if (delta != 0) {
             counts_file << frame << ',' << hook->name << ',' << delta << ',' << total << '\n';
         }
-        if (hook->mode != Mode::Count && args_file.is_open() && delta != 0) {
+        if ((hook->mode == Mode::Args || hook->mode == Mode::Snap) && args_file.is_open() && delta != 0) {
             const u64 first =
                 total - hook->last_count > hook->ring_entries ? total - hook->ring_entries
                                                               : hook->last_count;

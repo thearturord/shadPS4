@@ -38,6 +38,10 @@
 //     "snap": [ { "reg": "rdi", "off": "0x4698", "size": 8 }, ... ] }
 // They go to guest_hooks_snap.csv (frame,name,seq,ret,s0..s7); snap hooks write nothing to the args file.
 //
+// A hook with "mode": "call" and "handler": "<name>" calls a host function registered in native_draw.cpp at every
+// call of the guest function, with the first six integer arguments and the return address. The handler returns
+// non-zero to skip the guest function. Call hooks keep no counters or files.
+//
 // Output (log directory): guest_hooks.csv (frame,name,calls,total), for "args" hooks
 // guest_hooks_args.csv (frame,name,seq,rdi,rsi,rdx,rcx,r8,r9,ret), for hooks with "deref"
 // guest_hooks_deref.csv (frame,name,seq,d0..d5), and write_faults.csv (frame,page) with the pages

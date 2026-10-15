@@ -1891,6 +1891,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.cb_extent_mask = slot.cb_extent_mask;
     out.db_extent = slot.db_extent;
     out.has_extents = slot.kind != 3;
+    out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
@@ -2004,10 +2005,77 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
     return true;
 }
 
+/// A render target that was cleared with a fast clear and is now sampled needs its clear eliminated. The game does it with
+/// a full-screen quad in eliminate mode; the command processor only needs the target's registers, the eliminate mode of
+/// CB_COLOR_CONTROL and the extent hint, which come from the resource's own render target description (+0xb0, hint +0xec).
+std::atomic<u64> track_native{}, track_eliminated{}, track_game_second{}, track_game_depth{};
+
+bool EmitFastClearEliminate(u64 ctx, u64 resource) {
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.kind = 4;
+    slot.flags = 0;
+    slot.a1 = 3;
+    slot.caller = 0;
+    u32 n = 0;
+    for (u32 k = 0; k < 14; ++k) {
+        slot.regs[n++] = {ContextBase + 0x318 + k, Rd<u32>(resource, 0xb0 + k * 4)};
+    }
+    slot.regs[n++] = {ContextBase + 0x202, 0xcc0020u}; // CB_COLOR_CONTROL: eliminate fast clear
+    slot.count = n;
+    slot.cb_extent = {};
+    slot.cb_extent[0] = Rd<u32>(resource, 0xec);
+    slot.cb_extent_mask = 1;
+    slot.seq.store(seq, std::memory_order_release);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (4u << 8) | ExecFlag;
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    return WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1);
+}
+
+/// Native replacement of the game's per-resource tracking for the common cases: usage flags are cleared (the cache
+/// flush has no host effect) and a render target in state 1 / 2 that was cleared with a fast clear gets its clear
+/// eliminated, then state 3. Resources with depth transitions or the second resource (+0x138) keep the game's function.
+void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_track)(u64, u64)) {
+    if (native && Rd<u64>(resource, 0x138) != 0) {
+        track_game_second.fetch_add(1, std::memory_order_relaxed);
+    } else if (native && (Rd<u32>(resource, 0x144) - 1u) < 2) {
+        track_game_depth.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!native || Rd<u64>(resource, 0x138) != 0 || (Rd<u32>(resource, 0x144) - 1u) < 2) {
+        game_track(ctx, resource);
+        return;
+    }
+    track_native.fetch_add(1, std::memory_order_relaxed);
+    if (Rd<u32>(resource, 0x124) == 1) {
+        return;
+    }
+    if (Rd<u32>(resource, 0x134) != 0) {
+        Wr<u32>(resource, 0x134, 0);
+    }
+    const u32 state = Rd<u32>(resource, 0x14c);
+    if (state == 1 || state == 2) {
+        if ((Rd<u8>(resource, 0xc1) & 0x20) != 0 && Rd<u32>(resource, 0xcc) != 0 && !EmitFastClearEliminate(ctx, resource)) {
+            game_track(ctx, resource);
+            return;
+        }
+        track_eliminated.fetch_add(1, std::memory_order_relaxed);
+        Wr<u32>(resource, 0x14c, 3);
+    }
+}
+
 /// The resource tracking at the start of PrepareDraw: for every shader resource view the vertex and pixel shader
 /// use, the game's own tracking function runs (it may write barrier packets or draw internal full-screen quads).
 void RunResourceTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
+    const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
     const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
     // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
@@ -2030,7 +2098,7 @@ void RunResourceTracking(u64 ctx) {
                 }
                 continue;
             }
-            track(ctx, resource);
+            TrackResource(ctx, resource, native, track);
         }
     };
     if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader); valid(vs) && Rd<u8>(vs + 0x30, 0xd6) == 0) {
@@ -2237,6 +2305,9 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
             why += fmt::format(" {}: {};", FallbackNames[k], fallback_counts[k].exchange(0));
         }
         LOG_INFO(Core, "native draws on the packet path:{}", why);
+        LOG_INFO(Core, "native tracking: {} resources, {} fast clear eliminates; game function: {} second resource, {} depth state",
+                 track_native.exchange(0), track_eliminated.exchange(0), track_game_second.exchange(0),
+                 track_game_depth.exchange(0));
     }
     return 0;
 }

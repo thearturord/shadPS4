@@ -537,6 +537,11 @@ void Liverpool::ExecuteNativeDraw() {
         program = saved_program;
         return;
     }
+    // a fast clear eliminate takes the extent hint of its own target for this operation only
+    const auto saved_cb_extent = last_cb_extent;
+    if (draw.cb_extents_only) {
+        native_tag_pending.valid = false;
+    }
     if (draw.has_extents) {
         // the extent hints the game's target bind sends in a trailing NOP packet
         for (u32 slot = 0; slot < NUM_COLOR_BUFFERS && slot < draw.cb_extent.size(); ++slot) {
@@ -544,7 +549,9 @@ void Liverpool::ExecuteNativeDraw() {
                 last_cb_extent[slot].raw = draw.cb_extent[slot];
             }
         }
-        last_db_extent.raw = draw.db_extent;
+        if (!draw.cb_extents_only) {
+            last_db_extent.raw = draw.db_extent;
+        }
     }
     // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
     // for draws that take the packet path, assume the register file holds what they wrote.
@@ -571,11 +578,14 @@ void Liverpool::ExecuteNativeDraw() {
         call.instance_sgpr_offset = static_cast<u16>(draw.instance_sgpr);
     } else {
         call.kind = RasterCall::Kind::Draw;
-        call.marker = "gfx:{}:NativeDraw";
+        call.marker = draw.cb_extents_only ? "gfx:{}:NativeFastClearEliminate" : "gfx:{}:NativeDraw";
         call.indexed = draw.kind == 0;
         call.index_offset = draw.start_index;
     }
     RasterDispatch(call);
+    if (draw.cb_extents_only) {
+        last_cb_extent = saved_cb_extent;
+    }
     for (u32 i = draw.count; i-- > 0;) {
         const u32 index = draw.regs[i].index;
         regs.reg_array[index] = saved[i];

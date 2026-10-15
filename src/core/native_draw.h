@@ -54,6 +54,7 @@ struct ExecDraw {
     u32 cb_extent_mask{};           ///< bit per slot whose hint is set by this draw
     u32 db_extent{};
     bool has_extents{};
+    bool cb_extents_only{}; ///< fast clear eliminate: only the render target extents change
 };
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).

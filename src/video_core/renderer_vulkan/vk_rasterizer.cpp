@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <atomic>
 #include <thread>
 #include "common/arch.h"
@@ -152,6 +153,31 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs
 
 bool Rasterizer::FilterDraw() {
     const auto classified = ClassifyDraw(liverpool->RasterRegs());
+    {
+        // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
+        static std::array<u64, 8> class_counts{};
+        static u64 last_log_ns = 0;
+        ++class_counts[static_cast<size_t>(classified.kind)];
+        const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        if (now - last_log_ns > 5'000'000'000ull) {
+            if (last_log_ns != 0) {
+                LOG_INFO(Render_Vulkan,
+                         "draw classes per 5 s: eliminate fast clear {}, fmask decompress {}, resolve {}, primitive none {}, "
+                         "depth/stencil copy {}, skipped shadow {}, normal {}",
+                         class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)],
+                         class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)],
+                         class_counts[static_cast<size_t>(DrawClass::Resolve)],
+                         class_counts[static_cast<size_t>(DrawClass::PrimitiveNone)],
+                         class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)],
+                         class_counts[static_cast<size_t>(DrawClass::SkipShadow)],
+                         class_counts[static_cast<size_t>(DrawClass::Normal)]);
+            }
+            class_counts = {};
+            last_log_ns = now;
+        }
+    }
     switch (classified.kind) {
     case DrawClass::EliminateFastClear:
         // Clears the render target if FCE is launched before any draws

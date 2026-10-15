@@ -988,9 +988,7 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             sh_reg(0x49, 0);
             // the modifier of the fetch shader object goes into the shader's first resource word; a vertex shader whose
             // fetch object does not exist yet gets it created during this draw
-            if (fetch_obj) {
-                sh_reg(0x4a, (r2 & 0xfcfffc3fu) | modifier);
-            }
+            sh_reg(0x4a, fetch_obj ? (r2 & 0xfcfffc3fu) | modifier : r2);
             sh_reg(0x4b, Rd<u32>(regs, 12));
             context_reg(0x207, Rd<u32>(regs, 24));
             context_reg(0x1b1, Rd<u32>(regs, 16));
@@ -1028,6 +1026,11 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             context_reg(0x1b8, Rd<u32>(regs, 36));
             context_reg(0x203, Rd<u32>(regs, 40));
             context_reg(0x8f, Rd<u32>(regs, 44));
+            // SPI_PS_INPUT_CNTL_n: the interpolant table that follows the shader's input usage table
+            const u64 interpolants = gnm + 0x3c + u64(Rd<u8>(gnm, 3)) * 4;
+            for (u32 k = 0; k < (Rd<u32>(regs, 32) & 0x3f) && k < 32; ++k) {
+                context_reg(0x191 + k, Rd<u16>(interpolants, k * 2));
+            }
         } else {
             sh_reg(8, 0);
             sh_reg(9, 0);
@@ -1046,7 +1049,7 @@ NativeRecord& Slot(u64 seq) {
 }
 
 /// Guest thread: builds the record of a draw. Returns its number.
-u64 MakeRecord(u64 ctx) {
+u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
@@ -1059,6 +1062,18 @@ u64 MakeRecord(u64 ctx) {
         u32 n = slot.count;
         SynthesizeUserData(ctx, 0, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
         SynthesizeUserData(ctx, 1, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
+        // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
+        slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
+        slot.regs[n++] = {UconfigBase + 0x24d, Rd<u32>(ctx, 0x4724)};
+        if (kind == 0) {
+            if (const u64 view = Rd<u64>(ctx, 0x58); view != 0) {
+                slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
+                slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
+                slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
+            }
+            slot.regs[n++] = {ContextBase + 0x29e, static_cast<u32>(a1)};
+        }
         slot.count = n;
     }
     slot.seq.store(seq, std::memory_order_release);
@@ -1078,6 +1093,8 @@ struct VerifyStats {
         u32 actual{};
     };
     std::unordered_map<u32, PerReg> by_register;
+    std::unordered_map<u32, u64> uncovered; ///< registers that changed between draws without being in the record
+    std::unordered_map<u32, std::pair<u32, u32>> uncovered_values; ///< last value and the one before
     u64 last_log_ns{};
 } verify_stats;
 
@@ -1183,6 +1200,52 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         auto& r = s.by_register[0x91000000u];
         r.count += unsupported;
     }
+    {
+        constexpr u32 ContextFirst = 0xA000, ContextCount = 0x400, ShFirst = 0x2C00, ShCount = 0x280, UconfigFirst = 0xC200,
+                      UconfigCount = 0x80;
+        constexpr u32 Total = ContextCount + ShCount + UconfigCount;
+        static std::array<u32, Total> previous{};
+        static std::array<u64, Total> covered_in{};
+        static u64 stamp = 0;
+        static bool have_previous = false;
+        ++stamp;
+        const auto slot_of = [](u32 index) -> u32 {
+            if (index >= ContextFirst && index < ContextFirst + ContextCount) {
+                return index - ContextFirst;
+            }
+            if (index >= ShFirst && index < ShFirst + ShCount) {
+                return ContextCount + index - ShFirst;
+            }
+            if (index >= UconfigFirst && index < UconfigFirst + UconfigCount) {
+                return ContextCount + ShCount + index - UconfigFirst;
+            }
+            return Total;
+        };
+        for (u32 i = 0; i < count; ++i) {
+            if (const u32 slot_index = slot_of(regs[i].index); slot_index < Total) {
+                covered_in[slot_index] = stamp;
+            }
+        }
+        for (u32 c = 0; c < check_count; ++c) {
+            for (u32 k = 0; k < 2; ++k) {
+                if (const u32 slot_index = slot_of(checks[c].reg + k); slot_index < Total) {
+                    covered_in[slot_index] = stamp;
+                }
+            }
+        }
+        for (u32 slot_index = 0; slot_index < Total; ++slot_index) {
+            const u32 index = slot_index < ContextCount ? ContextFirst + slot_index
+                              : slot_index < ContextCount + ShCount ? ShFirst + slot_index - ContextCount
+                                                                    : UconfigFirst + slot_index - ContextCount - ShCount;
+            const u32 value = reg_array[index];
+            if (have_previous && value != previous[slot_index] && covered_in[slot_index] != stamp) {
+                ++s.uncovered[index];
+                s.uncovered_values[index] = {value, previous[slot_index]};
+            }
+            previous[slot_index] = value;
+        }
+        have_previous = true;
+    }
     s.draws_with_mismatch += any;
     if (any || true) {
         // the first draws of each distinct vertex/pixel shader pair: input table and the actual user data
@@ -1203,6 +1266,14 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                 vs_ud += fmt::format(" {:x}", reg_array[ShBase + 0x4c + i]);
                 ps_ud += fmt::format(" {:x}", reg_array[ShBase + 0x0c + i]);
             }
+            std::string ps_words, ps_inputs_cntl;
+            for (u32 i = 0; ps_gnm && i < 40; ++i) {
+                ps_words += fmt::format(" {:x}", Rd<u32>(ps_gnm, i * 4));
+            }
+            for (u32 i = 0; i < 12; ++i) {
+                ps_inputs_cntl += fmt::format(" {:x}", reg_array[ContextBase + 0x191 + i]);
+            }
+            LOG_INFO(Core, "native ps words: gnm {:#x}:{} | actual 0x191..:{}", ps_gnm, ps_words, ps_inputs_cntl);
             LOG_INFO(Core, "native shader dump: vs {:#x} inputs {} | actual vs user data{} | ps {:#x} inputs {} | actual ps user data{}",
                      vs_gnm, dump_inputs(vs_gnm, 0x28), vs_ud, ps_gnm, ps_gnm ? dump_inputs(ps_gnm, 0x3c) : std::string{}, ps_ud);
         }
@@ -1221,9 +1292,21 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                 LOG_INFO(Core, "native front end check: register {:#x} differs {} times (last: built {:#x}, actual {:#x})",
                          top[k].first, top[k].second.count, top[k].second.expected, top[k].second.actual);
             }
+            std::vector<std::pair<u32, u64>> gaps(s.uncovered.begin(), s.uncovered.end());
+            std::ranges::sort(gaps, [](const auto& x, const auto& y) { return x.second > y.second; });
+            std::string gap_text;
+            for (size_t k = 0; k < gaps.size() && k < 90; ++k) {
+                const auto v = s.uncovered_values[gaps[k].first];
+                gap_text += fmt::format("\n  {:#x}: {} draws (last {:#x} was {:#x})", gaps[k].first, gaps[k].second,
+                                        v.first, v.second);
+            }
+            LOG_INFO(Core, "native front end gaps ({} registers changed outside the record, register:draws):{}",
+                     gaps.size(), gap_text);
         }
         s.draws_checked = s.draws_missing = s.registers_compared = s.mismatches = s.draws_with_mismatch = 0;
         s.by_register.clear();
+        s.uncovered.clear();
+        s.uncovered_values.clear();
         s.last_log_ns = now;
     }
 }
@@ -1261,7 +1344,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     std::memcpy(&words[3], &k1, sizeof(u64));
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
-    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx) : 0;
+    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx, kind, a1, a2, a3) : 0;
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;

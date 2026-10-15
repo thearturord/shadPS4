@@ -208,6 +208,9 @@ struct Liverpool::RasterSplit {
     u64 stat_draws_no_reg_change{};
     // Raster thread wall time by kind of work (ns), logged every few seconds.
     u64 ns_draws{};
+    u64 ns_depth_only_draws{}; ///< part of ns_draws spent in draws without a color target (z-prepass, shadows)
+    u64 n_draws{};
+    u64 n_depth_only_draws{};
     u64 ns_dispatches{};
     u64 ns_write_closures{};
     u64 ns_other_closures{};
@@ -616,10 +619,18 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     sp.cs = op.cs;
                 }
                 ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
-                (op.call.kind == RasterCall::Kind::Draw ||
-                         op.call.kind == RasterCall::Kind::DrawIndirect
-                     ? sp.ns_draws
-                     : sp.ns_dispatches) += VideoCore::ReadbackStats::NowNs() - op_start;
+                const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
+                if (op.call.kind == RasterCall::Kind::Draw ||
+                    op.call.kind == RasterCall::Kind::DrawIndirect) {
+                    sp.ns_draws += op_ns;
+                    ++sp.n_draws;
+                    if (sp.regs->color_target_mask.raw == 0) {
+                        sp.ns_depth_only_draws += op_ns;
+                        ++sp.n_depth_only_draws;
+                    }
+                } else {
+                    sp.ns_dispatches += op_ns;
+                }
             } else if (op.closure) {
                 op.closure();
                 (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
@@ -739,12 +750,16 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             Core::DebugServer::Publish(
                 "raster_thread_ms",
                 {{"draws", sp.ns_draws / 1'000'000},
+                 {"depth_only_draws_ms", sp.ns_depth_only_draws / 1'000'000},
+                 {"draw_count", sp.n_draws},
+                 {"depth_only_draw_count", sp.n_depth_only_draws},
                  {"dispatches", sp.ns_dispatches / 1'000'000},
                  {"memory_write_closures", sp.ns_write_closures / 1'000'000},
                  {"other_closures", sp.ns_other_closures / 1'000'000},
                  {"send_command_callbacks", sp.ns_callbacks / 1'000'000},
                  {"note", "wall time per ~5 s interval"}});
             sp.ns_draws = sp.ns_dispatches = sp.ns_write_closures = sp.ns_other_closures = 0;
+            sp.ns_depth_only_draws = sp.n_draws = sp.n_depth_only_draws = 0;
             sp.ns_callbacks = 0;
             // The thread CPU report and the core isolation re-apply run on the housekeeping thread:
             // each took about 70 ms here, which showed as a dip to 50 fps every 5 seconds.

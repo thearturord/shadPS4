@@ -5,7 +5,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "core/debug_server.h"
 #include "core/native_draw.h"
@@ -243,6 +246,19 @@ u64 NowNs() {
         .count();
 }
 
+// Where the constant buffers (vertex and pixel stage) of sampled z-prepass and G-buffer draws live: 64 MB region of the
+// buffer's memory (JsBuffer + 0x30) and size class (D3D11 ByteWidth at +0x180).
+struct CbStats {
+    std::mutex mutex;
+    std::map<u64, u64> region[2]; // [pass] 64 MB region index -> count
+    std::array<u64, 6> size_class[2]{};
+    u64 total[2]{};
+    u64 draws_sampled[2]{};
+    std::map<u64, u64> distinct_objects[2]; // object -> count in the window (capped)
+};
+CbStats cb_stats;
+thread_local u32 sample_counter = 0;
+
 void Publish() {
     nlohmann::json out = nlohmann::json::object();
     for (u32 c = 0; c < NumClasses; ++c) {
@@ -274,10 +290,83 @@ void Publish() {
                  ClassNames[c], draws, p[Shaders], p[InputObjects], p[Targets], p[States], p[ConstantBuffers],
                  p[ShaderResources], p[Samplers], p[VertexBuffers]);
     }
+    {
+        std::scoped_lock lk{cb_stats.mutex};
+        nlohmann::json cbs = nlohmann::json::object();
+        for (u32 pass = 0; pass < 2; ++pass) {
+            nlohmann::json e = nlohmann::json::object();
+            e["draws_sampled"] = cb_stats.draws_sampled[pass];
+            e["constant_buffer_uses"] = cb_stats.total[pass];
+            e["distinct_buffers"] = cb_stats.distinct_objects[pass].size();
+            nlohmann::json regions = nlohmann::json::object();
+            for (const auto& [region, count] : cb_stats.region[pass]) {
+                regions[fmt::format("{:#x}", region << 26)] = count;
+            }
+            e["by_64mb_region"] = regions;
+            e["by_size_le_64_256_1k_4k_64k_more"] = cb_stats.size_class[pass];
+            cbs[pass == 0 ? "z_prepass" : "g_buffer"] = std::move(e);
+            LOG_INFO(Core,
+                     "native draw probe constant buffers {}: sampled draws {}, uses {}, distinct buffers {}, regions {}, "
+                     "size classes (<=64,<=256,<=1k,<=4k,<=64k,more) {} {} {} {} {} {}",
+                     pass == 0 ? "z_prepass" : "g_buffer", cb_stats.draws_sampled[pass], cb_stats.total[pass],
+                     cb_stats.distinct_objects[pass].size(), cb_stats.region[pass].size(),
+                     cb_stats.size_class[pass][0], cb_stats.size_class[pass][1], cb_stats.size_class[pass][2],
+                     cb_stats.size_class[pass][3], cb_stats.size_class[pass][4], cb_stats.size_class[pass][5]);
+            for (const auto& [region, count] : cb_stats.region[pass]) {
+                LOG_INFO(Core, "native draw probe constant buffers {}: region {:#x} uses {}",
+                         pass == 0 ? "z_prepass" : "g_buffer", region << 26, count);
+            }
+            cb_stats.region[pass].clear();
+            cb_stats.size_class[pass] = {};
+            cb_stats.total[pass] = 0;
+            cb_stats.draws_sampled[pass] = 0;
+            cb_stats.distinct_objects[pass].clear();
+        }
+        out["constant_buffers"] = std::move(cbs);
+    }
     DebugServer::Publish("native_draw_probe", std::move(out));
 }
 
 thread_local Signature previous;
+
+
+void SampleConstantBuffers(u64 ctx, Class cls) {
+    if (cls != ZPass && cls != GBuffer) {
+        return;
+    }
+    if ((++sample_counter & 15) != 0) {
+        return;
+    }
+    const u32 pass = cls == ZPass ? 0 : 1;
+    const std::array<u64, 2> shaders{Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader)};
+    std::scoped_lock lk{cb_stats.mutex};
+    cb_stats.draws_sampled[pass]++;
+    for (u64 stage = 0; stage < 2; ++stage) {
+        const u64 shader = shaders[stage];
+        if (!shader) {
+            continue;
+        }
+        const u32 mask = Rd<u32>(shader, Shader::CbMask) & 0xffff;
+        for (u32 slot = 0; slot < 16; ++slot) {
+            if (!((mask >> slot) & 1)) {
+                continue;
+            }
+            const u64 obj = Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8);
+            if (!obj) {
+                continue;
+            }
+            const u64 address = Rd<u64>(obj, 0x30);
+            const u32 bytes = Rd<u32>(obj, 0x180);
+            cb_stats.total[pass]++;
+            cb_stats.region[pass][address >> 26]++;
+            const u32 cls_index = bytes <= 64 ? 0 : bytes <= 256 ? 1 : bytes <= 1024 ? 2 : bytes <= 4096 ? 3 : bytes <= 65536 ? 4 : 5;
+            cb_stats.size_class[pass][cls_index]++;
+            if (cb_stats.distinct_objects[pass].size() < 100000) {
+                cb_stats.distinct_objects[pass][obj]++;
+            }
+        }
+    }
+}
 
 u64 Probe(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     if (ctx == 0) {
@@ -318,6 +407,7 @@ u64 Probe(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
         }
     }
     previous = now;
+    SampleConstantBuffers(ctx, cls);
 
     const u64 t = NowNs();
     u64 last = last_publish_ns.load(std::memory_order_relaxed);

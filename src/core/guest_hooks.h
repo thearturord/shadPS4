@@ -32,6 +32,12 @@
 //   { "name": "Map", "ghidra": "0x247f990", "mode": "args",
 //     "deref": [ { "reg": "rsi", "off": "0x30", "size": 8 }, { "reg": "rsi", "off": "0x124", "size": 4 } ] }
 //
+// A hook with "mode": "snap" records, at call time, up to eight values read from [argument register +
+// offset] (the objects the arguments point to), next to the return address:
+//   { "name": "DrawIndexedCommon", "ghidra": "0x248e080", "mode": "snap",
+//     "snap": [ { "reg": "rdi", "off": "0x4698", "size": 8 }, ... ] }
+// They go to guest_hooks_snap.csv (frame,name,seq,ret,s0..s7); snap hooks write nothing to the args file.
+//
 // Output (log directory): guest_hooks.csv (frame,name,calls,total), for "args" hooks
 // guest_hooks_args.csv (frame,name,seq,rdi,rsi,rdx,rcx,r8,r9,ret), for hooks with "deref"
 // guest_hooks_deref.csv (frame,name,seq,d0..d5), and write_faults.csv (frame,page) with the pages

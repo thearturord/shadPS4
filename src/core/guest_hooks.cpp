@@ -37,7 +37,7 @@ constexpr u64 RingEntrySize = 64;
 constexpr size_t MinDisplacedBytes = 5; // size of a near jump
 constexpr size_t MaxDisplacedBytes = 15;
 
-enum class Mode { Count, Args };
+enum class Mode { Count, Args, Snap };
 
 struct Deref {
     u32 reg{};  // index into rdi, rsi, rdx, rcx, r8, r9
@@ -48,6 +48,8 @@ struct Deref {
 struct Hook {
     std::string name;
     std::vector<Deref> derefs;
+    std::vector<Deref> snaps; ///< Mode Snap: values read at call time from [reg + offset].
+    u64 entry_size{RingEntrySize};
     u64 offset{};
     Mode mode{Mode::Count};
     u8* entry{};
@@ -68,6 +70,7 @@ std::vector<std::unique_ptr<Hook>> hooks;
 std::ofstream counts_file;
 std::ofstream args_file;
 std::ofstream deref_file;
+std::ofstream snap_file;
 std::ofstream fault_file;
 std::atomic<u64> frame_index{0};
 
@@ -155,7 +158,7 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
     c.xadd(qword[r10], r11); // r11 = sequence number of this call
     c.mov(rax, r11);
     c.and_(rax, static_cast<uint32_t>(hook.ring_entries - 1));
-    c.shl(rax, 6);
+    c.shl(rax, hook.entry_size == 128 ? 7 : 6);
     c.lea(r10, ptr[r10 + rax + RingHeaderSize]);
     c.mov(ptr[r10 + 0], rdi);
     c.mov(ptr[r10 + 8], rsi);
@@ -165,6 +168,23 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
     c.mov(ptr[r10 + 40], r9);
     c.mov(rax, ptr[rsp + 32]); // return address: [r11][r10][rax][flags][ret]
     c.mov(ptr[r10 + 48], rax);
+    // Snap mode: values read from the objects the arguments point to, at call time.
+    static const Xbyak::Reg64* const arg_regs[] = {&rdi, &rsi, &rdx, &rcx, &r8, &r9};
+    for (size_t i = 0; i < hook.snaps.size(); ++i) {
+        const auto& snap = hook.snaps[i];
+        const auto& base = *arg_regs[snap.reg];
+        const int disp = static_cast<int>(snap.offset);
+        if (snap.size == 8) {
+            c.mov(rax, ptr[base + disp]);
+        } else if (snap.size == 4) {
+            c.mov(eax, ptr[base + disp]);
+        } else if (snap.size == 2) {
+            c.movzx(eax, word[base + disp]);
+        } else {
+            c.movzx(eax, byte[base + disp]);
+        }
+        c.mov(ptr[r10 + 64 + 8 * static_cast<int>(i)], rax);
+    }
     c.mov(ptr[r10 + 56], r11); // publish
     c.pop(r11);
     c.pop(r10);
@@ -188,7 +208,7 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     std::memcpy(original, entry, displaced);
 
     const u64 storage_size =
-        RingHeaderSize + (hook.mode == Mode::Args ? hook.ring_entries * RingEntrySize : 0) + 64;
+        RingHeaderSize + (hook.mode != Mode::Count ? hook.ring_entries * hook.entry_size : 0) + 64;
     hook.storage = std::make_unique<u8[]>(storage_size);
     std::memset(hook.storage.get(), 0, storage_size);
     const auto raw = reinterpret_cast<u64>(hook.storage.get());
@@ -197,7 +217,7 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     const u8* stub = nullptr;
     const bool emitted = EmitInTrampolineArea(entry, [&](Xbyak::CodeGenerator& c) {
         stub = c.getCurr<const u8*>();
-        if (hook.mode == Mode::Args) {
+        if (hook.mode != Mode::Count) {
             EmitArgsStub(c, hook);
         } else {
             EmitCountStub(c, hook);
@@ -227,7 +247,7 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
 #endif
     hook.entry = entry;
     LOG_INFO(Core, "guest hook '{}' installed at {:#x} ({} bytes displaced, mode {})", hook.name,
-             reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Args ? "args" : "count");
+             reinterpret_cast<u64>(entry), displaced, hook.mode == Mode::Snap ? "snap" : hook.mode == Mode::Args ? "args" : "count");
     return true;
 }
 
@@ -274,7 +294,35 @@ void InstallForEboot(VAddr base, u64 image_size) {
             } else {
                 hook->offset = ParseHex(item.at("offset"));
             }
-            hook->mode = item.value("mode", std::string("count")) == "args" ? Mode::Args : Mode::Count;
+            {
+                const auto mode_name = item.value("mode", std::string("count"));
+                hook->mode = mode_name == "snap"   ? Mode::Snap
+                             : mode_name == "args" ? Mode::Args
+                                                   : Mode::Count;
+            }
+            if (hook->mode == Mode::Snap && item.contains("snap")) {
+                static const char* const snap_reg_names[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+                hook->entry_size = 128;
+                for (const auto& d : item.at("snap")) {
+                    Deref snap;
+                    const auto name = d.at("reg").get<std::string>();
+                    snap.reg = 99;
+                    for (u32 i = 0; i < 6; ++i) {
+                        if (name == snap_reg_names[i]) {
+                            snap.reg = i;
+                        }
+                    }
+                    snap.offset = ParseHex(d.at("off"));
+                    snap.size = d.value("size", 8u);
+                    if (snap.reg == 99 ||
+                        (snap.size != 1 && snap.size != 2 && snap.size != 4 && snap.size != 8) ||
+                        snap.offset > 0x7fffffff || hook->snaps.size() >= 8) {
+                        LOG_ERROR(Core, "guest hook '{}': bad snap entry", hook->name);
+                        continue;
+                    }
+                    hook->snaps.push_back(snap);
+                }
+            }
             if (item.contains("deref")) {
                 static const char* const reg_names[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
                 for (const auto& d : item.at("deref")) {
@@ -317,7 +365,12 @@ void InstallForEboot(VAddr base, u64 image_size) {
     counts_file.open(log_dir / "guest_hooks.csv", std::ios::trunc);
     counts_file << "frame,name,calls,total\n";
     const bool any_args = std::any_of(hooks.begin(), hooks.end(),
-                                      [](const auto& h) { return h->mode == Mode::Args; });
+                                      [](const auto& h) { return h->mode != Mode::Count; });
+    if (std::any_of(hooks.begin(), hooks.end(),
+                    [](const auto& h) { return h->mode == Mode::Snap; })) {
+        snap_file.open(log_dir / "guest_hooks_snap.csv", std::ios::trunc);
+        snap_file << "frame,name,seq,ret,s0,s1,s2,s3,s4,s5,s6,s7\n";
+    }
     if (any_args) {
         args_file.open(log_dir / "guest_hooks_args.csv", std::ios::trunc);
         args_file << "frame,name,seq,rdi,rsi,rdx,rcx,r8,r9,ret\n";
@@ -379,20 +432,31 @@ void OnFrame() {
         if (delta != 0) {
             counts_file << frame << ',' << hook->name << ',' << delta << ',' << total << '\n';
         }
-        if (hook->mode == Mode::Args && args_file.is_open() && delta != 0) {
+        if (hook->mode != Mode::Count && args_file.is_open() && delta != 0) {
             const u64 first =
                 total - hook->last_count > hook->ring_entries ? total - hook->ring_entries
                                                               : hook->last_count;
             for (u64 seq = first; seq < total; ++seq) {
                 const u64 slot = seq & (hook->ring_entries - 1);
                 const auto* entry = reinterpret_cast<const volatile u64*>(
-                    hook->header + RingHeaderSize + slot * RingEntrySize);
-                u64 values[8];
-                for (int i = 0; i < 8; ++i) {
+                    hook->header + RingHeaderSize + slot * hook->entry_size);
+                u64 values[16];
+                for (u64 i = 0; i < hook->entry_size / 8; ++i) {
                     values[i] = entry[i];
                 }
                 if (values[7] != seq) {
                     continue; // not published yet, or overwritten
+                }
+                if (hook->mode == Mode::Snap && snap_file.is_open()) {
+                    snap_file << frame << ',' << hook->name << ',' << seq << std::hex << ',' << values[6];
+                    for (size_t s = 0; s < 8; ++s) {
+                        snap_file << ',';
+                        if (s < hook->snaps.size()) {
+                            snap_file << values[8 + s];
+                        }
+                    }
+                    snap_file << std::dec << '\n';
+                    continue; // snap hooks do not write the argument file
                 }
                 args_file << frame << ',' << hook->name << ',' << seq;
                 args_file << std::hex;
@@ -439,6 +503,9 @@ void OnFrame() {
             deref_file.flush();
         }
         fault_file.flush();
+        if (snap_file.is_open()) {
+            snap_file.flush();
+        }
     }
 }
 

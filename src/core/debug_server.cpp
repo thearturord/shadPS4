@@ -19,6 +19,7 @@
 #include "core/debug_server.h"
 #include "core/memory.h"
 #include "video_core/readback_policy.h"
+#include "video_core/thread_profiler.h"
 #include "video_core/thread_usage.h"
 
 namespace Core::DebugServer {
@@ -210,6 +211,19 @@ nlohmann::json Faults(const Params& params) {
     return j;
 }
 
+nlohmann::json Profile(const Params& params) {
+    std::string thread = "GpuRaster";
+    if (const auto it = params.find("thread"); it != params.end() && !it->second.empty()) {
+        thread = it->second;
+    }
+    const double seconds = static_cast<double>(ParseNumber(params, "seconds", 5));
+    const u32 hz = static_cast<u32>(ParseNumber(params, "hz", 500));
+    const u32 top = static_cast<u32>(std::min<u64>(ParseNumber(params, "top", 25), 200));
+    static std::mutex profile_mutex; // one profile at a time
+    std::scoped_lock lk{profile_mutex};
+    return VideoCore::ProfileThread(thread, seconds, hz, top);
+}
+
 nlohmann::json Policy(const Params&) {
     return VideoCore::ReadbackPolicy::Dump();
 }
@@ -284,6 +298,10 @@ void RegisterBuiltins() {
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);
+    Register("/profile",
+             "?thread=GpuRaster&seconds=5&hz=500&top=25: stack sampling of one thread (functions as "
+             "offsets, resolve with the linker map)",
+             Profile);
     Register("/policy", "readback policy switches (video_core/readback_policy.h)", Policy);
     Register("/set", "?name=value changes readback policy switches (development only)",
              SetPolicy);

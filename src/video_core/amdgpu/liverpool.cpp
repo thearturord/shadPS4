@@ -562,21 +562,39 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             applied_core = wanted;
         }
         {
+            const u64 idle_start = VideoCore::ReadbackStats::NowNs();
+            const u8 front_state_at_idle = sp.front_state.load(std::memory_order_relaxed);
             std::unique_lock lk{sp.mutex};
             Common::CondvarWait(sp.work_cv, lk, stoken,
                                 [&] { return !sp.queue.empty() || num_commands != 0; });
+            {
+                const u64 idle = VideoCore::ReadbackStats::NowNs() - idle_start;
+                sp.stat_raster_idle_ns.fetch_add(idle, std::memory_order_relaxed);
+                sp.raster_idle_ns_by_front_state[front_state_at_idle & 3].fetch_add(
+                    idle, std::memory_order_relaxed);
+            }
             if (stoken.stop_requested() && sp.queue.empty() && num_commands == 0) {
                 return;
             }
             batch.swap(sp.queue);
+            if (!batch.empty()) {
+                const auto& first = batch.front();
+                const size_t kind = first.has_call ? static_cast<size_t>(first.call.kind) : 4;
+                sp.raster_idle_ns_by_next_op[kind].fetch_add(
+                    VideoCore::ReadbackStats::NowNs() - idle_start, std::memory_order_relaxed);
+                sp.raster_idle_count_by_next_op[kind].fetch_add(1, std::memory_order_relaxed);
+            }
             sp.done_cv.notify_all(); // The queue has room again.
         }
         for (auto& op : batch) {
             // Callbacks sent by other threads (fault readbacks, fences) run between operations,
             // like they ran between packets before.
             if (num_commands != 0) {
+                const u64 callback_start = VideoCore::ReadbackStats::NowNs();
                 ProcessCommands();
+                sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
             }
+            const u64 op_start = VideoCore::ReadbackStats::NowNs();
             const u32* p = op.deltas.data();
             const u32* end = p + op.deltas.size();
             while (p < end) {
@@ -598,8 +616,14 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     sp.cs = op.cs;
                 }
                 ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
+                (op.call.kind == RasterCall::Kind::Draw ||
+                         op.call.kind == RasterCall::Kind::DrawIndirect
+                     ? sp.ns_draws
+                     : sp.ns_dispatches) += VideoCore::ReadbackStats::NowNs() - op_start;
             } else if (op.closure) {
                 op.closure();
+                (op.writes_memory ? sp.ns_write_closures : sp.ns_other_closures) +=
+                    VideoCore::ReadbackStats::NowNs() - op_start;
                 if (op.writes_memory) {
                     sp.pending_writes.fetch_sub(1, std::memory_order_acq_rel);
                     std::scoped_lock lk{sp.mutex};
@@ -617,6 +641,118 @@ void Liverpool::RasterMain(std::stop_token stoken) {
         }
         const u64 count = batch.size();
         batch.clear();
+        if (const u64 now = VideoCore::ReadbackStats::NowNs();
+            now - sp.stat_last_log_ns > 5'000'000'000ULL) {
+            const u64 block_start = now;
+            const auto plan_stats = rasterizer->TakePlanStats();
+            if (sp.stat_last_log_ns != 0) {
+                Core::DebugServer::Publish(
+                    "cp_split",
+                    {{"operations", sp.stat_ops},
+                     {"draws_and_dispatches", sp.stat_calls},
+                     {"write_drains", sp.stat_write_drains},
+                     {"draws", sp.stat_draws},
+                     {"draws_no_register_change", sp.stat_draws_no_reg_change},
+                     {"plan_draws_all_stages_same", plan_stats.draws_all_stages_same},
+                     {"plan_draws", plan_stats.draws},
+                     {"note", "counts per ~5 s interval"}});
+                LOG_INFO(Render,
+                         "CP split: {} operations, {} draws/dispatches, {} waits for guest memory "
+                         "writes before a pipeline lookup, front blocked on a full queue {} times, "
+                         "raster thread idle {} ms, "
+                         "draws {} of which {} had no register change since the previous op, "
+                         "stage inputs same as the previous draw: draws {}/{}, stages {}/{} "
+                         "(since the last line)",
+                         sp.stat_ops, sp.stat_calls, sp.stat_write_drains,
+                         sp.stat_front_blocked.exchange(0),
+                         sp.stat_raster_idle_ns.exchange(0) / 1'000'000, sp.stat_draws,
+                         sp.stat_draws_no_reg_change, plan_stats.draws_all_stages_same,
+                         plan_stats.draws, plan_stats.stages_same, plan_stats.stages);
+            }
+            sp.stat_front_blocked = 0;
+            sp.stat_raster_idle_ns = 0;
+            sp.stat_ops = sp.stat_calls = sp.stat_write_drains = 0;
+            sp.stat_draws = sp.stat_draws_no_reg_change = 0;
+            LOG_INFO(Render,
+                     "Raster thread wall time (ms per interval): draws {}, dispatches {}, memory "
+                     "write closures {}, other closures (fences, submit end, flips) {}, "
+                     "SendCommand callbacks {}",
+                     sp.ns_draws / 1'000'000, sp.ns_dispatches / 1'000'000,
+                     sp.ns_write_closures / 1'000'000, sp.ns_other_closures / 1'000'000,
+                     sp.ns_callbacks / 1'000'000);
+            {
+                static constexpr const char* names[] = {"front_working", "front_waiting_for_game_submit",
+                                                        "front_draining_writes", "queue_full"};
+                nlohmann::json idle = nlohmann::json::object();
+                for (size_t i = 0; i < 4; ++i) {
+                    idle[names[i]] = sp.raster_idle_ns_by_front_state[i].exchange(0) / 1'000'000;
+                }
+                Core::DebugServer::Publish("raster_idle_ms_by_what_the_front_was_doing",
+                                           std::move(idle));
+                static constexpr const char* op_names[] = {"draw", "draw_indirect", "dispatch",
+                                                           "dispatch_indirect", "closure"};
+                nlohmann::json by_op = nlohmann::json::object();
+                for (size_t i = 0; i < 5; ++i) {
+                    by_op[op_names[i]] = {
+                        {"idle_ms", sp.raster_idle_ns_by_next_op[i].exchange(0) / 1'000'000},
+                        {"idle_episodes", sp.raster_idle_count_by_next_op[i].exchange(0)}};
+                }
+                Core::DebugServer::Publish("raster_idle_by_kind_of_op_that_ended_it",
+                                           std::move(by_op));
+            }
+            {
+                static constexpr const char* kind_names[] = {"gfx_eop", "gfx_eos", "compute_release",
+                                                             "held_write", "submit_end"};
+                nlohmann::json fences = nlohmann::json::object();
+                for (size_t i = 0; i < fence_latency.size(); ++i) {
+                    auto& stat = fence_latency[i];
+                    const u64 count = stat.count.exchange(0);
+                    const u64 queue_ns = stat.queue_ns.exchange(0);
+                    const u64 gpu_ns = stat.gpu_ns.exchange(0);
+                    const u64 total_ns = stat.total_ns.exchange(0);
+                    const u64 max_ns = stat.max_total_ns.exchange(0);
+                    if (count == 0) {
+                        continue;
+                    }
+                    fences[kind_names[i]] = {
+                        {"fences", count},
+                        {"avg_ms_parsed_to_raster_start", queue_ns / 1e6 / count},
+                        {"avg_ms_raster_start_to_signal", gpu_ns / 1e6 / count},
+                        {"avg_ms_total", total_ns / 1e6 / count},
+                        {"max_ms_total", max_ns / 1e6}};
+                }
+                Core::DebugServer::Publish("fence_latency", std::move(fences));
+            }
+            {
+                nlohmann::json sites = nlohmann::json::object();
+                for (auto& site : sp.write_sites) {
+                    const u32 line = site.line.load(std::memory_order_relaxed);
+                    if (line == 0) {
+                        continue;
+                    }
+                    sites["liverpool.cpp:" + std::to_string(line)] = {
+                        {"writes_queued", site.pushes.exchange(0)},
+                        {"front_wait_ms", site.wait_ns.exchange(0) / 1'000'000}};
+                }
+                Core::DebugServer::Publish("write_drains_by_call_site", std::move(sites));
+            }
+            Core::DebugServer::Publish(
+                "raster_thread_ms",
+                {{"draws", sp.ns_draws / 1'000'000},
+                 {"dispatches", sp.ns_dispatches / 1'000'000},
+                 {"memory_write_closures", sp.ns_write_closures / 1'000'000},
+                 {"other_closures", sp.ns_other_closures / 1'000'000},
+                 {"send_command_callbacks", sp.ns_callbacks / 1'000'000},
+                 {"note", "wall time per ~5 s interval"}});
+            sp.ns_draws = sp.ns_dispatches = sp.ns_write_closures = sp.ns_other_closures = 0;
+            sp.ns_callbacks = 0;
+            // The thread CPU report and the core isolation re-apply run on the housekeeping thread:
+            // each took about 70 ms here, which showed as a dip to 50 fps every 5 seconds.
+            sp.stat_last_log_ns = now;
+            Core::DebugServer::RecordPeriodic(
+                "raster_thread_5s_stats_block",
+                static_cast<double>(VideoCore::ReadbackStats::NowNs() - block_start) / 1e6);
+        }
         {
             std::scoped_lock lk{sp.mutex};
             for (auto& v : recycled) {

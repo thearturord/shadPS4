@@ -1230,6 +1230,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/readback_policy.h
                src/video_core/readback_stats.h
                src/video_core/readback_trace.h
+               src/video_core/thread_profiler.cpp
+               src/video_core/thread_profiler.h
                src/video_core/thread_usage.cpp
                src/video_core/thread_usage.h
                src/video_core/renderdoc.cpp
@@ -1441,6 +1443,13 @@ if (WIN32)
         target_link_options(shadps4 PRIVATE /STACK:0x200000,0x200000)
     else()
         target_link_options(shadps4 PRIVATE -Wl,--stack,2097152)
+    endif()
+
+    # Symbol map (function names for the debug server's /profile; no debug info needed)
+    if (MSVC)
+        target_link_options(shadps4 PRIVATE /MAP)
+    else()
+        target_link_options(shadps4 PRIVATE -Wl,-Map=shadps4.map)
     endif()
 
     # Change base image address

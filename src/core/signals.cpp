@@ -12,6 +12,7 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
 #include "emulator.h"
+#include "video_core/thread_profiler.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -40,6 +41,10 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (pExp != nullptr && pExp->ExceptionRecord != nullptr) {
         code = pExp->ExceptionRecord->ExceptionCode;
         address = pExp->ExceptionRecord->ExceptionAddress;
+    }
+
+    if (VideoCore::IsProfilerUnwinding()) {
+        return EXCEPTION_CONTINUE_SEARCH; // the profiler's own __try handles it
     }
 
     Ucontext guest_context{pExp->ContextRecord};

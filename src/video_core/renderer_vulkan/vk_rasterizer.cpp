@@ -7,6 +7,7 @@
 #include "common/debug.h"
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
+#include "core/native_draw.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -433,6 +434,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     native_last.valid = false;
     if (tag.valid) {
         ++native_stats.tagged;
+        if (tag.seq != 0) {
+            Core::NativeDraw::VerifyRecord(tag.seq, liverpool->RasterRegs().reg_array.data());
+        }
     } else {
         ++native_stats.untagged;
     }

@@ -65,6 +65,7 @@ struct State {
     /// native_draw_mode / native_draw_classes (see emulator_settings.h). Applied live.
     std::atomic<u32> native_draw_mode{0};
     std::atomic<u32> native_draw_classes{3};
+    std::atomic<u32> native_synth_verify{0};
 };
 
 State& Get();

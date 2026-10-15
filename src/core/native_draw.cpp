@@ -6,6 +6,9 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
@@ -461,6 +464,216 @@ bool WriteDwords(u64 ctx, const u32* words, u32 count) {
     return true;
 }
 
+// ---- the native front end: the register state the game's objects describe -------------------------------------------
+// PrepareDraw copies register words that the state objects hold into the command buffer (documents/tlg/spike/
+// WP7_prepare_draw_notes.md). This builds the same words, per draw, straight from the objects. In shadow mode they are
+// compared with the register file the rasterizer got from the command packets.
+constexpr u32 ContextBase = 0xA000;
+constexpr u32 UconfigBase = 0xC000;
+constexpr u32 MaxSynthRegs = 96;
+
+struct SynthReg {
+    u32 index; ///< index in the register file (dword offset)
+    u32 value;
+};
+
+struct NativeRecord {
+    std::atomic<u64> seq{0};
+    u32 count{};
+    std::array<SynthReg, MaxSynthRegs> regs{};
+};
+
+constexpr u32 RecordSlots = 16384;
+std::unique_ptr<NativeRecord[]> records;
+std::once_flag records_once;
+std::atomic<u64> next_seq{1};
+
+struct DeviceAddresses {
+    u64 device{}; ///< JsDevice (global pointer in the eboot)
+    u64 topology_table{};
+    u64 depth_stencil_table{};
+};
+
+DeviceAddresses ResolveDevice() {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    DeviceAddresses d;
+    if (base == 0) {
+        return d;
+    }
+    const auto rt = [&](u64 ghidra) { return base + ghidra - 0x1000000; };
+    d.device = Rd<u64>(rt(0x6b03558), 0);
+    d.topology_table = rt(0x25e0810);
+    d.depth_stencil_table = rt(0x25e07e0);
+    return d;
+}
+
+u32 Synthesize(u64 ctx, SynthReg* out) {
+    const DeviceAddresses dev = ResolveDevice();
+    if (dev.device == 0) {
+        return 0;
+    }
+    u32 n = 0;
+    const auto context_reg = [&](u32 offset, u32 value) { out[n++] = {ContextBase + offset, value}; };
+    const auto uconfig_reg = [&](u32 offset, u32 value) { out[n++] = {UconfigBase + offset, value}; };
+
+    // blend state: CB_BLENDi_CONTROL, CB_BLEND_FACTORS..., CB_TARGET_MASK, blend constant
+    {
+        u64 blend = Rd<u64>(ctx, Ctx::BlendState);
+        if (blend == 0) {
+            blend = Rd<u64>(dev.device, 0x30280);
+        }
+        if (blend) {
+            for (u32 i = 0; i < 8; ++i) {
+                context_reg(0x1e0 + i, Rd<u32>(blend, 0x134 + i * 4) & 0xffff1fff);
+            }
+            context_reg(0x2dc, Rd<u32>(blend, 0x154));
+            u32 mask = Rd<u32>(blend, 0x158);
+            if (Rd<u64>(ctx, 0x130e0) != 0) {
+                mask |= 0xf0000000u;
+            }
+            context_reg(0x8e, mask);
+        }
+        for (u32 i = 0; i < 4; ++i) {
+            context_reg(0x105 + i, Rd<u32>(ctx, Ctx::BlendFactor + i * 4));
+        }
+    }
+    // rasterizer state: PA_SU_SC_MODE_CNTL, PA_CL_CLIP_CNTL
+    {
+        u64 raster = Rd<u64>(ctx, Ctx::RasterizerState);
+        if (raster == 0) {
+            raster = Rd<u64>(dev.device, 0x30278);
+        }
+        if (raster) {
+            context_reg(0x205, Rd<u32>(raster, 0x4c) & 0x393fff);
+            context_reg(0x204, Rd<u32>(raster, 0x50) & 0xf7fe03f);
+        }
+    }
+    // depth-stencil state: DB_DEPTH_CONTROL, DB_STENCILREFMASK(_BF), DB_RENDER_CONTROL-like word
+    {
+        u64 ds = Rd<u64>(ctx, Ctx::DepthStencilState);
+        if (ds == 0) {
+            ds = Rd<u64>(dev.device, 0x30288);
+        }
+        if (ds) {
+            u32 control = Rd<u32>(ds, 0x60);
+            u32 stencil_write_mask = Rd<u8>(ds, 0x66);
+            const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
+            if (dsv) {
+                const u32 flags = Rd<u32>(dsv, 0x48);
+                if (flags & 1) {
+                    const u32 index = Rd<u32>(ds, 0x38);
+                    control = (control & 0xffffff8bu) | ((Rd<u32>(dev.depth_stencil_table, index * 4) & 7u) << 4);
+                }
+                if (flags & 2) {
+                    stencil_write_mask = 0;
+                }
+            }
+            context_reg(0x200, control & 0xc07007ffu);
+            const u32 refmask = (((u32(Rd<u8>(ds, 0x65)) << 8) | (u32(Rd<u8>(ds, 0x67)) << 24)) +
+                                 u32(Rd<u8>(ctx, Ctx::StencilRef))) |
+                                (stencil_write_mask << 16);
+            context_reg(0x10c, refmask);
+            context_reg(0x10d, refmask);
+            context_reg(0x10b, Rd<u32>(ds, 0x68) & 0xffffff);
+        }
+    }
+    // primitive type (VGT_PRIMITIVE_TYPE)
+    {
+        const u32 topology = Rd<u32>(ctx, Ctx::Topology);
+        const u32 value = topology < 10 ? (Rd<u32>(dev.topology_table, topology * 4) & 0x3f) : 9u;
+        uconfig_reg(0x242, value);
+    }
+    return n;
+}
+
+NativeRecord& Slot(u64 seq) {
+    std::call_once(records_once, [] { records = std::make_unique<NativeRecord[]>(RecordSlots); });
+    return records[seq % RecordSlots];
+}
+
+/// Guest thread: builds the record of a draw. Returns its number.
+u64 MakeRecord(u64 ctx) {
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.count = Synthesize(ctx, slot.regs.data());
+    slot.seq.store(seq, std::memory_order_release);
+    return seq;
+}
+
+struct VerifyStats {
+    std::mutex mutex;
+    u64 draws_checked{};
+    u64 draws_missing{};
+    u64 registers_compared{};
+    u64 mismatches{};
+    u64 draws_with_mismatch{};
+    struct PerReg {
+        u64 count{};
+        u32 expected{};
+        u32 actual{};
+    };
+    std::unordered_map<u32, PerReg> by_register;
+    u64 last_log_ns{};
+} verify_stats;
+
+}  // namespace
+
+void VerifyRecord(u64 seq, const u32* reg_array) {
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        std::scoped_lock lk{verify_stats.mutex};
+        ++verify_stats.draws_missing;
+        return;
+    }
+    // copy: the guest thread may reuse the slot while this is compared
+    std::array<SynthReg, MaxSynthRegs> regs = slot.regs;
+    const u32 count = slot.count;
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        std::scoped_lock lk{verify_stats.mutex};
+        ++verify_stats.draws_missing;
+        return;
+    }
+    std::scoped_lock lk{verify_stats.mutex};
+    auto& s = verify_stats;
+    ++s.draws_checked;
+    bool any = false;
+    for (u32 i = 0; i < count; ++i) {
+        ++s.registers_compared;
+        const u32 actual = reg_array[regs[i].index];
+        if (actual != regs[i].value) {
+            ++s.mismatches;
+            any = true;
+            auto& r = s.by_register[regs[i].index];
+            ++r.count;
+            r.expected = regs[i].value;
+            r.actual = actual;
+        }
+    }
+    s.draws_with_mismatch += any;
+
+    const u64 now = NowNs();
+    if (now - s.last_log_ns > 5'000'000'000ull) {
+        if (s.last_log_ns != 0) {
+            std::vector<std::pair<u32, VerifyStats::PerReg>> top(s.by_register.begin(), s.by_register.end());
+            std::ranges::sort(top, [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+            LOG_INFO(Core,
+                     "native front end check: {} draws checked, {} without record, {} registers compared, {} differ "
+                     "({} draws with a difference)",
+                     s.draws_checked, s.draws_missing, s.registers_compared, s.mismatches, s.draws_with_mismatch);
+            for (size_t k = 0; k < top.size() && k < 12; ++k) {
+                LOG_INFO(Core, "native front end check: register {:#x} differs {} times (last: built {:#x}, actual {:#x})",
+                         top[k].first, top[k].second.count, top[k].second.expected, top[k].second.actual);
+            }
+        }
+        s.draws_checked = s.draws_missing = s.registers_compared = s.mismatches = s.draws_with_mismatch = 0;
+        s.by_register.clear();
+        s.last_log_ns = now;
+    }
+}
+
+namespace {
+
 std::atomic<u64> tags_written{};
 std::atomic<u64> tags_skipped_class{};
 std::atomic<u64> tags_failed{};
@@ -492,8 +705,10 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     std::memcpy(&words[3], &k1, sizeof(u64));
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
-    words[9] = 0;
-    words[10] = 0;
+    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx) : 0;
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
     } else {

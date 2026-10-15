@@ -1347,6 +1347,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         std::memcpy(&native_tag_pending.k1, &nop->data_block[2], sizeof(u64));
                         std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
                         std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
+                        std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
                     }
                     break;
                 }

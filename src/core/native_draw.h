@@ -22,4 +22,8 @@ u64 FindHandler(const std::string& name);
 /// Runtime address of the eboot image (callers are classified by their Ghidra address).
 void SetImageBase(VAddr base);
 
+/// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
+/// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).
+void VerifyRecord(u64 seq, const u32* reg_array);
+
 } // namespace Core::NativeDraw

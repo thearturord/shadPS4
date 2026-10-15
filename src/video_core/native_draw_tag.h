@@ -16,9 +16,10 @@ struct NativeTag {
     u64 k1{};   ///< vertex shader, pixel shader, input layout, topology
     u64 k2{};   ///< render targets, depth view, blend / rasterizer / depth-stencil state, viewport
     u64 k3{};   ///< shader resource views and samplers
+    u64 seq{};  ///< native record (0 = none): the register state the game's objects describe for this draw
 };
 
 constexpr u32 NativeTagMagic = 0x4E445447; ///< "NDTG"
-constexpr u32 NativeTagPayloadDwords = 10; ///< magic, meta, k1, k2, k3 (two dwords each)
+constexpr u32 NativeTagPayloadDwords = 12; ///< magic, meta, k1, k2, k3, seq (two dwords each)
 
 } // namespace VideoCore

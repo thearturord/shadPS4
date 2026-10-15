@@ -265,9 +265,8 @@ private:
         bool valid{};
         u64 generation{};
         VideoCore::ImageId image_id{};
-        u32 base_level{};
-        u32 base_layer{};
-        std::array<u8, 48> key{};
+        std::array<u64, 6> key{};
+        VideoCore::TextureCache::ImageDesc desc;
     };
     std::array<CachedTextureLookup, 512> texture_lookup_cache{};
     const bool rt_reuse_enabled;

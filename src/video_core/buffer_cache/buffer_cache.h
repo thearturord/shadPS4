@@ -305,6 +305,9 @@ private:
     IntervalList<Backing> resident_ranges;
     /// Blocks verified resident (block + 1; 0 = empty). Residency is never revoked, so entries stay valid.
     std::array<u64, 4096> resident_block_cache{};
+    /// Ranges of more blocks (vertex and index buffers) verified resident, round robin.
+    std::array<std::pair<u64, u64>, 8> resident_range_cache{};
+    u32 resident_range_next{};
     /// Upload ring ranges already uploaded in the current command buffer (see UntrackedRing).
     struct RingUpload {
         u64 lo{};

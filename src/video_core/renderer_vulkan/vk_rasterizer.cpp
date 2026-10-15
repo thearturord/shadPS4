@@ -1247,57 +1247,50 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& [image_id, desc] = image_bindings[num_images++];
-            std::construct_at(&desc, tsharp, image_desc);
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
+            // Same T# and use as an earlier lookup, no image registered or removed since: the description and the
+            // image FindImage returned are the same again (native_draw_mode >= 2).
+            std::array<u64, 6> key{};
+            static_assert(sizeof(AmdGpu::Image) <= 32);
+            std::memcpy(key.data(), &tsharp, sizeof(AmdGpu::Image));
+            key[4] = u64(image_desc.is_depth) | u64(image_desc.is_atomic) << 8 |
+                     u64(image_desc.is_array) << 16 | u64(image_desc.is_written) << 24 |
+                     u64(image_desc.is_r128) << 32 | u64(image_desc.constant_mip_index) << 40 |
+                     u64(static_cast<u8>(image_desc.mip_fallback_mode)) << 48 |
+                     u64(static_cast<u8>(image_desc.post_op)) << 56;
+            key[5] = u64(i);
+            u64 hash = 0;
+            for (const u64 word : key) {
+                hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+                hash ^= hash >> 29;
             }
+            auto& cached = texture_lookup_cache[hash & 511];
+            const bool native_reuse =
+                VideoCore::ReadbackPolicy::Get().native_draw_mode.load(std::memory_order_relaxed) >=
+                2;
+            if (native_reuse && cached.valid && cached.key == key &&
+                cached.generation == texture_cache.ImageGeneration()) {
+                std::construct_at(&desc, cached.desc);
+                image_id = cached.image_id;
+                texture_cache.TouchFoundImage(image_id);
+            } else {
+                std::construct_at(&desc, tsharp, image_desc);
 
-            {
-                // Same T# and use as an earlier lookup, no image registered or removed since: FindImage would
-                // find the same image again.
-                std::array<u8, 48> key{};
-                static_assert(sizeof(AmdGpu::Image) <= 32);
-                std::memcpy(key.data(), &tsharp, sizeof(AmdGpu::Image));
-                key[32] = image_desc.is_depth;
-                key[33] = image_desc.is_atomic;
-                key[34] = image_desc.is_array;
-                key[35] = image_desc.is_written;
-                key[36] = image_desc.is_r128;
-                key[37] = image_desc.constant_mip_index;
-                key[38] = static_cast<u8>(image_desc.mip_fallback_mode);
-                key[39] = static_cast<u8>(image_desc.post_op);
-                key[40] = static_cast<u8>(i);
-                key[41] = static_cast<u8>(desc.type);
-                u64 hash = 0xcbf29ce484222325ull;
-                for (const u8 byte : key) {
-                    hash = (hash ^ byte) * 0x100000001b3ull;
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    desc.view_info.range.base.level += i;
+                    desc.view_info.range.extent.levels = 1;
                 }
-                auto& cached = texture_lookup_cache[(hash ^ (hash >> 32)) & 511];
-                const bool native_reuse =
-                    VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
-                        std::memory_order_relaxed) >= 2;
-                if (native_reuse && cached.valid && cached.key == key &&
-                    cached.generation == texture_cache.ImageGeneration()) {
-                    image_id = cached.image_id;
-                    desc.view_info.range.base.level = cached.base_level;
-                    desc.view_info.range.base.layer = cached.base_layer;
-                    texture_cache.TouchFoundImage(image_id);
-                } else {
-                    image_id = texture_cache.FindImage(desc);
-                    if (native_reuse) {
-                        cached.valid = true;
-                        cached.generation = texture_cache.ImageGeneration();
-                        cached.image_id = image_id;
-                        cached.base_level = desc.view_info.range.base.level;
-                        cached.base_layer = desc.view_info.range.base.layer;
-                        cached.key = key;
-                    }
+
+                image_id = texture_cache.FindImage(desc);
+                if (native_reuse) {
+                    cached.valid = true;
+                    cached.generation = texture_cache.ImageGeneration();
+                    cached.image_id = image_id;
+                    cached.key = key;
+                    cached.desc = desc;
                 }
             }
             auto* image = &texture_cache.GetImage(image_id);

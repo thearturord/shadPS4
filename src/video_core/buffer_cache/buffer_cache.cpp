@@ -727,6 +727,11 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    for (const auto& [lo, hi] : resident_range_cache) {
+        if (first_block >= lo && last_block < hi) {
+            return;
+        }
+    }
     const bool cacheable = last_block - first_block < 4;
     if (cacheable) {
         bool all_known = true;
@@ -745,6 +750,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             for (u64 block = first_block; block <= last_block; ++block) {
                 resident_block_cache[block & 4095] = block + 1;
             }
+        } else {
+            resident_range_cache[resident_range_next++ & 7] = {first_block, last_block + 1};
         }
     };
 

@@ -234,7 +234,7 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         DrainRaster();
         split_active = false;
         StopRasterSplit();
-        direct_state.Gather(regs);
+        direct_state = front_state;
         raster_state = &direct_state;
         raster_cb_extent = &last_cb_extent;
         raster_db_extent = &last_db_extent;
@@ -318,39 +318,50 @@ void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
     MirrorRegsRaw(dword_offset, count);
 }
 
-void Liverpool::OverlaySet(u32 index, u32 value) {
-    u32& current = regs.reg_array[index];
-    if (current == value) {
+void Liverpool::PushDelta(u32 index, u32 value) {
+    if (!split_active) {
         return;
     }
-    if (!overlay.truth) {
-        overlay.truth = std::make_unique<u32[]>(Regs::NumRegs);
+    auto& pending = split->pending;
+    const size_t old_size = pending.size();
+    pending.resize(old_size + 3);
+    pending[old_size] = index;
+    pending[old_size + 1] = 1;
+    pending[old_size + 2] = value;
+}
+
+void Liverpool::OverlaySet(u32 index, u32 value) {
+    u32* const word = front_state.Word(index);
+    if (word == nullptr || *word == value) {
+        return; // no member of the draw state covers the register, or it already holds the value
+    }
+    if (overlay.bits.empty()) {
         overlay.bits.assign((Regs::NumRegs + 63) / 64, 0);
     }
-    u64& word = overlay.bits[index >> 6];
-    if ((word >> (index & 63) & 1) == 0) {
-        overlay.truth[index] = current;
-        word |= 1ull << (index & 63);
+    u64& bits = overlay.bits[index >> 6];
+    if ((bits >> (index & 63) & 1) == 0) {
+        bits |= 1ull << (index & 63);
         overlay.list.push_back(index);
         if (overlay.list.size() > 32768) {
-            // duplicates pile up only when packets keep rewriting overlaid registers: start over from the truth
-            current = value;
-            MirrorRegsRaw(index, 1);
+            // duplicates pile up only when packets keep rewriting overlaid registers: start over from the register file
+            *word = value;
+            PushDelta(index, value);
             OverlayRestore();
             return;
         }
     }
-    current = value;
-    MirrorRegsRaw(index, 1);
+    *word = value;
+    PushDelta(index, value);
 }
 
 void Liverpool::OverlayRestore() {
     for (const u32 index : overlay.list) {
-        u64& word = overlay.bits[index >> 6];
-        if ((word >> (index & 63) & 1) != 0) {
-            word &= ~(1ull << (index & 63));
-            regs.reg_array[index] = overlay.truth[index];
-            MirrorRegsRaw(index, 1);
+        u64& bits = overlay.bits[index >> 6];
+        if ((bits >> (index & 63) & 1) != 0) {
+            bits &= ~(1ull << (index & 63));
+            u32* const word = front_state.Word(index);
+            *word = regs.reg_array[index]; // what the command packets wrote
+            PushDelta(index, *word);
         }
     }
     overlay.list.clear();
@@ -502,8 +513,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             // internal full-screen quads (resource transitions) run the emulator's embedded vertex shader, whose
             // address has bits above the game's address space in SPI_SHADER_PGM_HI_VS
             match = tag_kind <= 1 && (tag_kind == 0) == call.indexed &&
-                    regs.reg_array[Regs::ShRegWordOffset + 0x49] == 0 &&
-                    (Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == regs.num_indices ||
+                    (front_state.vs_program.address >> 32) == 0 &&
+                    (Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == front_state.num_indices ||
                      Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == Core::NativeDraw::UnknownDrawCount);
             break;
         case RasterCall::Kind::DrawIndirect:
@@ -523,7 +534,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
     }
     if (!split_active) {
-        direct_state.Gather(regs);
+        direct_state = front_state;
         ExecRasterCall(call, nullptr, nullptr);
         return;
     }
@@ -641,10 +652,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             last_db_extent.raw = draw.db_extent;
         }
     }
-    // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
-    // for draws that take the packet path, assume the register file holds what they wrote.
-    // The registers stay as the draw leaves them; the next draw writes only what differs, and a draw of the packet
-    // path first gets the registers its own packets built (RasterDispatch).
+    // The record goes straight into the draw state (and the raster thread's deltas), not through the register file: the
+    // next draw writes only what differs, and a draw of the packet path first gets back what its own packets wrote.
+    // Registers no member of the draw state covers are not needed by anything and are skipped.
     for (u32 i = 0; i < draw.count; ++i) {
         OverlaySet(draw.regs[i].index, draw.regs[i].value);
     }

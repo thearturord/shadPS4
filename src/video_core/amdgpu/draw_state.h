@@ -121,6 +121,11 @@ struct DrawRegs {
             reinterpret_cast<u32*>(this)[word - 1] = value;
         }
     }
+    /// The dword of one register (nullptr for registers no member covers).
+    u32* Word(u32 register_index) {
+        const u32 word = Map()[register_index];
+        return word != 0 ? &reinterpret_cast<u32*>(this)[word - 1] : nullptr;
+    }
     /// Reads one register dword back (0 for registers no member covers); `known` tells which.
     u32 Get(u32 register_index, bool* known = nullptr) const {
         const u32 word = Map()[register_index];

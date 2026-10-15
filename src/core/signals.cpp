@@ -10,6 +10,7 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/threads/pthread.h"
+#include "core/native_draw.h"
 #include "core/signals.h"
 #include "emulator.h"
 #include "video_core/thread_profiler.h"
@@ -43,7 +44,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         address = pExp->ExceptionRecord->ExceptionAddress;
     }
 
-    if (VideoCore::IsProfilerUnwinding()) {
+    if (VideoCore::IsProfilerUnwinding() || Core::NativeDraw::IsGuarded()) {
         return EXCEPTION_CONTINUE_SEARCH; // the profiler's own __try handles it
     }
 

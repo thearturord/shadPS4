@@ -41,6 +41,8 @@ LiveCounters& Live();
 void SetImageBase(VAddr base);
 /// Load address of the game's main module (0 until known).
 VAddr ImageBase();
+/// True on a thread that is running a guarded record build: a fault there is handled by the builder, not fatal.
+bool IsGuarded();
 
 /// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).

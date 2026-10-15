@@ -16,6 +16,9 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "common/logging/log.h"
 #include "core/debug_server.h"
 #include "core/native_draw.h"
@@ -39,6 +42,7 @@ inline T Rd(u64 base, u64 offset) {
     return value;
 }
 
+thread_local bool guard_active;
 thread_local bool bad_object_seen;
 inline u64 Obj(u64 pointer) {
     if (pointer != 0 && !(pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0)) {
@@ -46,6 +50,40 @@ inline u64 Obj(u64 pointer) {
         return 0;
     }
     return pointer;
+}
+
+/// Runs a record builder with a guard: the engine's objects are read without knowing which entries are valid, and a stale
+/// entry that looks like a pointer must not take the game down. A fault ends the build (no record, the packet path).
+using GuardedThunk = u64 (*)(void*);
+#ifdef _WIN32
+__declspec(noinline) u64 RunGuarded(GuardedThunk thunk, void* argument, bool* faulted) {
+    guard_active = true;
+    u64 result = 0;
+    __try {
+        result = thunk(argument);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *faulted = true;
+    }
+    guard_active = false;
+    return result;
+}
+#else
+u64 RunGuarded(GuardedThunk thunk, void* argument, bool*) {
+    return thunk(argument);
+}
+#endif
+std::atomic<u64> guarded_faults{};
+template <typename F>
+u64 Guarded(F&& body) {
+    bool faulted = false;
+    const u64 result = RunGuarded([](void* argument) -> u64 { return (*static_cast<F*>(argument))(); }, &body, &faulted);
+    if (faulted) {
+        if (guarded_faults.fetch_add(1) < 8) {
+            LOG_WARNING(Core, "native record builder: an engine object held a stale pointer, the draw takes the packet path");
+        }
+        return 0;
+    }
+    return result;
 }
 
 namespace Ctx {
@@ -2641,7 +2679,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     std::memcpy(&words[3], &k1, sizeof(u64));
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
-    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx, kind, a1, a2, a3, ret) : 0;
+    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? Guarded([&] { return MakeRecord(ctx, kind, a1, a2, a3, ret); }) : 0;
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
@@ -2760,7 +2798,7 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     if (Rd<u64>(ctx, 0x4670) != 0) {
         RunComputeTracking(ctx);
     }
-    const u64 seq = MakeComputeRecord(ctx, x, y, z, ret);
+    const u64 seq = Guarded([&] { return MakeComputeRecord(ctx, x, y, z, ret); });
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
     words[1] = VideoCore::NativeTagMagic;
@@ -2801,7 +2839,7 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
-    const u64 seq = MakeCopyRecord(ctx, destination, source, bytes, ret);
+    const u64 seq = Guarded([&] { return MakeCopyRecord(ctx, destination, source, bytes, ret); });
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
     words[1] = VideoCore::NativeTagMagic;
@@ -2899,7 +2937,7 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
-    const u64 seq = MakeAscRecord(jcc, x, y, z, ret);
+    const u64 seq = Guarded([&] { return MakeAscRecord(jcc, x, y, z, ret); });
     if (seq == 0) {
         asc_no_record.fetch_add(1, std::memory_order_relaxed);
         Live().asc_no_record.fetch_add(1, std::memory_order_relaxed);
@@ -3101,6 +3139,10 @@ u64 FindHandler(const std::string& name) {
 LiveCounters& Live() {
     static LiveCounters counters;
     return counters;
+}
+
+bool IsGuarded() {
+    return guard_active;
 }
 
 VAddr ImageBase() {

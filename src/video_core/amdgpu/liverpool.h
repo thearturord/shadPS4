@@ -276,13 +276,13 @@ private:
     /// every register that currently holds a record's value, so the packet path (and a fast clear eliminate) gets
     /// its own state back before it runs (front thread only).
     struct NativeOverlay {
-        std::unique_ptr<u32[]> truth;
-        std::vector<u64> bits;
+        std::vector<u64> bits; ///< register indices that hold a record's value
         std::vector<u32> list;
     };
     NativeOverlay overlay;
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
     void OverlaySet(u32 index, u32 value);
+    void PushDelta(u32 index, u32 value);
     void OverlayRestore();
     void OverlayForget(u32 dword_offset, u32 count);
     void OverlayForgetAll();

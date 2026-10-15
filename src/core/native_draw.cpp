@@ -14,6 +14,9 @@
 #include "core/native_draw.h"
 #include "video_core/native_draw_tag.h"
 #include "video_core/readback_policy.h"
+#include "video_core/untracked_ring.h"
+#include "core/memory.h"
+#include "core/address_space.h"
 
 namespace Core::NativeDraw {
 
@@ -505,6 +508,37 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     return 0;
 }
 
+// The frame allocator (AllocFrameGarlic(allocator, size, align)) hands out memory from one ring: base at
+// allocator + 0x18, size in the low half of the first qword. With native_draw_mode 3 and readbacks off the ring is taken out of page tracking.
+std::atomic<bool> ring_checked{false};
+
+u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ring_checked.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) < 3 ||
+        VideoCore::ReadbackPolicy::ReadbacksMode() != 0 || allocator == 0) {
+        return 0;
+    }
+    if (ring_checked.exchange(true)) {
+        return 0;
+    }
+    const u64 base = Rd<u64>(allocator, 0x18);
+    const u64 size = Rd<u64>(allocator, 0x0) & 0xffffffffull;
+    if (base == 0 || (base & 0xfff) != 0 || (size & 0xfff) != 0 || size < (1ull << 20) ||
+        size > (1ull << 30)) {
+        LOG_WARNING(Core, "native draw: frame allocator ring not recognised (base {:#x}, size {:#x})",
+                    base, size);
+        return 0;
+    }
+    VideoCore::UntrackedRing::Get().Set(base, size);
+    // Pages the tracker already protected become writable; nothing protects them again.
+    Core::Memory::Instance()->GetAddressSpace().Protect(base, size, Core::MemoryPermission::ReadWrite);
+    LOG_INFO(Core, "native draw: upload ring {:#x} + {:#x} is no longer page tracked", base, size);
+    return 0;
+}
+
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 0);
 }
@@ -533,6 +567,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_indirect") {
         return reinterpret_cast<u64>(&ProbeIndirect);
+    }
+    if (name == "ring_discover") {
+        return reinterpret_cast<u64>(&RingDiscover);
     }
     if (name == "tag_indexed") {
         return reinterpret_cast<u64>(&TagIndexed);

@@ -18,6 +18,7 @@
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/readback_policy.h"
+#include "video_core/untracked_ring.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -812,10 +813,34 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
-    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
-        copies.emplace_back(total_size_bytes, addr, size);
-        total_size_bytes += size;
-    });
+    const auto add_copy = [&](u64 addr, u64 copy_size) {
+        copies.emplace_back(total_size_bytes, addr, copy_size);
+        total_size_bytes += copy_size;
+    };
+    const auto& ring = UntrackedRing::Get();
+    if (ring.Active() && !is_written) {
+        const auto [lo, hi] = ring.Clip(device_addr, size);
+        if (lo < hi && !memory_tracker->IsRegionGpuModified(lo, hi - lo)) {
+            // Untracked upload ring: nobody told us what the CPU wrote, so the requested part is uploaded.
+            if (device_addr < lo) {
+                memory_tracker->ForEachUploadRange(device_addr, lo - device_addr, is_written, add_copy);
+            }
+            // Read again in the same command buffer: the data cannot have changed since the first upload.
+            auto& done = ring_uploads[(lo >> 6) & 255];
+            const u64 tick = scheduler.CurrentTick();
+            if (done.tick != tick || done.lo > lo || done.hi < hi) {
+                add_copy(lo, hi - lo);
+                done = {lo, hi, tick};
+            }
+            if (hi < device_addr + size) {
+                memory_tracker->ForEachUploadRange(hi, device_addr + size - hi, is_written, add_copy);
+            }
+        } else {
+            memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
+        }
+    } else {
+        memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
+    }
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {

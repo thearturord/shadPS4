@@ -18,6 +18,7 @@
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
+#include "video_core/untracked_ring.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 #ifndef _WIN64
@@ -427,6 +428,23 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        // The upload ring is never write-protected (see untracked_ring.h): protect only what lies outside it.
+        if (const auto& ring = UntrackedRing::Get(); ring.Active()) {
+            const auto [lo, hi] = ring.Clip(address, size);
+            if (lo < hi) {
+                if (address < lo) {
+                    ProtectChecked(address, lo - address, perms);
+                }
+                if (hi < address + size) {
+                    ProtectChecked(hi, address + size - hi, perms);
+                }
+                return;
+            }
+        }
+        ProtectChecked(address, size, perms);
+    }
+
+    void ProtectChecked(VAddr address, size_t size, Core::MemoryPermission perms) {
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         if (perms == Core::MemoryPermission::Write) {

@@ -3049,6 +3049,17 @@ u64 PS4_SYSV_ABI TagModeSwitch(u64 ctx, u64 mode, u64 a2, u64 a3, u64 a4, u64 a5
     return 1;
 }
 
+/// FUN_024712d0(async compute context): a barrier inside the queue. It writes a scratch label, releases it at the end of
+/// the pipe, waits for it and rewrites it; the label is local to the function. The raster thread runs the queue's work in
+/// order, so with execution the barrier is not needed.
+u64 PS4_SYSV_ABI TagAscBarrier(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (jcc == 0 || VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+    Live().asc_barrier_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
@@ -3125,6 +3136,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_mode_switch") {
         return reinterpret_cast<u64>(&TagModeSwitch);
+    }
+    if (name == "tag_asc_barrier") {
+        return reinterpret_cast<u64>(&TagAscBarrier);
     }
     if (name == "tag_fill") {
         return reinterpret_cast<u64>(&TagFill);

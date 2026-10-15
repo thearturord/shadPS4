@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <bitset>
 #include <bit>
 #include <cmath>
 #include <atomic>
@@ -486,6 +487,8 @@ struct NativeRecord {
     u32 count{};
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
     u64 ps_gnm{};
+    u64 dbg_vs{};
+    u64 dbg_fetch{};
     /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
     /// content with what the register `reg` points to in the packet path's state.
     struct TableCheck {
@@ -493,6 +496,8 @@ struct NativeRecord {
         u32 kind;
         u32 dwords;
         u64 address;
+        u32 entry_dwords; ///< size of one table entry (0 = compare the table as a whole)
+        std::array<u64, 2> slot_mask; ///< entries the shader reads (bit per slot); the others hold stale data
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
@@ -573,6 +578,90 @@ void SamplerDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
     }
 }
 
+/// Which dwords of the tables behind user data pointers a shader reads: the scalar loads (`s_load_*`) from the SGPR
+/// pair that holds the pointer. The constant update engine writes only these entries of a table.
+struct ShaderLoads {
+    std::array<std::bitset<256>, 16> loaded; ///< per SGPR (first of the pair): dword offsets read with immediate offsets
+    std::bitset<16> dynamic;                 ///< loads with an SGPR offset: anything may be read
+};
+
+std::mutex shader_loads_mutex;
+std::unordered_map<u64, std::unique_ptr<ShaderLoads>> shader_loads_cache;
+
+const ShaderLoads& ScanShaderLoads(u64 gnm) {
+    std::scoped_lock lk{shader_loads_mutex};
+    auto& entry = shader_loads_cache[gnm];
+    if (entry) {
+        return *entry;
+    }
+    entry = std::make_unique<ShaderLoads>();
+    ShaderLoads& loads = *entry;
+    const u64 code = static_cast<u64>(Rd<u32>(gnm + 8, 0)) << 8;
+    constexpr u32 SignatureWord = 0x5362724f; // "OrbS" of the "OrbShdr" footer after the last instruction
+    for (u32 pc = 0; pc < 0x8000;) {
+        const u32 w = Rd<u32>(code, pc * 4);
+        if (w == SignatureWord) {
+            break;
+        }
+        u32 size = 1;
+        if ((w >> 23) == 0x17F || (w >> 23) == 0x17E || (w >> 23) == 0x17D) { // SOPP, SOPC, SOP1
+            const bool literal = (w & 0xff) == 255 || ((w >> 23) == 0x17E && ((w >> 8) & 0xff) == 255);
+            size += literal;
+        } else if ((w >> 28) == 0xB) { // SOPK
+        } else if ((w >> 30) == 2) {   // SOP2
+            size += (w & 0xff) == 255 || ((w >> 8) & 0xff) == 255;
+        } else if ((w >> 27) == 0x18) { // SMRD
+            const u32 opcode = (w >> 22) & 0x1f;
+            if (opcode <= 4) {
+                const u32 sgpr = ((w >> 9) & 0x3f) * 2;
+                const u32 dwords = 1u << opcode;
+                if ((w >> 8) & 1) {
+                    for (u32 k = 0; k < dwords && sgpr < 16; ++k) {
+                        if ((w & 0xff) + k < 256) {
+                            loads.loaded[sgpr].set((w & 0xff) + k);
+                        }
+                    }
+                } else if (sgpr < 16) {
+                    loads.dynamic.set(sgpr);
+                }
+            }
+        } else if ((w >> 25) == 0x3F || (w >> 25) == 0x3E) { // VOP1, VOPC
+            size += (w & 0x1ff) == 255;
+        } else if ((w >> 31) == 0) { // VOP2
+            const u32 opcode = (w >> 25) & 0x3f;
+            size += (w & 0x1ff) == 255 || opcode == 32 || opcode == 33;
+        } else {
+            const u32 prefix = w >> 26;
+            if (prefix == 0x34 || prefix == 0x36 || prefix == 0x37 || prefix == 0x38 || prefix == 0x3A ||
+                prefix == 0x3C || prefix == 0x3E) { // VOP3, DS, FLAT, MUBUF, MTBUF, MIMG, EXP
+                size = 2;
+            }
+        }
+        pc += size;
+    }
+    return loads;
+}
+
+/// Entries of a table (`entry_dwords` per slot) the shader reads through the pointer in SGPR `sgpr`.
+std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dwords, u32 slots) {
+    std::array<u64, 2> mask{};
+    const bool unknown = loads.dynamic.test(sgpr) || loads.loaded[sgpr].none();
+    for (u32 s = 0; s < slots && s < 128; ++s) {
+        bool used = unknown;
+        for (u32 k = 0; k < entry_dwords && !used; ++k) {
+            const u32 dword = s * entry_dwords + k;
+            used = dword < 256 && loads.loaded[sgpr].test(dword);
+        }
+        if (used) {
+            mask[s >> 6] |= u64(1) << (s & 63);
+        }
+    }
+    return mask;
+}
+
+thread_local u64 dbg_vs;
+thread_local u64 dbg_fetch;
+
 u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
 
 /// User data of one stage (SGPR values the constant update engine would have written): descriptors of the bound
@@ -592,6 +681,8 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
         u32 kind;
         u32* table;
         u32 dwords;
+        u32 entry;
+        std::array<u64, 2> mask;
     };
     std::array<PendingPtr, 8> pending{};
     u32 pending_count = 0;
@@ -668,7 +759,8 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
                 sgpr[start] = static_cast<u32>(address);
                 sgpr[start + 1] = static_cast<u32>(address >> 32);
                 sgpr_set[start] = sgpr_set[start + 1] = false; // compared by content, not by value
-                pending[pending_count++] = {sgpr_base + start, type, table, slots * entry};
+                pending[pending_count++] = {sgpr_base + start, type, table, slots * entry, entry,
+                                            UsedSlots(ScanShaderLoads(gnm), start, entry, slots)};
             }
             break;
         }
@@ -682,7 +774,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
         for (u32 i = 0; i < eud_dwords; ++i) {
             table[i] = eud[i];
         }
-        pending[pending_count++] = {sgpr_base + eud_ptr_sgpr, 27, table, eud_dwords};
+        pending[pending_count++] = {sgpr_base + eud_ptr_sgpr, 27, table, eud_dwords, 0, {}};
     }
     for (u32 r = 0; r < 16; ++r) {
         if (sgpr_set[r]) {
@@ -690,8 +782,12 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
         }
     }
     for (u32 p = 0; p < pending_count && record.check_count < record.checks.size(); ++p) {
-        record.checks[record.check_count++] = {pending[p].sgpr, pending[p].kind, pending[p].dwords,
-                                               reinterpret_cast<u64>(pending[p].table)};
+        record.checks[record.check_count++] = {pending[p].sgpr,
+                                               pending[p].kind,
+                                               pending[p].dwords,
+                                               reinterpret_cast<u64>(pending[p].table),
+                                               pending[p].entry,
+                                               pending[p].mask};
     }
 }
 
@@ -883,6 +979,8 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
         if (gnm) {
             const u64 regs = gnm + 8;
             const u64 fetch_obj = Rd<u64>(vs + 0x30, 0xe0);
+            dbg_vs = vs;
+            dbg_fetch = fetch_obj;
             const u32 modifier = fetch_obj ? Rd<u32>(fetch_obj, 0x40) : 0;
             const u64 fetch_addr = fetch_obj ? Rd<u64>(fetch_obj, 0x30) : 0;
             const u32 r2 = Rd<u32>(regs, 8);
@@ -947,6 +1045,8 @@ u64 MakeRecord(u64 ctx) {
     slot.check_count = 0;
     slot.unsupported_inputs = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    slot.dbg_vs = dbg_vs;
+    slot.dbg_fetch = dbg_fetch;
     {
         u32 n = slot.count;
         SynthesizeUserData(ctx, 0, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
@@ -987,6 +1087,8 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     const u32 count = slot.count;
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
+    const u64 dbg_vs = slot.dbg_vs;
+    const u64 dbg_fetch = slot.dbg_fetch;
     const u32 check_count = slot.check_count;
     const auto checks = slot.checks;
     const u32 unsupported = slot.unsupported_inputs;
@@ -1003,6 +1105,20 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         ++s.registers_compared;
         const u32 actual = reg_array[regs[i].index];
         if (actual != regs[i].value) {
+            if (regs[i].index == ShBase + 0x4c) {
+                static u32 fetch_dumps = 0;
+                if (fetch_dumps < 40 && dbg_vs != 0) {
+                    ++fetch_dumps;
+                    const auto rd = [](u64 base, u64 off) { return base ? Rd<u64>(base, off) : u64{0}; };
+                    const u64 alt = rd(dbg_vs + 0x330, 0xe0);
+                    LOG_INFO(Core,
+                             "native fetch diff: vs {:#x} variant420 {:#x} fetch_obj {:#x} built {:#x} actual {:#x}/{:#x} "
+                             "obj30 {:#x} 38 {:#x} 40 {:#x} 48 {:#x} | variant330 obj {:#x}: 30 {:#x} 40 {:#x}",
+                             dbg_vs, rd(dbg_vs, 0x420), dbg_fetch, regs[i].value, actual, reg_array[ShBase + 0x4d],
+                             rd(dbg_fetch, 0x30), rd(dbg_fetch, 0x38), rd(dbg_fetch, 0x40), rd(dbg_fetch, 0x48), alt,
+                             rd(alt, 0x30), rd(alt, 0x40));
+                }
+            }
             ++s.mismatches;
             any = true;
             auto& r = s.by_register[regs[i].index];
@@ -1019,11 +1135,34 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         bool same = false;
         u32 first_actual = 0;
         if (ptr != 0 && Core::Memory::Instance()->IsValidMapping(ptr, check.dwords * 4)) {
-            same = std::memcmp(reinterpret_cast<const void*>(check.address), reinterpret_cast<const void*>(ptr),
-                               check.dwords * 4) == 0;
+            if (check.entry_dwords == 0) {
+                same = std::memcmp(reinterpret_cast<const void*>(check.address), reinterpret_cast<const void*>(ptr),
+                                   check.dwords * 4) == 0;
+            } else {
+                same = true;
+                for (u32 slot = 0; slot < check.dwords / check.entry_dwords && same; ++slot) {
+                    if (slot < 128 && ((check.slot_mask[slot >> 6] >> (slot & 63)) & 1) != 0) {
+                        same = std::memcmp(reinterpret_cast<const u32*>(check.address) + slot * check.entry_dwords,
+                                           reinterpret_cast<const void*>(ptr + slot * check.entry_dwords * 4),
+                                           check.entry_dwords * 4) == 0;
+                    }
+                }
+            }
             first_actual = Rd<u32>(ptr, 0);
         }
         if (!same) {
+            static u32 table_dumps = 0;
+            if (ptr != 0 && table_dumps < 80 && Core::Memory::Instance()->IsValidMapping(ptr, check.dwords * 4)) {
+                ++table_dumps;
+                std::string text;
+                for (u32 k = 0; k < check.dwords && k < 48; ++k) {
+                    const u32 b = Rd<u32>(check.address, k * 4);
+                    const u32 a = Rd<u32>(ptr, k * 4);
+                    text += b == a ? fmt::format(" {:x}", a) : fmt::format(" [{}:{:x}/{:x}]", k, b, a);
+                }
+                LOG_INFO(Core, "native table diff: kind {} reg {:#x} dwords {} (built/actual):{}", check.kind, check.reg,
+                         check.dwords, text);
+            }
             ++s.mismatches;
             any = true;
             auto& r = s.by_register[0x90000000u + check.kind * 0x100 + (check.reg & 0xff)];

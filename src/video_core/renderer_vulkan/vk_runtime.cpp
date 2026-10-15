@@ -4,6 +4,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/readback_policy.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -709,11 +710,39 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
+    // The lists are only consulted to decide whether a later access needs a barrier. A list that grows
+    // without a barrier in between (thousands of tiny constant buffer ranges) made every insert shift the
+    // vector; with the native draw path on, a list that holds many ranges is replaced by the one range that
+    // covers them all, which can only add a barrier, never drop one.
+    const bool bounded = VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
+                             std::memory_order_relaxed) >= 2;
+    const auto add_range = [bounded](auto& list, const Interval& new_range) {
+        if (!bounded) {
+            list.Add(new_range);
+            return;
+        }
+        if (list.Contains(new_range.start, new_range.end)) {
+            return;
+        }
+        constexpr size_t MaxIntervals = 64;
+        if (list.Size() >= MaxIntervals) {
+            u64 lo = new_range.start;
+            u64 hi = new_range.end;
+            for (const auto& interval : list) {
+                lo = std::min(lo, interval.start);
+                hi = std::max(hi, interval.end);
+            }
+            list.Clear();
+            list.Add({.start = lo, .end = hi});
+            return;
+        }
+        list.Add(new_range);
+    };
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        add_range(resource->write_ranges, range);
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        add_range(resource->read_ranges, range);
     }
 
     memory_barrier.srcStageMask |= src_stage;

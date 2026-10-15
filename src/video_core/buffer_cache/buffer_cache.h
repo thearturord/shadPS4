@@ -303,6 +303,8 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Blocks verified resident (block + 1; 0 = empty). Residency is never revoked, so entries stay valid.
+    std::array<u64, 4096> resident_block_cache{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

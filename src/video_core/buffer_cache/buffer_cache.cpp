@@ -726,6 +726,27 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    const bool cacheable = last_block - first_block < 4;
+    if (cacheable) {
+        bool all_known = true;
+        for (u64 block = first_block; block <= last_block; ++block) {
+            if (resident_block_cache[block & 4095] != block + 1) {
+                all_known = false;
+                break;
+            }
+        }
+        if (all_known) {
+            return;
+        }
+    }
+    const auto remember = [&] {
+        if (cacheable) {
+            for (u64 block = first_block; block <= last_block; ++block) {
+                resident_block_cache[block & 4095] = block + 1;
+            }
+        }
+    };
+
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -734,6 +755,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        remember();
         return;
     }
 
@@ -783,6 +805,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+    remember();
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,

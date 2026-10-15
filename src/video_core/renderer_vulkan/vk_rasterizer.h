@@ -259,6 +259,17 @@ private:
         std::array<u8, 256> inputs{};
     };
     std::array<CachedTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_cache{};
+    /// Sampled images (BindTextures): the result of FindImage for a T# and the way the shader uses it, valid while
+    /// no image was registered or removed (native_draw_mode >= 2).
+    struct CachedTextureLookup {
+        bool valid{};
+        u64 generation{};
+        VideoCore::ImageId image_id{};
+        u32 base_level{};
+        u32 base_layer{};
+        std::array<u8, 48> key{};
+    };
+    std::array<CachedTextureLookup, 512> texture_lookup_cache{};
     const bool rt_reuse_enabled;
     const u32 encoder_debug;
     /// Encoder thread: fences without readbacks wait for all work recorded before them.

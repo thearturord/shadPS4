@@ -1258,7 +1258,48 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            {
+                // Same T# and use as an earlier lookup, no image registered or removed since: FindImage would
+                // find the same image again.
+                std::array<u8, 48> key{};
+                static_assert(sizeof(AmdGpu::Image) <= 32);
+                std::memcpy(key.data(), &tsharp, sizeof(AmdGpu::Image));
+                key[32] = image_desc.is_depth;
+                key[33] = image_desc.is_atomic;
+                key[34] = image_desc.is_array;
+                key[35] = image_desc.is_written;
+                key[36] = image_desc.is_r128;
+                key[37] = image_desc.constant_mip_index;
+                key[38] = static_cast<u8>(image_desc.mip_fallback_mode);
+                key[39] = static_cast<u8>(image_desc.post_op);
+                key[40] = static_cast<u8>(i);
+                key[41] = static_cast<u8>(desc.type);
+                u64 hash = 0xcbf29ce484222325ull;
+                for (const u8 byte : key) {
+                    hash = (hash ^ byte) * 0x100000001b3ull;
+                }
+                auto& cached = texture_lookup_cache[(hash ^ (hash >> 32)) & 511];
+                const bool native_reuse =
+                    VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
+                        std::memory_order_relaxed) >= 2;
+                if (native_reuse && cached.valid && cached.key == key &&
+                    cached.generation == texture_cache.ImageGeneration()) {
+                    image_id = cached.image_id;
+                    desc.view_info.range.base.level = cached.base_level;
+                    desc.view_info.range.base.layer = cached.base_layer;
+                    texture_cache.TouchFoundImage(image_id);
+                } else {
+                    image_id = texture_cache.FindImage(desc);
+                    if (native_reuse) {
+                        cached.valid = true;
+                        cached.generation = texture_cache.ImageGeneration();
+                        cached.image_id = image_id;
+                        cached.base_level = desc.view_info.range.base.level;
+                        cached.base_layer = desc.view_info.range.base.layer;
+                        cached.key = key;
+                    }
+                }
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.

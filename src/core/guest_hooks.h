@@ -58,7 +58,9 @@ bool IsActive();
 /// instruction was set with SetFaultRip) or from an explicit invalidation by a system call (rip 0). Cheap, any thread.
 void NoteWriteFault(VAddr address, u64 size = 1);
 
-/// The guest instruction that caused the write fault being handled on this thread (0 = not a fault).
-void SetFaultRip(u64 rip);
+/// The guest instruction that caused the write fault being handled on this thread (0 = not a fault), and the
+/// first three stack words at that moment (the caller's return address when the faulting code is a leaf
+/// function such as memcpy).
+void SetFaultRip(u64 rip, const u64* stack_words = nullptr);
 
 } // namespace Core::GuestHooks

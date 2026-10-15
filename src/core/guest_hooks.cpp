@@ -81,8 +81,10 @@ struct FaultRecord {
     std::atomic<u64> address{};
     std::atomic<u64> rip{};
     std::atomic<u64> size{};
+    std::atomic<u64> stack[3]{};
 };
 thread_local u64 current_fault_rip = 0;
+thread_local u64 current_fault_stack[3] = {};
 std::unique_ptr<FaultRecord[]> fault_ring;
 std::atomic<u64> fault_head{0};
 u64 fault_tail = 0;
@@ -385,11 +387,14 @@ void InstallForEboot(VAddr base, u64 image_size) {
     }
     fault_ring = std::make_unique<FaultRecord[]>(FaultRingSize);
     fault_file.open(log_dir / "write_faults.csv", std::ios::trunc);
-    fault_file << "frame,page,npages,rip\n";
+    fault_file << "frame,page,npages,rip,st0,st1,st2\n";
 }
 
-void SetFaultRip(u64 rip) {
+void SetFaultRip(u64 rip, const u64* stack_words) {
     current_fault_rip = rip;
+    for (int i = 0; i < 3; ++i) {
+        current_fault_stack[i] = stack_words ? stack_words[i] : 0;
+    }
 }
 
 void NoteWriteFault(VAddr address, u64 size) {
@@ -400,6 +405,9 @@ void NoteWriteFault(VAddr address, u64 size) {
     fault_ring[slot].address.store(address, std::memory_order_relaxed);
     fault_ring[slot].rip.store(current_fault_rip, std::memory_order_relaxed);
     fault_ring[slot].size.store(size, std::memory_order_relaxed);
+    for (int i = 0; i < 3; ++i) {
+        fault_ring[slot].stack[i].store(current_fault_stack[i], std::memory_order_relaxed);
+    }
     fault_ring[slot].frame.store(frame_index.load(std::memory_order_relaxed),
                                  std::memory_order_release);
 }
@@ -432,8 +440,11 @@ void OnFrame() {
             const u64 rip = record.rip.load(std::memory_order_relaxed);
             const u64 npages = ((address + (size ? size : 1) - 1) >> 12) - (address >> 12) + 1;
             if (seen.insert(page ^ (fault_frame << 52) ^ (npages << 40)).second) {
-                fault_file << fault_frame << ',' << std::hex << page << ',' << npages << ',' << rip
-                           << std::dec << '\n';
+                fault_file << fault_frame << ',' << std::hex << page << ',' << npages << ',' << rip;
+                for (int i = 0; i < 3; ++i) {
+                    fault_file << ',' << record.stack[i].load(std::memory_order_relaxed);
+                }
+                fault_file << std::dec << '\n';
             }
         }
         fault_tail = head;

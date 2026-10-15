@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -451,7 +452,17 @@ struct SignalImpl : public PageManager::Impl {
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
 #ifdef ARCH_X86_64
-            Core::GuestHooks::SetFaultRip(reinterpret_cast<u64>(Common::GetRip(context)));
+            {
+                u64 stack_words[3] = {};
+#ifdef _WIN32
+                const u64 rsp = ((EXCEPTION_POINTERS*)context)->ContextRecord->Rsp;
+                if (Core::Memory::Instance()->IsValidMapping(rsp, sizeof(stack_words))) {
+                    std::memcpy(stack_words, reinterpret_cast<const void*>(rsp), sizeof(stack_words));
+                }
+#endif
+                Core::GuestHooks::SetFaultRip(reinterpret_cast<u64>(Common::GetRip(context)),
+                                              stack_words);
+            }
 #endif
             const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
 #ifdef ARCH_X86_64

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 #include "common/types.h"
 
@@ -25,5 +26,23 @@ void SetImageBase(VAddr base);
 /// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).
 void VerifyRecord(u64 seq, const u32* reg_array);
+
+struct ExecRegister {
+    u32 index; ///< index in the register file (dword offset)
+    u32 value;
+};
+
+/// A draw the game's render layer did not write as command packets: the registers its objects describe and the
+/// draw arguments.
+struct ExecDraw {
+    static constexpr u32 MaxRegisters = 320;
+    std::array<ExecRegister, MaxRegisters> regs;
+    u32 count{};
+    u32 kind{};        ///< 0 = indexed, 1 = auto
+    u32 start_index{}; ///< indexed draws
+};
+
+/// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
+bool TakeExecDraw(u64 seq, ExecDraw& out);
 
 } // namespace Core::NativeDraw

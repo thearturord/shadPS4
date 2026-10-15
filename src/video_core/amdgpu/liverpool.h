@@ -237,6 +237,7 @@ private:
     struct RasterOp;
     /// Tag written by the game in front of the next draw (front thread only).
     VideoCore::NativeTag native_tag_pending{};
+    u64 native_exec_calls{};
     void StartRasterSplit();
     void StopRasterSplit();
     void RasterMain(std::stop_token stoken);
@@ -251,6 +252,8 @@ private:
                    std::source_location site = std::source_location::current());
     /// Queues a draw or dispatch. Without the split it runs right away.
     void RasterDispatch(const RasterCall& call);
+    /// Draws the pending native draw tag from its record instead of from command packets.
+    void ExecuteNativeDraw();
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
     void DrainRasterWrites();

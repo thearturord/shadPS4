@@ -66,6 +66,7 @@ struct State {
     std::atomic<u32> native_draw_mode{0};
     std::atomic<u32> native_draw_classes{3};
     std::atomic<u32> native_synth_verify{0};
+    std::atomic<u32> native_draw_exec{0};
 };
 
 State& Get();

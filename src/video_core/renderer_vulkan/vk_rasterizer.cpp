@@ -434,7 +434,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     native_last.valid = false;
     if (tag.valid) {
         ++native_stats.tagged;
-        if (tag.seq != 0) {
+        if (tag.seq != 0 && (tag.meta & VideoCore::NativeTagExecFlag) == 0) {
             Core::NativeDraw::VerifyRecord(tag.seq, liverpool->RasterRegs().reg_array.data());
         }
     } else {

@@ -34,6 +34,7 @@ void InitFromSettings() {
     s.native_draw_mode = EmulatorSettings.GetNativeDrawMode();
     s.native_draw_classes = EmulatorSettings.GetNativeDrawClasses();
     s.native_synth_verify = EmulatorSettings.IsNativeSynthVerify() ? 1 : 0;
+    s.native_draw_exec = EmulatorSettings.IsNativeDrawExec() ? 1 : 0;
 }
 
 bool Set(std::string_view name, s64 value) {
@@ -72,6 +73,8 @@ bool Set(std::string_view name, s64 value) {
         s.native_draw_classes = static_cast<u32>(value);
     } else if (name == "native_synth_verify") {
         s.native_synth_verify = static_cast<u32>(value);
+    } else if (name == "native_draw_exec") {
+        s.native_draw_exec = static_cast<u32>(value);
     } else {
         return false;
     }

@@ -489,6 +489,9 @@ struct NativeRecord {
     u64 ps_gnm{};
     u64 dbg_vs{};
     u64 dbg_fetch{};
+    u32 kind{};
+    u32 a1{};
+    u32 a2{};
     u32 rt_info{};
     u32 flags{}; ///< RecordFlag bits: why this draw cannot run natively
     /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
@@ -518,6 +521,13 @@ constexpr u32 RecordSlots = 16384;
 std::unique_ptr<NativeRecord[]> records;
 std::once_flag records_once;
 std::atomic<u64> next_seq{1};
+std::atomic<u64> consumed_seq{0};
+
+void NoteConsumed(u64 seq) {
+    u64 seen = consumed_seq.load(std::memory_order_relaxed);
+    while (seq > seen && !consumed_seq.compare_exchange_weak(seen, seq, std::memory_order_relaxed)) {
+    }
+}
 
 struct DeviceAddresses {
     u64 device{}; ///< JsDevice (global pointer in the eboot)
@@ -1090,6 +1100,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
     slot.flags = synth_flags;
     slot.rt_info = synth_rt_info;
+    slot.kind = kind;
+    slot.a1 = static_cast<u32>(a1);
+    slot.a2 = static_cast<u32>(a2);
     slot.dbg_vs = dbg_vs;
     slot.dbg_fetch = dbg_fetch;
     {
@@ -1143,6 +1156,7 @@ struct VerifyStats {
 }  // namespace
 
 void VerifyRecord(u64 seq, const u32* reg_array) {
+    NoteConsumed(seq);
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
@@ -1402,12 +1416,129 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     }
 }
 
+bool TakeExecDraw(u64 seq, ExecDraw& out) {
+    NoteConsumed(seq);
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        return false;
+    }
+    u32 n = 0;
+    for (u32 i = 0; i < slot.count && n < ExecDraw::MaxRegisters - 2 * slot.check_count; ++i) {
+        out.regs[n++] = {slot.regs[i].index, slot.regs[i].value};
+    }
+    for (u32 c = 0; c < slot.check_count; ++c) {
+        const auto& check = slot.checks[c];
+        out.regs[n++] = {check.reg, static_cast<u32>(check.address)};
+        out.regs[n++] = {check.reg + 1, static_cast<u32>(check.address >> 32)};
+    }
+    out.count = n;
+    out.kind = slot.kind;
+    out.start_index = slot.a2;
+    return slot.seq.load(std::memory_order_acquire) == seq;
+}
+
 namespace {
 
 std::atomic<u64> tags_written{};
 std::atomic<u64> tags_skipped_class{};
 std::atomic<u64> tags_failed{};
 std::atomic<u64> last_tag_log_ns{0};
+
+constexpr u32 ExecFlag = 1u << 16; ///< tag meta: the draw is executed from its record, the game wrote no packets for it
+constexpr u32 AuditEvery = 64;
+
+struct ExecContextState {
+    u64 ctx{};
+    u64 target_signature{}; ///< render targets as the game's own path last bound them
+    u32 draws{};
+};
+
+thread_local std::array<ExecContextState, 4> exec_states;
+thread_local u32 exec_state_next;
+
+ExecContextState& ExecState(u64 ctx) {
+    for (auto& state : exec_states) {
+        if (state.ctx == ctx) {
+            return state;
+        }
+    }
+    auto& state = exec_states[exec_state_next++ % exec_states.size()];
+    state = {};
+    state.ctx = ctx;
+    return state;
+}
+
+/// Hash of everything PrepareDraw writes for the render and depth targets.
+u64 TargetSignature(u64 ctx) {
+    Hasher h;
+    const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+    h.Add(count);
+    const auto add_view = [&](u64 view) {
+        h.Add(view);
+        if (view) {
+            for (u32 k = 0; k < 14; ++k) {
+                h.Add(Rd<u32>(view + 0x54, k * 4));
+            }
+        }
+    };
+    for (u32 slot = 0; slot < 7; ++slot) {
+        add_view(slot < count ? Rd<u64>(ctx, Ctx::RenderTargets + slot * 8) : 0);
+    }
+    add_view(Rd<u64>(ctx, 0x130e0));
+    const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
+    h.Add(dsv);
+    if (dsv) {
+        for (u32 k = 0; k < 12; ++k) {
+            h.Add(Rd<u32>(dsv + 0x58, k * 4));
+        }
+        h.Add(Rd<u64>(dsv, 0x30));
+    }
+    return h.h | 1;
+}
+
+/// The game's own path runs PrepareDraw: remember the targets it bound.
+u64 PS4_SYSV_ABI PrepareNote(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx != 0 && VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
+        ExecState(ctx).target_signature = TargetSignature(ctx);
+    }
+    return 0;
+}
+
+std::atomic<u64> exec_drawn{};
+std::atomic<u64> exec_fallback{};
+
+bool ExecEligible(u64 ctx, u64 seq) {
+    if (Slot(seq).flags != 0 || (Rd<u8>(ctx, 0x13009) & 1) != 0 || (Rd<u8>(ctx, 0x48de) & 1) != 0) {
+        return false;
+    }
+    if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+        return false;
+    }
+    auto& state = ExecState(ctx);
+    if (state.target_signature == 0 || state.target_signature != TargetSignature(ctx)) {
+        return false;
+    }
+    return (++state.draws % AuditEvery) != 0;
+}
+
+/// What the game's draw functions and PrepareDraw leave in the engine's objects besides command packets.
+void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
+    if (Rd<u32>(ctx, 0x4724) != 1) {
+        Wr<u32>(ctx, 0x4724, 1);
+    }
+    Wr<u32>(ctx, 0x479c, static_cast<u32>(kind == 0 ? a3 : a2));
+    Wr<u32>(ctx, 0x47a0, 0);
+    Wr<u32>(ctx, 0x30, Rd<u32>(ctx, 0x30) + 1);
+    Wr<u32>(ctx, 0x38, Rd<u32>(ctx, 0x38) + static_cast<u32>(a1));
+    const u32 stamp = Rd<u32>(ctx, 0x47ac);
+    for (const u64 object : {Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader),
+                             Rd<u64>(ctx, Ctx::BlendState), Rd<u64>(ctx, Ctx::RasterizerState),
+                             Rd<u64>(ctx, Ctx::DepthStencilState)}) {
+        if (object != 0) {
+            Wr<u32>(object, 0x2c, stamp);
+        }
+    }
+}
 
 u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
@@ -1439,16 +1570,26 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
+    const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq);
+    if (exec) {
+        words[2] |= ExecFlag;
+    }
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
+        if (exec) {
+            ExecSideEffects(ctx, kind, a1, a2, a3);
+            exec_drawn.fetch_add(1, std::memory_order_relaxed);
+            return 1;
+        }
     } else {
         tags_failed.fetch_add(1, std::memory_order_relaxed);
     }
     const u64 t = NowNs();
     u64 last = last_tag_log_ns.load(std::memory_order_relaxed);
     if (t - last > 5'000'000'000ull && last_tag_log_ns.compare_exchange_strong(last, t) && last != 0) {
-        LOG_INFO(Core, "native draw tags: {} written, {} failed, {} skipped (class not enabled)",
-                 tags_written.exchange(0), tags_failed.exchange(0), tags_skipped_class.exchange(0));
+        LOG_INFO(Core, "native draw tags: {} written, {} failed, {} skipped (class not enabled), {} drawn from records",
+                 tags_written.exchange(0), tags_failed.exchange(0), tags_skipped_class.exchange(0),
+                 exec_drawn.exchange(0));
     }
     return 0;
 }
@@ -1509,6 +1650,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_auto") {
         return reinterpret_cast<u64>(&ProbeAuto);
+    }
+    if (name == "prepare_note") {
+        return reinterpret_cast<u64>(&PrepareNote);
     }
     if (name == "draw_probe_indirect") {
         return reinterpret_cast<u64>(&ProbeIndirect);

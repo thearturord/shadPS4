@@ -20,6 +20,7 @@ struct NativeTag {
 };
 
 constexpr u32 NativeTagMagic = 0x4E445447; ///< "NDTG"
+constexpr u32 NativeTagExecFlag = 1u << 16; ///< meta: the draw is executed from its record, no packets follow
 constexpr u32 NativeTagPayloadDwords = 12; ///< magic, meta, k1, k2, k3, seq (two dwords each)
 
 } // namespace VideoCore

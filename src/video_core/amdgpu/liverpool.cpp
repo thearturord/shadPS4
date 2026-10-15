@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
+#include "core/native_draw.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -483,6 +484,41 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                   "{:#x}); a register write is not mirrored",
                   count, first, a[first], b[first]);
     }
+}
+
+void Liverpool::ExecuteNativeDraw() {
+    native_exec_calls++;
+    Core::NativeDraw::ExecDraw draw;
+    if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw)) {
+        native_tag_pending.valid = false;
+        LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
+        return;
+    }
+    // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
+    // for draws that take the packet path, assume the register file holds what they wrote.
+    std::array<u32, Core::NativeDraw::ExecDraw::MaxRegisters> saved;
+    for (u32 i = 0; i < draw.count; ++i) {
+        const u32 index = draw.regs[i].index;
+        saved[i] = regs.reg_array[index];
+        regs.reg_array[index] = draw.regs[i].value;
+        MirrorRegs(index, 1);
+    }
+    const u32 saved_initiator = regs.draw_initiator;
+    regs.draw_initiator = 0;
+    MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
+    RasterCall call{};
+    call.kind = RasterCall::Kind::Draw;
+    call.marker = "gfx:{}:NativeDraw";
+    call.indexed = draw.kind == 0;
+    call.index_offset = draw.start_index;
+    RasterDispatch(call);
+    for (u32 i = draw.count; i-- > 0;) {
+        const u32 index = draw.regs[i].index;
+        regs.reg_array[index] = saved[i];
+        MirrorRegs(index, 1);
+    }
+    regs.draw_initiator = saved_initiator;
+    MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
 }
 
 void Liverpool::CpWriteData(void* address, const u32* data, u32 data_size, u32 queue) {
@@ -1348,6 +1384,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
                         std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
                         std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
+                        if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
+                            ExecuteNativeDraw();
+                        }
                     }
                     break;
                 }

@@ -2107,6 +2107,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.count = n;
     out.kind = slot.kind;
     out.start_index = slot.a2;
+    out.a1 = slot.a1;
     out.args_addr = slot.args_addr;
     out.offset = slot.a2;
     out.vertex_sgpr = slot.vertex_sgpr;
@@ -2899,6 +2900,46 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     return 1;
 }
 
+/// FUN_02485c00(context, destination, dwords, source, source dwords): the SDK's compute copy with wrap, a shader that
+/// writes destination[i] = source[i mod size]. Every call of the game has a source of one dword: a buffer fill. With
+/// execution it is a fill operation of the command processor (record kind 6); any other size keeps the game's path.
+u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u64 size_arg, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const u32 count = static_cast<u32>(count_arg);
+    const u32 size = static_cast<u32>(size_arg);
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        ctx == 0 || size != 1 || count == 0 || count > (64u << 20) / 4 || source == 0 || destination == 0 ||
+        (Rd<u8>(ctx, 0xe849) & 1) != 0 || (destination & 3) != 0) {
+        return 0;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.count = 0;
+    slot.kind = 6;
+    slot.flags = 0;
+    slot.caller = ret;
+    slot.a1 = count;
+    slot.a2 = Rd<u32>(source, 0); // the value the shader would read
+    slot.args_addr = destination;
+    slot.seq.store(seq, std::memory_order_release);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (6u << 8) | ExecFlag;
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!WriteDwordsAt(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    Live().fill_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
@@ -2972,6 +3013,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_cs_copy") {
         return reinterpret_cast<u64>(&TagCsCopyHandler);
+    }
+    if (name == "tag_fill") {
+        return reinterpret_cast<u64>(&TagFill);
     }
     if (name == "tag_prepare_draw") {
         return reinterpret_cast<u64>(&PrepareDrawHook);

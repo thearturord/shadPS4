@@ -28,7 +28,7 @@ constexpr u32 UnknownDrawCount = 0xfffffffe;
 struct LiveCounters {
     std::atomic<u64> gfx_tags{}, gfx_exec{};
     std::atomic<u64> compute_tags{}, compute_exec{};
-    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{};
+    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
     /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
@@ -72,6 +72,7 @@ struct ExecDraw {
     u32 cb_extent_mask{};           ///< bit per slot whose hint is set by this draw
     u32 db_extent{};
     bool has_extents{};
+    u32 a1{}; ///< kind 6 (buffer fill): number of dwords; start_index holds the value, args_addr the destination
     bool cb_extents_only{}; ///< fast clear eliminate: only the render target extents change
 };
 

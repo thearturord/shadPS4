@@ -520,6 +520,18 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
     }
+    if (draw.kind == 6) {
+        // buffer fill: destination, value and the number of dwords travel in the record
+        native_tag_pending.valid = false;
+        if (rasterizer) {
+            RasterRun(
+                [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u] {
+                    rasterizer->FillBuffer(destination, bytes, value, false);
+                },
+                false, true);
+        }
+        return;
+    }
     if (draw.kind == 3) {
         // dispatch: the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
         ComputeProgram& program = GetCsRegs();

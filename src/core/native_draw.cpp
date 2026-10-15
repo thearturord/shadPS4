@@ -486,6 +486,17 @@ struct NativeRecord {
     u32 count{};
     u64 vs_gnm{}; ///< Gnm shader binaries of the draw (for the shader input dump)
     u64 ps_gnm{};
+    /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
+    /// content with what the register `reg` points to in the packet path's state.
+    struct TableCheck {
+        u32 reg;
+        u32 kind;
+        u32 dwords;
+        u64 address;
+    };
+    u32 check_count{};
+    std::array<TableCheck, 8> checks{};
+    u32 unsupported_inputs{}; ///< input usage types the builder does not know
     std::array<SynthReg, MaxSynthRegs> regs{};
 };
 
@@ -511,6 +522,177 @@ DeviceAddresses ResolveDevice() {
     d.topology_table = rt(0x25e0810);
     d.depth_stencil_table = rt(0x25e07e0);
     return d;
+}
+
+constexpr u32 TableRingDwords = 4u << 20; // 16 MB of scratch descriptor tables
+std::unique_ptr<u32[]> table_ring;
+std::once_flag table_ring_once;
+std::atomic<u64> table_cursor{0};
+
+u32* AllocTable(u32 dwords) {
+    std::call_once(table_ring_once, [] { table_ring = std::make_unique<u32[]>(TableRingDwords); });
+    u64 start = table_cursor.fetch_add(dwords, std::memory_order_relaxed) % TableRingDwords;
+    if (start + dwords > TableRingDwords) {
+        table_cursor.fetch_add(TableRingDwords - start, std::memory_order_relaxed);
+        start = 0;
+    }
+    return table_ring.get() + start;
+}
+
+// Descriptors of the objects bound in the context's tables (api stage 0 = vertex, 1 = pixel).
+/// Writes up to `max_dwords` of the descriptor of shader resource slot `slot`; returns the descriptor size in dwords.
+u32 ResourceDescriptor(u64 ctx, u32 stage, u32 slot, u32* out, u32 max_dwords) {
+    const u64 view = Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8);
+    u32 size = 0;
+    if (view) {
+        const u32 kind = Rd<u32>(view, 0x44);
+        const bool buffer = kind == 1 || kind == 0xb;
+        size = buffer ? 4 : 8;
+        const u64 src = view + (buffer ? 0x78 : 0x58);
+        for (u32 i = 0; i < size && i < max_dwords; ++i) {
+            out[i] = Rd<u32>(src, i * 4);
+        }
+    }
+    for (u32 i = size; i < max_dwords; ++i) {
+        out[i] = 0;
+    }
+    return size;
+}
+
+void ConstBufferDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
+    const u64 buffer = Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8);
+    for (u32 i = 0; i < 4; ++i) {
+        out[i] = buffer ? Rd<u32>(buffer, 0x60 + i * 4) : 0;
+    }
+}
+
+void SamplerDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
+    const u64 sampler = Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8);
+    for (u32 i = 0; i < 4; ++i) {
+        out[i] = sampler ? Rd<u32>(sampler, 0x64 + i * 4) : 0;
+    }
+}
+
+u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
+
+/// User data of one stage (SGPR values the constant update engine would have written): descriptors of the bound
+/// objects copied by the shader's input usage table. `sgpr_base` = index of the stage's first user data register.
+void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr_base, SynthReg* out, u32& n,
+                        NativeRecord& record) {
+    if (!gnm) {
+        return;
+    }
+    const u32 count = Rd<u8>(gnm, 3);
+    std::array<u32, 16> sgpr{};
+    std::array<bool, 16> sgpr_set{};
+    std::array<u32, 128> eud{};
+    u32 eud_dwords = 0;
+    struct PendingPtr {
+        u32 sgpr;
+        u32 kind;
+        u32* table;
+        u32 dwords;
+    };
+    std::array<PendingPtr, 8> pending{};
+    u32 pending_count = 0;
+    bool have_eud_ptr = false;
+    u32 eud_ptr_sgpr = 0;
+    const auto put = [&](u32 start, const u32* words, u32 size) {
+        for (u32 i = 0; i < size; ++i) {
+            const u32 reg = start + i;
+            if (reg < 16) {
+                sgpr[reg] = words[i];
+                sgpr_set[reg] = true;
+            } else if (reg - 16 < eud.size()) {
+                eud[reg - 16] = words[i];
+                eud_dwords = std::max(eud_dwords, reg - 16 + 1);
+            }
+        }
+    };
+    for (u32 i = 0; i < count && i < 40; ++i) {
+        const u64 e = gnm + inputs_offset + i * 4;
+        const u32 type = Rd<u8>(e, 0);
+        const u32 slot = Rd<u8>(e, 1);
+        const u32 start = Rd<u8>(e, 2);
+        const u32 flags = Rd<u8>(e, 3);
+        std::array<u32, 8> words{};
+        switch (type) {
+        case 0: { // immediate resource (V# of 4 dwords or T# of 8)
+            const u32 size = (flags & 1) ? 8 : 4;
+            ResourceDescriptor(ctx, stage, slot, words.data(), size);
+            put(start, words.data(), size);
+            break;
+        }
+        case 1: // immediate sampler
+            SamplerDescriptor(ctx, stage, slot, words.data());
+            put(start, words.data(), 4);
+            break;
+        case 2: // immediate constant buffer
+            ConstBufferDescriptor(ctx, stage, slot, words.data());
+            put(start, words.data(), 4);
+            break;
+        case 27: // pointer to the extended user data
+            have_eud_ptr = true;
+            eud_ptr_sgpr = start;
+            break;
+        case 19:   // pointer to the resource table (32 bytes per slot)
+        case 21:   // pointer to the sampler table (16 bytes per slot)
+        case 22: { // pointer to the constant buffer table (16 bytes per slot)
+            if (pending_count >= pending.size()) {
+                ++record.unsupported_inputs;
+                break;
+            }
+            u32 slots = 0;
+            for (u32 s = 0; s < (type == 19 ? 128u : 16u); ++s) {
+                const u64 obj = type == 19 ? Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + s * 8)
+                                : type == 22 ? Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + s * 8)
+                                             : Rd<u64>(ctx, Ctx::SamplerTable(stage) + s * 8);
+                if (obj) {
+                    slots = s + 1;
+                }
+            }
+            slots = std::max(slots, 1u);
+            const u32 entry = type == 19 ? 8 : 4;
+            u32* table = AllocTable(slots * entry);
+            for (u32 s = 0; s < slots; ++s) {
+                if (type == 19) {
+                    ResourceDescriptor(ctx, stage, s, table + s * 8, 8);
+                } else if (type == 22) {
+                    ConstBufferDescriptor(ctx, stage, s, table + s * 4);
+                } else {
+                    SamplerDescriptor(ctx, stage, s, table + s * 4);
+                }
+            }
+            const u64 address = reinterpret_cast<u64>(table);
+            if (start < 15) {
+                sgpr[start] = static_cast<u32>(address);
+                sgpr[start + 1] = static_cast<u32>(address >> 32);
+                sgpr_set[start] = sgpr_set[start + 1] = false; // compared by content, not by value
+                pending[pending_count++] = {sgpr_base + start, type, table, slots * entry};
+            }
+            break;
+        }
+        default:
+            ++record.unsupported_inputs;
+            break;
+        }
+    }
+    if (have_eud_ptr && eud_ptr_sgpr < 15) {
+        u32* table = AllocTable(std::max(eud_dwords, 1u));
+        for (u32 i = 0; i < eud_dwords; ++i) {
+            table[i] = eud[i];
+        }
+        pending[pending_count++] = {sgpr_base + eud_ptr_sgpr, 27, table, eud_dwords};
+    }
+    for (u32 r = 0; r < 16; ++r) {
+        if (sgpr_set[r]) {
+            out[n++] = {sgpr_base + r, sgpr[r]};
+        }
+    }
+    for (u32 p = 0; p < pending_count && record.check_count < record.checks.size(); ++p) {
+        record.checks[record.check_count++] = {pending[p].sgpr, pending[p].kind, pending[p].dwords,
+                                               reinterpret_cast<u64>(pending[p].table)};
+    }
 }
 
 u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
@@ -762,7 +944,15 @@ u64 MakeRecord(u64 ctx) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.unsupported_inputs = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    {
+        u32 n = slot.count;
+        SynthesizeUserData(ctx, 0, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
+        SynthesizeUserData(ctx, 1, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        slot.count = n;
+    }
     slot.seq.store(seq, std::memory_order_release);
     return seq;
 }
@@ -797,6 +987,9 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     const u32 count = slot.count;
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
+    const u32 check_count = slot.check_count;
+    const auto checks = slot.checks;
+    const u32 unsupported = slot.unsupported_inputs;
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
         ++verify_stats.draws_missing;
@@ -817,6 +1010,31 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
             r.expected = regs[i].value;
             r.actual = actual;
         }
+    }
+    // tables the user data points to: compare their content
+    for (u32 c = 0; c < check_count; ++c) {
+        ++s.registers_compared;
+        const auto& check = checks[c];
+        const u64 ptr = ((u64(reg_array[check.reg + 1]) << 32) | reg_array[check.reg]) & 0x0000ffffffffffffull;
+        bool same = false;
+        u32 first_actual = 0;
+        if (ptr != 0 && Core::Memory::Instance()->IsValidMapping(ptr, check.dwords * 4)) {
+            same = std::memcmp(reinterpret_cast<const void*>(check.address), reinterpret_cast<const void*>(ptr),
+                               check.dwords * 4) == 0;
+            first_actual = Rd<u32>(ptr, 0);
+        }
+        if (!same) {
+            ++s.mismatches;
+            any = true;
+            auto& r = s.by_register[0x90000000u + check.kind * 0x100 + (check.reg & 0xff)];
+            ++r.count;
+            r.expected = Rd<u32>(check.address, 0);
+            r.actual = first_actual;
+        }
+    }
+    if (unsupported != 0) {
+        auto& r = s.by_register[0x91000000u];
+        r.count += unsupported;
     }
     s.draws_with_mismatch += any;
     if (any || true) {

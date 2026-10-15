@@ -79,7 +79,10 @@ constexpr u64 FaultRingSize = 1u << 20;
 struct FaultRecord {
     std::atomic<u64> frame{~0ull};
     std::atomic<u64> address{};
+    std::atomic<u64> rip{};
+    std::atomic<u64> size{};
 };
+thread_local u64 current_fault_rip = 0;
 std::unique_ptr<FaultRecord[]> fault_ring;
 std::atomic<u64> fault_head{0};
 u64 fault_tail = 0;
@@ -369,7 +372,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
     if (std::any_of(hooks.begin(), hooks.end(),
                     [](const auto& h) { return h->mode == Mode::Snap; })) {
         snap_file.open(log_dir / "guest_hooks_snap.csv", std::ios::trunc);
-        snap_file << "frame,name,seq,ret,s0,s1,s2,s3,s4,s5,s6,s7\n";
+        snap_file << "frame,name,seq,ret,rdi,rsi,rdx,rcx,r8,r9,s0,s1,s2,s3,s4,s5,s6,s7\n";
     }
     if (any_args) {
         args_file.open(log_dir / "guest_hooks_args.csv", std::ios::trunc);
@@ -382,15 +385,21 @@ void InstallForEboot(VAddr base, u64 image_size) {
     }
     fault_ring = std::make_unique<FaultRecord[]>(FaultRingSize);
     fault_file.open(log_dir / "write_faults.csv", std::ios::trunc);
-    fault_file << "frame,page\n";
+    fault_file << "frame,page,npages,rip\n";
 }
 
-void NoteWriteFault(VAddr address) {
+void SetFaultRip(u64 rip) {
+    current_fault_rip = rip;
+}
+
+void NoteWriteFault(VAddr address, u64 size) {
     if (!fault_ring) {
         return;
     }
     const u64 slot = fault_head.fetch_add(1, std::memory_order_relaxed) & (FaultRingSize - 1);
     fault_ring[slot].address.store(address, std::memory_order_relaxed);
+    fault_ring[slot].rip.store(current_fault_rip, std::memory_order_relaxed);
+    fault_ring[slot].size.store(size, std::memory_order_relaxed);
     fault_ring[slot].frame.store(frame_index.load(std::memory_order_relaxed),
                                  std::memory_order_release);
 }
@@ -417,9 +426,14 @@ void OnFrame() {
             if (fault_frame == ~0ull) {
                 continue;
             }
-            const u64 page = record.address.load(std::memory_order_relaxed) & ~u64{0xFFF};
-            if (seen.insert(page ^ (fault_frame << 52)).second) {
-                fault_file << fault_frame << ',' << std::hex << page << std::dec << '\n';
+            const u64 address = record.address.load(std::memory_order_relaxed);
+            const u64 page = address & ~u64{0xFFF};
+            const u64 size = record.size.load(std::memory_order_relaxed);
+            const u64 rip = record.rip.load(std::memory_order_relaxed);
+            const u64 npages = ((address + (size ? size : 1) - 1) >> 12) - (address >> 12) + 1;
+            if (seen.insert(page ^ (fault_frame << 52) ^ (npages << 40)).second) {
+                fault_file << fault_frame << ',' << std::hex << page << ',' << npages << ',' << rip
+                           << std::dec << '\n';
             }
         }
         fault_tail = head;
@@ -449,6 +463,9 @@ void OnFrame() {
                 }
                 if (hook->mode == Mode::Snap && snap_file.is_open()) {
                     snap_file << frame << ',' << hook->name << ',' << seq << std::hex << ',' << values[6];
+                    for (size_t r = 0; r < 6; ++r) {
+                        snap_file << ',' << values[r];
+                    }
                     for (size_t s = 0; s < 8; ++s) {
                         snap_file << ',';
                         if (s < hook->snaps.size()) {

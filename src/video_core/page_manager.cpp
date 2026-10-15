@@ -6,12 +6,14 @@
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/arch.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/guest_hooks.h"
 #include "core/memory.h"
 #include "core/signals.h"
 #include "video_core/page_manager.h"
@@ -448,7 +450,14 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+#ifdef ARCH_X86_64
+            Core::GuestHooks::SetFaultRip(reinterpret_cast<u64>(Common::GetRip(context)));
+#endif
+            const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+#ifdef ARCH_X86_64
+            Core::GuestHooks::SetFaultRip(0);
+#endif
+            return handled;
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

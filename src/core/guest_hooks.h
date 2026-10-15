@@ -54,7 +54,11 @@ void OnFrame();
 /// True when at least one hook is installed.
 bool IsActive();
 
-/// Records a CPU write to a page the emulator tracks (called from the fault handler). Cheap, any thread.
-void NoteWriteFault(VAddr address);
+/// Records a CPU write to pages the emulator tracks: from the fault handler (size 1, the faulting guest
+/// instruction was set with SetFaultRip) or from an explicit invalidation by a system call (rip 0). Cheap, any thread.
+void NoteWriteFault(VAddr address, u64 size = 1);
+
+/// The guest instruction that caused the write fault being handled on this thread (0 = not a fault).
+void SetFaultRip(u64 rip);
 
 } // namespace Core::GuestHooks

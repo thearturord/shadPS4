@@ -222,7 +222,7 @@ struct Liverpool::RasterSplit {
     bool verify{};
     u32 verify_reports{};
 
-    std::unique_ptr<Regs> regs;
+    DrawRegs state{}; ///< the draw state the raster thread reads
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
     CbDbExtent db_extent{};
     ComputeProgram cs{};
@@ -234,7 +234,8 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         DrainRaster();
         split_active = false;
         StopRasterSplit();
-        raster_regs = &regs;
+        direct_state.Gather(regs);
+        raster_state = &direct_state;
         raster_cb_extent = &last_cb_extent;
         raster_db_extent = &last_db_extent;
         raster_cs = nullptr;
@@ -250,12 +251,11 @@ void Liverpool::StartRasterSplit() {
     split = std::make_unique<RasterSplit>();
     auto& sp = *split;
     sp.verify = EmulatorSettings.GetCpSplitMode() >= 2;
-    sp.regs = std::make_unique<Regs>();
-    std::memcpy(sp.regs.get(), &regs, sizeof(Regs));
+    sp.state = front_state;
     sp.cb_extent = last_cb_extent;
     sp.db_extent = last_db_extent;
     sp.cs = mapped_queues[GfxQueueId].cs_state;
-    raster_regs = sp.regs.get();
+    raster_state = &sp.state;
     raster_cb_extent = &sp.cb_extent;
     raster_db_extent = &sp.db_extent;
     raster_cs = &sp.cs;
@@ -370,6 +370,9 @@ void Liverpool::OverlayForgetAll() {
 }
 
 void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
+    for (u32 k = 0; k < count; ++k) {
+        front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
+    }
     if (!split_active || count == 0) {
         return;
     }
@@ -397,6 +400,7 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 
 void Liverpool::MirrorSetDefaults() {
     OverlayForgetAll(); // the registers were reset to their defaults
+    front_state.SetDefaults();
     if (split_active) {
         split->pending.push_back(RasterSplit::SetDefaultsMarker);
         split->pending.push_back(0);
@@ -519,6 +523,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
     }
     if (!split_active) {
+        direct_state.Gather(regs);
         ExecRasterCall(call, nullptr, nullptr);
         return;
     }
@@ -548,18 +553,17 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                              .instance_sgpr_offset = call.instance_sgpr_offset,
                                              .is_indirect = true}
                 : Vulkan::DrawIndirectParams{};
-        op.draw_plan = rasterizer->PlanDraw(regs, params);
+        op.draw_plan = rasterizer->PlanDraw(front_state, params);
     }
     RasterPush(std::move(op), false);
-    if (sp.verify && sp.verify_reports < 20 &&
-        std::memcmp(sp.regs.get(), &regs, sizeof(Regs)) != 0) {
-        // The operation is done: everything the command processor wrote so far is in the
-        // mirror, so the two register files must be identical.
-        const auto* a = reinterpret_cast<const u32*>(sp.regs.get());
-        const auto* b = reinterpret_cast<const u32*>(&regs);
+    if (sp.verify && sp.verify_reports < 20 && std::memcmp(&sp.state, &front_state, sizeof(DrawRegs)) != 0) {
+        // The operation is done: everything the command processor wrote so far is in the mirror, so the two draw
+        // states must be identical.
+        const auto* a = reinterpret_cast<const u32*>(&sp.state);
+        const auto* b = reinterpret_cast<const u32*>(&front_state);
         u32 first = 0;
         u32 count = 0;
-        for (u32 i = 0; i < Regs::NumRegs; ++i) {
+        for (u32 i = 0; i < sizeof(DrawRegs) / sizeof(u32); ++i) {
             if (a[i] != b[i]) {
                 if (count++ == 0) {
                     first = i;
@@ -568,9 +572,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
         ++sp.verify_reports;
         LOG_ERROR(Render,
-                  "CP split verify: raster register mirror differs from the command processor "
-                  "registers in {} dwords, first at dword {:#x} (mirror {:#x}, command processor "
-                  "{:#x}); a register write is not mirrored",
+                  "CP split verify: raster draw state mirror differs from the command processor's in {} dwords, first at "
+                  "dword {:#x} (mirror {:#x}, command processor {:#x}); a register write is not mirrored",
                   count, first, a[first], b[first]);
     }
 }
@@ -723,7 +726,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
     case RasterCall::Kind::DrawIndirect:
         rasterizer->NativeInvalidate();
         if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
-            Core::NativeDraw::VerifyRecord(c.tag.seq, RasterRegs().reg_array.data());
+            Core::NativeDraw::VerifyRecord(c.tag.seq, RasterRegs());
         }
         run([&] {
             rasterizer->DrawIndirect(c.indexed, c.args_addr, c.offset, c.stride, c.max_count,
@@ -819,10 +822,12 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 const u32 count = p[1];
                 p += 2;
                 if (offset == RasterSplit::SetDefaultsMarker) {
-                    sp.regs->SetDefaults();
+                    sp.state.SetDefaults();
                     continue;
                 }
-                std::memcpy(&sp.regs->reg_array[offset], p, count * sizeof(u32));
+                for (u32 k = 0; k < count; ++k) {
+                    sp.state.Set(offset + k, p[k]);
+                }
                 p += count;
             }
             if (op.has_call) {
@@ -838,7 +843,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     op.call.kind == RasterCall::Kind::DrawIndirect) {
                     sp.ns_draws += op_ns;
                     ++sp.n_draws;
-                    if (sp.regs->color_target_mask.raw == 0) {
+                    if (sp.state.color_target_mask.raw == 0) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
                     }

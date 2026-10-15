@@ -1147,6 +1147,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/regs_color.h
                src/video_core/amdgpu/regs_depth.h
                src/video_core/amdgpu/regs.cpp
+               src/video_core/amdgpu/draw_state.cpp
+               src/video_core/amdgpu/draw_state.h
                src/video_core/amdgpu/regs.h
                src/video_core/amdgpu/regs_primitive.h
                src/video_core/amdgpu/regs_shader.h

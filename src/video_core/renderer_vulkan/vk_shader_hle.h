@@ -6,6 +6,7 @@
 namespace AmdGpu {
 struct ComputeProgram;
 union Regs;
+struct DrawRegs;
 } // namespace AmdGpu
 
 namespace Shader {
@@ -17,7 +18,7 @@ namespace Vulkan {
 class Rasterizer;
 
 /// Attempts to execute a shader using HLE if possible.
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
+bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::DrawRegs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer);
 
 } // namespace Vulkan

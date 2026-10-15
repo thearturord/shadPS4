@@ -39,6 +39,15 @@ inline T Rd(u64 base, u64 offset) {
     return value;
 }
 
+thread_local bool bad_object_seen;
+inline u64 Obj(u64 pointer) {
+    if (pointer != 0 && !(pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0)) {
+        bad_object_seen = true;
+        return 0;
+    }
+    return pointer;
+}
+
 namespace Ctx {
 constexpr u64 CurrentIndexBuffer = 0x58;
 constexpr u64 InputLayout = 0x68;
@@ -171,7 +180,7 @@ Signature Compute(u64 ctx, u64 a1, u64 a2, u64 a3, u32 kind) {
             const u32 cb_mask = Rd<u32>(shader, Shader::CbMask) & 0xffff;
             for (u32 slot = 0; slot < 16; ++slot) {
                 if ((cb_mask >> slot) & 1) {
-                    cb.Add(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8));
+                    cb.Add(Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8)));
                 }
             }
             HashSlots(srv, ctx, Ctx::ShaderResourceTable(stage), Rd<u64>(shader, Shader::SrvMaskLo),
@@ -179,7 +188,7 @@ Signature Compute(u64 ctx, u64 a1, u64 a2, u64 a3, u32 kind) {
             const u32 smp_mask = Rd<u32>(shader, Shader::SamplerMask) & 0xffff;
             for (u32 slot = 0; slot < 16; ++slot) {
                 if ((smp_mask >> slot) & 1) {
-                    smp.Add(Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8));
+                    smp.Add(Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8)));
                 }
             }
             cb.Add(0xffff0000 + stage);
@@ -372,7 +381,7 @@ void SampleConstantBuffers(u64 ctx, Class cls) {
             if (!((mask >> slot) & 1)) {
                 continue;
             }
-            const u64 obj = Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8);
+            const u64 obj = Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8));
             if (!obj) {
                 continue;
             }
@@ -604,6 +613,7 @@ void BeginTables(u64 seq) {
     table_seq = seq;
     table_used = 0;
     table_overflow = false;
+    bad_object_seen = false;
 }
 
 u32* AllocTable(u32 dwords) {
@@ -626,7 +636,7 @@ u32* AllocTable(u32 dwords) {
 // Descriptors of the objects bound in the context's tables (api stage 0 = vertex, 1 = pixel).
 /// Writes up to `max_dwords` of the descriptor of shader resource slot `slot`; returns the descriptor size in dwords.
 u32 ResourceDescriptor(u64 ctx, u32 stage, u32 slot, u32* out, u32 max_dwords) {
-    const u64 view = Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8);
+    const u64 view = Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + slot * 8));
     u32 size = 0;
     if (view) {
         const u32 kind = Rd<u32>(view, 0x44);
@@ -662,14 +672,14 @@ u32 UavDescriptor(u64 ctx, u32 slot, u32* out, u32 max_dwords) {
 }
 
 void ConstBufferDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
-    const u64 buffer = Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8);
+    const u64 buffer = Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + slot * 8));
     for (u32 i = 0; i < 4; ++i) {
         out[i] = buffer ? Rd<u32>(buffer, 0x60 + i * 4) : 0;
     }
 }
 
 void SamplerDescriptor(u64 ctx, u32 stage, u32 slot, u32* out) {
-    const u64 sampler = Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8);
+    const u64 sampler = Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + slot * 8));
     for (u32 i = 0; i < 4; ++i) {
         out[i] = sampler ? Rd<u32>(sampler, 0x64 + i * 4) : 0;
     }
@@ -928,10 +938,10 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 input
             }
             u32 slots = 0;
             for (u32 s = 0; s < (type == 19 ? 128u : type == 25 ? 8u : 16u); ++s) {
-                const u64 obj = type == 19 ? Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + s * 8)
-                                : type == 25 ? Rd<u64>(ctx, 0x2098 + s * 8)
-                                : type == 22 ? Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + s * 8)
-                                             : Rd<u64>(ctx, Ctx::SamplerTable(stage) + s * 8);
+                const u64 obj = type == 19 ? Obj(Rd<u64>(ctx, Ctx::ShaderResourceTable(stage) + s * 8))
+                                : type == 25 ? Obj(Rd<u64>(ctx, 0x2098 + s * 8))
+                                : type == 22 ? Obj(Rd<u64>(ctx, Ctx::ConstantBufferTable(stage) + s * 8))
+                                             : Obj(Rd<u64>(ctx, Ctx::SamplerTable(stage) + s * 8));
                 if (obj) {
                     slots = s + 1;
                 }
@@ -1317,7 +1327,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.cb_extent = synth_cb_extent;
     slot.cb_extent_mask = synth_cb_extent_mask;
     slot.db_extent = synth_db_extent;
-    slot.flags = synth_flags | (table_overflow ? SpecialPipeline : 0u);
+    slot.flags = synth_flags | (table_overflow || bad_object_seen ? SpecialPipeline : 0u);
     slot.rt_info = synth_rt_info;
     slot.kind = kind;
     slot.caller = caller;
@@ -1427,7 +1437,7 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
                            n, slot);
     }
-    slot.flags = (table_overflow ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
@@ -1699,7 +1709,7 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
             }
         }
     }
-    slot.flags = (table_overflow ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
     slot.seq.store(seq, std::memory_order_release);
     return seq;
@@ -1735,7 +1745,22 @@ struct VerifyStats {
 
 }  // namespace
 
+void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* mapping);
+
+void VerifyRecord(u64 seq, const AmdGpu::DrawRegs& state) {
+    static thread_local std::unique_ptr<u32[]> dump;
+    if (!dump) {
+        dump = std::make_unique<u32[]>(AmdGpu::Regs::NumRegs);
+    }
+    state.Dump(dump.get());
+    VerifyRecordImpl(seq, dump.get(), &state);
+}
+
 void VerifyRecord(u64 seq, const u32* reg_array) {
+    VerifyRecordImpl(seq, reg_array, nullptr);
+}
+
+void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* mapping) {
     NoteConsumed(seq);
     auto& slot = Slot(seq);
     if (slot.seq.load(std::memory_order_acquire) != seq) {
@@ -1745,7 +1770,7 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     }
     // copy: the guest thread may reuse the slot while this is compared
     std::array<SynthReg, MaxSynthRegs> regs = slot.regs;
-    const u32 count = slot.count;
+    u32 count = slot.count;
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
     const u32 flags = slot.flags;
@@ -1755,10 +1780,27 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     const u64 dbg_vs = slot.dbg_vs;
     const u64 dbg_fetch = slot.dbg_fetch;
     const u64 dbg_layout = slot.dbg_layout;
-    const u32 check_count = slot.check_count;
-    const auto checks = slot.checks;
+    u32 check_count = slot.check_count;
+    auto checks = slot.checks;
     const u32 unsupported = slot.unsupported_inputs;
     const u32 unsupported_mask = slot.unsupported_mask;
+    if (mapping != nullptr) {
+        // the draw state holds only what the backend reads: the other registers cannot be compared
+        u32 kept = 0;
+        for (u32 i = 0; i < count; ++i) {
+            if (AmdGpu::DrawRegs::IsMapped(regs[i].index)) {
+                regs[kept++] = regs[i];
+            }
+        }
+        count = kept;
+        kept = 0;
+        for (u32 i = 0; i < check_count; ++i) {
+            if (AmdGpu::DrawRegs::IsMapped(checks[i].reg) && AmdGpu::DrawRegs::IsMapped(checks[i].reg + 1)) {
+                checks[kept++] = checks[i];
+            }
+        }
+        check_count = kept;
+    }
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
         ++verify_stats.draws_missing;

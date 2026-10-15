@@ -32,7 +32,7 @@
 
 namespace Vulkan {
 
-static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
+static Shader::PushData MakeUserData(const AmdGpu::DrawRegs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
     Shader::PushData push_data{};
@@ -111,7 +111,7 @@ bool Rasterizer::CommandStreamBarrier(u64 producer_tick) {
     return true;
 }
 
-Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs) {
+Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& regs) {
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         return {DrawClass::EliminateFastClear};
     }
@@ -127,7 +127,7 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs
     // The SDK's clear: a full-screen triangle (embedded vertex shader, three vertices, no color target) with the depth /
     // stencil clear bits of DB_RENDER_CONTROL set. Its pixels carry nothing; the render pass clear does the work.
     if ((regs.depth_render_control.depth_clear_enable || regs.depth_render_control.stencil_clear_enable) &&
-        regs.reg_array[AmdGpu::Regs::ShRegWordOffset + 0x49] != 0 && regs.num_indices == 3 &&
+        (regs.vs_program.address >> 32) != 0 && regs.num_indices == 3 &&
         regs.color_target_mask.raw == 0 && regs.depth_buffer.DepthValid()) {
         return {DrawClass::DepthClear};
     }
@@ -135,7 +135,7 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs
          regs.depth_render_control.depth_compress_disable || regs.depth_render_control.stencil_compress_disable) &&
         !regs.depth_render_control.depth_clear_enable && !regs.depth_render_control.stencil_clear_enable &&
         !regs.depth_render_control.depth_copy && !regs.depth_render_control.stencil_copy &&
-        regs.reg_array[AmdGpu::Regs::ShRegWordOffset + 0x49] != 0 && regs.num_indices == 3 &&
+        (regs.vs_program.address >> 32) != 0 && regs.num_indices == 3 &&
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
         return {DrawClass::DepthTransition};
     }
@@ -245,7 +245,7 @@ bool Rasterizer::FilterDraw() {
     return true;
 }
 
-std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::Regs& regs,
+std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
                                                DrawIndirectParams params) {
     // SkipShadow draws are still planned: the switch can change between the front and the raster
     // thread, and the raster thread must find a plan for every draw it does not drop.
@@ -428,7 +428,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
 }
 
-static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
+static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::DrawRegs& regs, const Shader::Info& info,
                                           const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
@@ -500,7 +500,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (tag.valid) {
         ++native_stats.tagged;
         if (tag.seq != 0 && (tag.meta & VideoCore::NativeTagExecFlag) == 0) {
-            Core::NativeDraw::VerifyRecord(tag.seq, liverpool->RasterRegs().reg_array.data());
+            Core::NativeDraw::VerifyRecord(tag.seq, liverpool->RasterRegs());
         }
     } else {
         ++native_stats.untagged;

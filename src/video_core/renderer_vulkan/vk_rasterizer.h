@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/amdgpu/draw_state.h"
 #include <mutex>
 #include <vector>
 
@@ -65,7 +66,7 @@ public:
 
     /// Command processor thread: looks the pipeline up for `regs`. Returns null for draws that
     /// FilterDraw handles without a pipeline (the raster thread repeats that decision).
-    [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::Regs& regs,
+    [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::DrawRegs& regs,
                                                      DrawIndirectParams params);
     [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
 
@@ -206,7 +207,7 @@ private:
         bool stencil_copy{};
     };
     /// What FilterDraw does with a draw, decided from the registers only.
-    static DrawClassification ClassifyDraw(const AmdGpu::Regs& regs);
+    static DrawClassification ClassifyDraw(const AmdGpu::DrawRegs& regs);
 
     void ProcessReadbacksSync();
 

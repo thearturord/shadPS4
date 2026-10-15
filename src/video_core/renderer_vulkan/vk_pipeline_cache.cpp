@@ -281,7 +281,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
       stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
-    lookup_regs = &liverpool->regs;
+    lookup_regs = &liverpool->RasterRegs();
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -443,7 +443,7 @@ void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shade
     out.pgm_base = shared.pgm_base;
 }
 
-void PipelineCache::PlanGraphics(const AmdGpu::Regs& regs, DrawIndirectParams params,
+void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, DrawIndirectParams params,
                                  DrawPlan& plan) {
     lookup_regs = &regs;
     lookup_regs_pinned = true;

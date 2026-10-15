@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/amdgpu/draw_state.h"
 #include <functional>
 #include <memory>
 #include <variant>
@@ -130,7 +131,7 @@ public:
     /// cp_split_mode: looks the pipeline up for the command processor's registers `regs` and
     /// captures the per-draw state of its stages. Runs on the command processor thread, the only
     /// thread that touches this cache then.
-    void PlanGraphics(const AmdGpu::Regs& regs, DrawIndirectParams params, DrawPlan& plan);
+    void PlanGraphics(const AmdGpu::DrawRegs& regs, DrawIndirectParams params, DrawPlan& plan);
     void PlanCompute(const AmdGpu::ComputeProgram& cs, DispatchPlan& plan);
     /// Raster thread: writes the captured state into the stage Infos the pipeline uses.
     static void ApplyPlan(const DrawPlan& plan);
@@ -193,7 +194,7 @@ private:
     DrawIndirectParams draw_indirect_params{};
     /// Registers the current lookup reads: the raster mirror normally, the command processor's
     /// own registers (and the compute state of the dispatching queue) when planning.
-    const AmdGpu::Regs* lookup_regs{};
+    const AmdGpu::DrawRegs* lookup_regs{};
     const AmdGpu::ComputeProgram* lookup_cs{};
     PlanStats plan_stats{};
     std::array<u64, MaxShaderStages> last_stage_hash{};

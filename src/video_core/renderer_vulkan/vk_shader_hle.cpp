@@ -102,7 +102,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     return true;
 }
 
-bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
+bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::DrawRegs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:

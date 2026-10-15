@@ -24,6 +24,7 @@
 #include "common/types.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/draw_state.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/readback_stats.h"
 
@@ -85,8 +86,8 @@ public:
     /// What the rasterizer reads while it executes draws and dispatches. Without the command
     /// processor split (cp_split_mode) these are the command processor's own registers; with it
     /// they are the raster thread's mirror, kept in sync through the operation queue.
-    [[nodiscard]] Regs& RasterRegs() noexcept {
-        return *raster_regs;
+    [[nodiscard]] DrawRegs& RasterRegs() noexcept {
+        return *raster_state;
     }
     [[nodiscard]] std::array<CbDbExtent, NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
         return *raster_cb_extent;
@@ -415,7 +416,11 @@ private:
 #endif
     s32 curr_qid{-1};
 
-    Regs* raster_regs{&regs};
+    /// The draw state of the command processor (kept equal to `regs`, planning reads it), what the rasterizer reads
+    /// without the split (rebuilt from `regs` before each operation) and the raster thread's own with it.
+    DrawRegs front_state{};
+    DrawRegs direct_state{};
+    DrawRegs* raster_state{&direct_state};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS>* raster_cb_extent{&last_cb_extent};
     CbDbExtent* raster_db_extent{&last_db_extent};
     ComputeProgram* raster_cs{};

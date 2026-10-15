@@ -8,6 +8,7 @@
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/debug_server.h"
+#include "core/guest_hooks.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
@@ -860,6 +861,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (!is_reusing_frame) {
         LogPresentRate();
         Core::DebugServer::NotePresent();
+#ifdef ARCH_X86_64
+        Core::GuestHooks::OnFrame();
+#endif
     }
     // Free the frame for reuse
     const auto free_frame = [&] {

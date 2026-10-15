@@ -13,6 +13,7 @@
 #include "core/cpu_patches.h"
 #include "core/debug_server.h"
 #include "core/emulator_settings.h"
+#include "core/guest_hooks.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -285,6 +286,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     const VAddr entry_addr = base_virtual_addr + elf.GetElfEntry();
     LOG_INFO(Core_Linker, "program entry addr ..........: {:#018x}", entry_addr);
 
+    bool is_main_executable = false;
     if (MemoryPatcher::g_eboot_address == 0) {
         // TODO: Come up with a more reliable way to detect the main executable.
         std::string lower_name = name;
@@ -296,6 +298,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
             Core::DebugServer::Start(static_cast<u16>(EmulatorSettings.GetDebugServerPort()));
+            is_main_executable = true;
         }
     }
 
@@ -360,6 +363,10 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                      total.uncovered_inplace_cpu_patch_instruction_count,
                      total.uncovered_unsupported_cpu_patch_instruction_count);
         }
+    }
+    if (is_main_executable) {
+        // After the static patching: the hooks copy the code that executes.
+        GuestHooks::InstallForEboot(base_virtual_addr, base_size);
     }
 #endif
 }

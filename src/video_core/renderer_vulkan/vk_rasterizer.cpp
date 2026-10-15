@@ -5,6 +5,7 @@
 #include <thread>
 #include "common/debug.h"
 #include "core/debug_server.h"
+#include "core/guest_hooks.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -1596,6 +1597,9 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::DebugServer::NoteWriteFault(addr);
+#ifdef ARCH_X86_64
+    Core::GuestHooks::NoteWriteFault(addr);
+#endif
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;

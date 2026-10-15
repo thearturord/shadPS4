@@ -3,9 +3,14 @@
 
 #pragma once
 
+#include <functional>
 #include <span>
 
 #include "common/types.h"
+
+namespace Xbyak {
+class CodeGenerator;
+}
 
 // ============================================================================
 // Windows static guest red-zone protection
@@ -75,6 +80,12 @@ struct RedZonePatchResult {
 /// Registers a module for patching, providing an area to generate trampoline code.
 void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_area_ptr,
                          u64 trampoline_area_size);
+
+/// Runs `emit` with exclusive access to the trampoline code generator of the module that contains
+/// `code_ptr`. Returns false if the module is unknown, `emit` returns false, or the trampoline area
+/// is exhausted; in every failure case the generator is rolled back to its previous size.
+bool EmitInTrampolineArea(const void* code_ptr,
+                          const std::function<bool(Xbyak::CodeGenerator&)>& emit);
 
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);

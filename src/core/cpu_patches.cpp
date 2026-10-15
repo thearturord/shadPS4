@@ -2478,6 +2478,26 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
                                           trampoline_area_size));
 }
 
+bool EmitInTrampolineArea(const void* code_ptr,
+                          const std::function<bool(Xbyak::CodeGenerator&)>& emit) {
+    auto* module = GetContainingModule(code_ptr);
+    if (module == nullptr || module->trampoline_exhausted) {
+        return false;
+    }
+    std::scoped_lock lock{module->mutex};
+    auto& gen = module->trampoline_gen;
+    const size_t saved_size = gen.getSize();
+    try {
+        if (emit(gen)) {
+            return true;
+        }
+    } catch (const Xbyak::Error& error) {
+        HandleTrampolineError(module, error);
+    }
+    gen.setSize(saved_size);
+    return false;
+}
+
 void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
 #if defined(_WIN32)
     // cpu_prepatch_tcb: patch the thread-control-block accesses now, while no guest thread runs.

@@ -131,6 +131,14 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::Regs& regs
         regs.color_target_mask.raw == 0 && regs.depth_buffer.DepthValid()) {
         return {DrawClass::DepthClear};
     }
+    if ((regs.depth_render_control.decompress_enable || regs.depth_render_control.resummarize_enable ||
+         regs.depth_render_control.depth_compress_disable || regs.depth_render_control.stencil_compress_disable) &&
+        !regs.depth_render_control.depth_clear_enable && !regs.depth_render_control.stencil_clear_enable &&
+        !regs.depth_render_control.depth_copy && !regs.depth_render_control.stencil_copy &&
+        regs.reg_array[AmdGpu::Regs::ShRegWordOffset + 0x49] != 0 && regs.num_indices == 3 &&
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return {DrawClass::DepthTransition};
+    }
 
     const bool cb_disabled =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
@@ -162,7 +170,7 @@ bool Rasterizer::FilterDraw() {
     const auto classified = ClassifyDraw(liverpool->RasterRegs());
     {
         // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
-        static std::array<u64, 8> class_counts{};
+        static std::array<u64, 12> class_counts{};
         static u64 last_log_ns = 0;
         ++class_counts[static_cast<size_t>(classified.kind)];
         const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -172,7 +180,7 @@ bool Rasterizer::FilterDraw() {
             if (last_log_ns != 0) {
                 LOG_INFO(Render_Vulkan,
                          "draw classes per 5 s: eliminate fast clear {}, fmask decompress {}, resolve {}, primitive none {}, "
-                         "depth/stencil copy {}, skipped shadow {}, depth clear {}, normal {}",
+                         "depth/stencil copy {}, skipped shadow {}, depth clear {}, depth transition {}, normal {}",
                          class_counts[static_cast<size_t>(DrawClass::EliminateFastClear)],
                          class_counts[static_cast<size_t>(DrawClass::FmaskDecompress)],
                          class_counts[static_cast<size_t>(DrawClass::Resolve)],
@@ -180,6 +188,7 @@ bool Rasterizer::FilterDraw() {
                          class_counts[static_cast<size_t>(DrawClass::DepthStencilCopy)],
                          class_counts[static_cast<size_t>(DrawClass::SkipShadow)],
                          class_counts[static_cast<size_t>(DrawClass::DepthClear)],
+                         class_counts[static_cast<size_t>(DrawClass::DepthTransition)],
                          class_counts[static_cast<size_t>(DrawClass::Normal)]);
             }
             class_counts = {};
@@ -217,6 +226,8 @@ bool Rasterizer::FilterDraw() {
         return false;
     case DrawClass::DepthClear:
         ClearDepthTarget();
+        return false;
+    case DrawClass::DepthTransition:
         return false;
     case DrawClass::Normal:
         break;

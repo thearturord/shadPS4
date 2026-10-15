@@ -197,6 +197,7 @@ private:
         PrimitiveNone,
         DepthStencilCopy,
         SkipShadow, ///< Live switch skip_shadows: a depth-only draw into a shadow map sized target.
+        DepthTransition, ///< The SDK's full-screen triangle that decompresses / resummarizes depth: no effect without compression.
         DepthClear, ///< The SDK's full-screen triangle with the depth / stencil clear bits set: a clear of the target.
     };
     struct DrawClassification {

@@ -489,9 +489,11 @@ struct NativeRecord {
     u64 ps_gnm{};
     u64 dbg_vs{};
     u64 dbg_fetch{};
+    u64 dbg_layout{};
     u32 kind{};
     u32 a1{};
     u32 a2{};
+    u64 caller{}; ///< Ghidra address of the draw call's return address
     u64 args_addr{};      ///< indirect draws: the argument buffer
     u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
     u32 instance_sgpr{};
@@ -510,6 +512,7 @@ struct NativeRecord {
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
+    u32 unsupported_mask{};   ///< those types, bit per type
     std::array<SynthReg, MaxSynthRegs> regs{};
 };
 
@@ -525,6 +528,36 @@ std::unique_ptr<NativeRecord[]> records;
 std::once_flag records_once;
 std::atomic<u64> next_seq{1};
 std::atomic<u64> consumed_seq{0};
+
+/// Draws are executed from records only for call sites whose records matched what the game's own packets produced.
+/// Call sites that set state around the render layer (own shaders, direct packets) never match and stay on the
+/// packet path.
+struct CallerTrust {
+    std::atomic<u64> caller{0};
+    std::atomic<u32> total{0};
+    std::atomic<u32> bad{0};
+    std::atomic<u32> since_audit{0};
+};
+constexpr u32 TrustSlots = 512;
+std::array<CallerTrust, TrustSlots> caller_trust;
+
+CallerTrust* TrustFor(u64 caller) {
+    const u32 start = static_cast<u32>((caller * 0x9E3779B97F4A7C15ull) >> 40) % TrustSlots;
+    for (u32 i = 0; i < TrustSlots; ++i) {
+        auto& entry = caller_trust[(start + i) % TrustSlots];
+        u64 current = entry.caller.load(std::memory_order_acquire);
+        if (current == caller) {
+            return &entry;
+        }
+        if (current == 0 && entry.caller.compare_exchange_strong(current, caller, std::memory_order_acq_rel)) {
+            return &entry;
+        }
+        if (entry.caller.load(std::memory_order_acquire) == caller) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
 
 void NoteConsumed(u64 seq) {
     u64 seen = consumed_seq.load(std::memory_order_relaxed);
@@ -682,6 +715,7 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
 }
 
 thread_local u32 synth_flags;
+thread_local u64 synth_fetch_address;
 thread_local u32 synth_rt_info; ///< count | view mask << 8 | empty block mask << 16
 thread_local u64 dbg_vs;
 thread_local u64 dbg_fetch;
@@ -746,6 +780,14 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
             ConstBufferDescriptor(ctx, stage, slot, words.data());
             put(start, words.data(), 4);
             break;
+        case 18: // pointer to the fetch shader
+            words[0] = static_cast<u32>(synth_fetch_address);
+            words[1] = static_cast<u32>(synth_fetch_address >> 32);
+            put(start, words.data(), 2);
+            if (synth_fetch_address == 0) {
+                ++record.unsupported_inputs;
+            }
+            break;
         case 27: // pointer to the extended user data
             have_eud_ptr = true;
             eud_ptr_sgpr = start;
@@ -790,6 +832,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
         }
         default:
             ++record.unsupported_inputs;
+            record.unsupported_mask |= 1u << (type & 31);
             break;
         }
     }
@@ -1025,6 +1068,7 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             }
             dbg_vs = vs;
             dbg_fetch = fetch_obj;
+            synth_fetch_address = fetch_obj ? Rd<u64>(fetch_obj, 0x30) : 0;
             const u32 modifier = fetch_obj ? Rd<u32>(fetch_obj, 0x40) : 0;
             const u64 fetch_addr = fetch_obj ? Rd<u64>(fetch_obj, 0x30) : 0;
             const u32 r2 = Rd<u32>(regs, 8);
@@ -1032,19 +1076,20 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             sh_reg(0x49, 0);
             // the modifier of the fetch shader object goes into the shader's first resource word; a vertex shader whose
             // fetch object does not exist yet gets it created during this draw
-            sh_reg(0x4a, fetch_obj ? (r2 & 0xfcfffc3fu) | modifier : r2);
+            bool takes_fetch_shader = false;
+            for (u32 k = 0; k < Rd<u8>(gnm, 3) && k < 40; ++k) {
+                takes_fetch_shader |= Rd<u8>(gnm + 0x28 + k * 4, 0) == 18;
+            }
+            // The register keeps the shader's value with the fetch object's modifier merged in. Shaders that take
+            // the fetch shader pointer cannot run natively until that object exists (it is created by their first draw).
+            if (takes_fetch_shader && fetch_obj == 0) {
+                synth_flags |= NoFetchObject;
+            }
+            sh_reg(0x4a, fetch_obj != 0 ? (r2 & 0xfcfffc3fu) | modifier : r2);
             sh_reg(0x4b, Rd<u32>(regs, 12));
             context_reg(0x207, Rd<u32>(regs, 24));
             context_reg(0x1b1, Rd<u32>(regs, 16));
             context_reg(0x1c3, Rd<u32>(regs, 20));
-            bool user_data_in_first_sgprs = false;
-            for (u32 k = 0; k < Rd<u8>(gnm, 3) && k < 40; ++k) {
-                user_data_in_first_sgprs |= Rd<u8>(gnm + 0x28 + k * 4, 2) < 2;
-            }
-            if (fetch_addr && !user_data_in_first_sgprs) {
-                sh_reg(0x4c, static_cast<u32>(fetch_addr));
-                sh_reg(0x4d, static_cast<u32>(fetch_addr >> 32));
-            }
             if (fetch_obj) {
                 context_reg(0x2a8, Rd<u32>(fetch_obj, 0x48));
                 context_reg(0x2a9, Rd<u32>(fetch_obj, 0x4c));
@@ -1093,21 +1138,24 @@ NativeRecord& Slot(u64 seq) {
 }
 
 /// Guest thread: builds the record of a draw. Returns its number.
-u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
+u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     auto& slot = Slot(seq);
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
     slot.unsupported_inputs = 0;
+    slot.unsupported_mask = 0;
     synth_flags = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
     slot.flags = synth_flags;
     slot.rt_info = synth_rt_info;
     slot.kind = kind;
+    slot.caller = caller;
     slot.a1 = static_cast<u32>(a1);
     slot.a2 = static_cast<u32>(a2);
     slot.dbg_vs = dbg_vs;
     slot.dbg_fetch = dbg_fetch;
+    slot.dbg_layout = Rd<u64>(ctx, 0x68);
     {
         u32 n = slot.count;
         SynthesizeUserData(ctx, 0, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
@@ -1151,6 +1199,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
             }
             slot.regs[n++] = {ContextBase + 0x29e, static_cast<u32>(a1)};
         }
+        if (slot.unsupported_inputs != 0) {
+            slot.flags |= SpecialPipeline;
+        }
         slot.count = n;
     }
     slot.seq.store(seq, std::memory_order_release);
@@ -1169,6 +1220,7 @@ struct VerifyStats {
     std::array<u64, 4> flag_counts{};
     std::unordered_map<u64, u64> index_type_pairs;
     std::unordered_map<u32, u64> rt_odd_info;
+    std::map<std::pair<u64, bool>, u64> callers; ///< draw call return address, differs
     struct PerReg {
         u64 count{};
         u32 expected{};
@@ -1196,12 +1248,15 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
     const u32 flags = slot.flags;
+    const u64 caller = slot.caller;
     const u32 rt_info = slot.rt_info;
     const u64 dbg_vs = slot.dbg_vs;
     const u64 dbg_fetch = slot.dbg_fetch;
+    const u64 dbg_layout = slot.dbg_layout;
     const u32 check_count = slot.check_count;
     const auto checks = slot.checks;
     const u32 unsupported = slot.unsupported_inputs;
+    const u32 unsupported_mask = slot.unsupported_mask;
     if (slot.seq.load(std::memory_order_acquire) != seq) {
         std::scoped_lock lk{verify_stats.mutex};
         ++verify_stats.draws_missing;
@@ -1211,20 +1266,43 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     auto& s = verify_stats;
     ++s.draws_checked;
     bool any = false;
+    {
+        static std::map<u64, u32> caller_dumps;
+        u32& dumped_for_caller = caller_dumps[caller];
+        if (dumped_for_caller < 2) {
+            std::string diff;
+            u32 differing = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (reg_array[regs[i].index] != regs[i].value) {
+                    ++differing;
+                    if (differing <= 30) {
+                        diff += fmt::format(" {:#x}:{:x}/{:x}", regs[i].index, regs[i].value, reg_array[regs[i].index]);
+                    }
+                }
+            }
+            if (differing > 0 && count > 0) {
+                ++dumped_for_caller;
+                const VAddr base = image_base.load(std::memory_order_relaxed);
+                LOG_INFO(Core, "native draw diff: caller {:#x} kind {} class? {} regs differ {} (built/actual):{}",
+                         base ? caller - base + 0x1000000 : caller, slot.kind, flags, differing, diff);
+            }
+        }
+    }
     for (u32 i = 0; i < count; ++i) {
         ++s.registers_compared;
         const u32 actual = reg_array[regs[i].index];
         if (actual != regs[i].value) {
             if (regs[i].index == ShBase + 0x4c || regs[i].index == ShBase + 0x4a) {
                 static u32 fetch_dumps = 0;
-                if (fetch_dumps < 40 && dbg_vs != 0) {
+                static std::map<u64, u32> fetch_dumped_vs;
+                if (fetch_dumps < 200 && dbg_vs != 0 && fetch_dumped_vs[dbg_vs]++ < 2) {
                     ++fetch_dumps;
                     const auto rd = [](u64 base, u64 off) { return base ? Rd<u64>(base, off) : u64{0}; };
                     const u64 alt = rd(dbg_vs + 0x330, 0xe0);
                     LOG_INFO(Core,
-                             "native fetch diff: reg {:#x} vs {:#x} variant420 {:#x} fetch_obj {:#x} built {:#x} actual {:#x}/{:#x} "
+                             "native fetch diff: layout {:#x} caller {:#x} reg {:#x} vs {:#x} variant420 {:#x} fetch_obj {:#x} built {:#x} actual {:#x}/{:#x} "
                              "obj30 {:#x} 38 {:#x} 40 {:#x} 48 {:#x} | variant330 obj {:#x}: 30 {:#x} 40 {:#x}",
-                             regs[i].index, dbg_vs, rd(dbg_vs, 0x420), dbg_fetch, regs[i].value, actual, reg_array[ShBase + 0x4d],
+                             dbg_layout, caller, regs[i].index, dbg_vs, rd(dbg_vs, 0x420), dbg_fetch, regs[i].value, actual, reg_array[ShBase + 0x4d],
                              rd(dbg_fetch, 0x30), rd(dbg_fetch, 0x38), rd(dbg_fetch, 0x40), rd(dbg_fetch, 0x48), alt,
                              rd(alt, 0x30), rd(alt, 0x40));
                 }
@@ -1287,6 +1365,11 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     if (unsupported != 0) {
         auto& r = s.by_register[0x91000000u];
         r.count += unsupported;
+        for (u32 bit = 0; bit < 32; ++bit) {
+            if ((unsupported_mask >> bit) & 1) {
+                ++s.by_register[0x91000100u + bit].count;
+            }
+        }
     }
     {
         constexpr u32 ContextFirst = 0xA000, ContextCount = 0x400, ShFirst = 0x2C00, ShCount = 0x280, UconfigFirst = 0xC200,
@@ -1355,6 +1438,15 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     }
     s.draws_with_mismatch += any;
     s.draws_flagged += flags != 0;
+    ++s.callers[{caller, any}];
+    if (auto* trust = TrustFor(caller)) {
+        trust->total.fetch_add(1, std::memory_order_relaxed);
+        trust->bad.fetch_add(any ? 1 : 0, std::memory_order_relaxed);
+        if (trust->total.load(std::memory_order_relaxed) >= 4096) {
+            trust->total.store(trust->total.load() / 2, std::memory_order_relaxed);
+            trust->bad.store(trust->bad.load() / 2, std::memory_order_relaxed);
+        }
+    }
     if (flags & OddRenderTarget) {
         ++s.rt_odd_info[rt_info];
     }
@@ -1420,6 +1512,22 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                 LOG_INFO(Core, "native front end check: odd render targets: count {} views {:#x} empty blocks {:#x}: {} draws",
                          info & 0xff, (info >> 8) & 0xff, (info >> 16) & 0xff, count);
             }
+            {
+                const VAddr base = image_base.load(std::memory_order_relaxed);
+                std::vector<std::pair<u64, u64>> bad;
+                for (const auto& [key, count] : s.callers) {
+                    if (key.second) {
+                        const u64 total = count + s.callers[{key.first, false}];
+                        bad.push_back({key.first, count * 1000000 + total});
+                    }
+                }
+                std::ranges::sort(bad, [](const auto& x, const auto& y) { return x.second > y.second; });
+                for (size_t k = 0; k < bad.size() && k < 6; ++k) {
+                    LOG_INFO(Core, "native front end check: draws called from {:#x} differ {} of {}",
+                             base ? bad[k].first - base + 0x1000000 : bad[k].first, bad[k].second / 1000000,
+                             bad[k].second % 1000000);
+                }
+            }
             std::vector<std::pair<u32, u64>> gaps(s.uncovered.begin(), s.uncovered.end());
             std::ranges::sort(gaps, [](const auto& x, const auto& y) { return x.second > y.second; });
             std::string gap_text;
@@ -1437,6 +1545,7 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         s.by_register.clear();
         s.uncovered.clear();
         s.index_type_pairs.clear();
+        s.callers.clear();
         s.rt_odd_info.clear();
         s.uncovered_values.clear();
         s.last_log_ns = now;
@@ -1538,7 +1647,7 @@ u64 PS4_SYSV_ABI PrepareNote(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 std::atomic<u64> exec_drawn{};
 std::atomic<u64> exec_fallback{};
 
-bool ExecEligible(u64 ctx, u64 seq) {
+bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
     if (Slot(seq).flags != 0 || (Rd<u8>(ctx, 0x13009) & 1) != 0 || (Rd<u8>(ctx, 0x48de) & 1) != 0) {
         return false;
     }
@@ -1549,7 +1658,15 @@ bool ExecEligible(u64 ctx, u64 seq) {
     if (state.target_signature == 0 || state.target_signature != TargetSignature(ctx)) {
         return false;
     }
-    return (++state.draws % AuditEvery) != 0;
+    CallerTrust* trust = TrustFor(caller);
+    if (trust == nullptr) {
+        return false;
+    }
+    const u32 total = trust->total.load(std::memory_order_relaxed);
+    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 50 >= total) {
+        return false;
+    }
+    return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
 }
 
 /// What the game's draw functions and PrepareDraw leave in the engine's objects besides command packets.
@@ -1609,11 +1726,11 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     std::memcpy(&words[3], &k1, sizeof(u64));
     std::memcpy(&words[5], &k2, sizeof(u64));
     std::memcpy(&words[7], &k3, sizeof(u64));
-    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx, kind, a1, a2, a3) : 0;
+    const u64 seq = policy.native_synth_verify.load(std::memory_order_relaxed) != 0 ? MakeRecord(ctx, kind, a1, a2, a3, ret) : 0;
     std::memcpy(&words[9], &seq, sizeof(u64));
     words[11] = 0;
     words[12] = 0;
-    const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq);
+    const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
     }

@@ -1168,7 +1168,10 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
         }
         if (gnm) {
             const u64 regs = gnm + 8;
-            const u64 fetch_obj = Rd<u64>(vs + 0x30, 0xe0);
+            // The fetch shader object belongs to the input layout; without a layout the game binds the shader with
+            // modifier 0 and no fetch address.
+            const bool has_layout = Rd<u64>(ctx, Ctx::InputLayout) != 0;
+            const u64 fetch_obj = has_layout ? Rd<u64>(vs + 0x30, 0xe0) : 0;
             if (Rd<u64>(vs, 0x420) != 0 || Rd<u64>(ctx, 0x4680) != 0 || Rd<u64>(ctx, 0x4688) != 0 ||
                 Rd<u32>(ctx, 0x130c8) == 0x200) {
                 synth_flags |= SpecialPipeline;
@@ -1179,25 +1182,30 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             const u32 modifier = fetch_obj ? Rd<u32>(fetch_obj, 0x40) : 0;
             const u64 fetch_addr = fetch_obj ? Rd<u64>(fetch_obj, 0x30) : 0;
             const u32 r2 = Rd<u32>(regs, 8);
-            sh_reg(0x48, Rd<u32>(regs, 0));
-            sh_reg(0x49, 0);
-            // the modifier of the fetch shader object goes into the shader's first resource word; a vertex shader whose
-            // fetch object does not exist yet gets it created during this draw
             bool takes_fetch_shader = false;
             for (u32 k = 0; k < Rd<u8>(gnm, 3) && k < 40; ++k) {
                 takes_fetch_shader |= Rd<u8>(gnm + 0x28 + k * 4, 0) == 18;
             }
-            // The register keeps the shader's value with the fetch object's modifier merged in. Shaders that take
-            // the fetch shader pointer cannot run natively until that object exists (it is created by their first draw).
+            // Shaders that take the fetch shader pointer cannot run natively until that object exists (it is created by
+            // their first draw).
             if (takes_fetch_shader && fetch_obj == 0) {
                 synth_flags |= NoFetchObject;
             }
-            sh_reg(0x4a, fetch_obj != 0 ? (r2 & 0xfcfffc3fu) | modifier : r2);
-            sh_reg(0x4b, Rd<u32>(regs, 12));
-            context_reg(0x207, Rd<u32>(regs, 24));
-            context_reg(0x1b1, Rd<u32>(regs, 16));
-            context_reg(0x1c3, Rd<u32>(regs, 20));
-            if (fetch_obj) {
+            // PrepareDraw binds the vertex shader only when (shader, modifier, fetch address) differ from the cached
+            // ones, and a bind merges the modifier into the first resource word when it is not zero. A register file
+            // that holds something else (a reset by the frame's default state) keeps it.
+            const bool bind = Rd<u64>(ctx, 0x4440) != gnm || Rd<u32>(ctx, 0x4448) != modifier ||
+                              Rd<u64>(ctx, 0x4450) != fetch_addr;
+            if (bind) {
+                sh_reg(0x48, Rd<u32>(regs, 0));
+                sh_reg(0x49, 0);
+                sh_reg(0x4a, modifier != 0 ? (r2 & 0xfcfffc3fu) | modifier : r2);
+                sh_reg(0x4b, Rd<u32>(regs, 12));
+                context_reg(0x207, Rd<u32>(regs, 24));
+                context_reg(0x1b1, Rd<u32>(regs, 16));
+                context_reg(0x1c3, Rd<u32>(regs, 20));
+            }
+            if (fetch_obj && (Rd<u32>(ctx, 0x4710) != Rd<u32>(fetch_obj, 0x48) || Rd<u32>(ctx, 0x4714) != Rd<u32>(fetch_obj, 0x4c))) {
                 context_reg(0x2a8, Rd<u32>(fetch_obj, 0x48));
                 context_reg(0x2a9, Rd<u32>(fetch_obj, 0x4c));
             }
@@ -1375,6 +1383,85 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         cs_reg(0x13, Rd<u32>(regs, 12));
         SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
                            n, slot);
+    }
+    slot.flags = synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.count = n;
+    slot.seq.store(seq, std::memory_order_release);
+    return seq;
+}
+
+/// Guest thread: the record of a CsCopyBufferDwords dispatch. The state is fully given by the arguments and the device's
+/// copy shader: the source buffer is the shader resource of slot 0, the destination the RW resource of slot 0, both
+/// described by V# words built from the addresses. No program packets are written by the game's path for this one
+/// beyond the shader bind, so the record carries the program registers too.
+u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) {
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.unsupported_inputs = 0;
+    slot.unsupported_mask = 0;
+    synth_flags = 0;
+    slot.kind = 3;
+    slot.caller = caller;
+    slot.a1 = (static_cast<u32>(bytes) + 3) >> 2;
+    slot.a2 = 1;
+    slot.rt_info = 0;
+    slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
+    slot.ps_gnm = 0;
+    const VAddr image = image_base.load(std::memory_order_relaxed);
+    const u64 device = image ? Rd<u64>(image + 0x6b03540 - 0x1000000, 0) : 0;
+    const u64 gnm = device ? Rd<u64>(device, 0x120) : 0;
+    slot.vs_gnm = gnm;
+    u32 n = 0;
+    if (gnm == 0) {
+        synth_flags |= NoVertexShader;
+    } else {
+        const u64 regs = gnm + 8;
+        const u32 words = (static_cast<u32>(bytes) + 3) >> 2;
+        const auto cs_reg = [&](u32 dword, u32 value) {
+            slot.regs[n++] = {Core::NativeDraw::ComputeRegisterBase + dword, value};
+        };
+        cs_reg(0x00, (u32(Rd<u8>(ctx, 0x13015)) * 8 & 0x18) + 1);
+        cs_reg(0x01, (words + 0x3f) >> 6);
+        cs_reg(0x02, 1);
+        cs_reg(0x03, 1);
+        cs_reg(0x07, Rd<u32>(regs, 16));
+        cs_reg(0x08, Rd<u32>(regs, 20));
+        cs_reg(0x09, Rd<u32>(regs, 24));
+        cs_reg(0x0c, Rd<u32>(regs, 0));
+        cs_reg(0x0d, 0);
+        cs_reg(0x12, Rd<u32>(regs, 8));
+        cs_reg(0x13, Rd<u32>(regs, 12));
+        const std::array<u32, 4> source_descriptor{static_cast<u32>(source), static_cast<u32>(source >> 32) & 0xfff | 0x40000, words,
+                                                   0x20024004};
+        const std::array<u32, 4> destination_descriptor{static_cast<u32>(destination),
+                                                        static_cast<u32>(destination >> 32) & 0xfff | 0x47000, words,
+                                                        0x18024004};
+        std::array<u32, 16> sgpr{};
+        for (u32 i = 0; i < Rd<u8>(gnm, 3) && i < 40; ++i) {
+            const u64 e = gnm + 0x28 + i * 4;
+            const u32 type = Rd<u8>(e, 0);
+            const u32 slot_index = Rd<u8>(e, 1);
+            const u32 start = Rd<u8>(e, 2);
+            if (start > 12) {
+                ++slot.unsupported_inputs;
+            } else if ((type == 0 || type == 4) && slot_index == 0) {
+                const auto& descriptor = type == 0 ? source_descriptor : destination_descriptor;
+                for (u32 k = 0; k < 4; ++k) {
+                    sgpr[start + k] = descriptor[k];
+                }
+                for (u32 k = 0; k < 4; ++k) {
+                    cs_reg(0x40 + start + k, descriptor[k]);
+                }
+            } else if (type == 26) {
+                const u64 table = Rd<u64>(ctx, 0x12f30);
+                cs_reg(0x40 + start, static_cast<u32>(table));
+                cs_reg(0x40 + start + 1, static_cast<u32>(table >> 32));
+            } else {
+                ++slot.unsupported_inputs;
+            }
+        }
     }
     slot.flags = synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
@@ -1889,22 +1976,35 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
 void RunResourceTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
-    const auto run_stage = [&](u64 mask_lo, u64 mask_hi, u64 table) {
+    // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const auto run_stage = [&](u64 mask_lo, u64 mask_hi, u64 table, u32 stage) {
         for (u32 slot = 0; slot < 128; ++slot) {
             const u64 mask = slot < 64 ? mask_lo : mask_hi;
             if (((mask >> (slot & 63)) & 1) == 0) {
                 continue;
             }
-            if (const u64 view = Rd<u64>(ctx, table + slot * 8); view != 0) {
-                track(ctx, Rd<u64>(view, 0x30));
+            const u64 view = Rd<u64>(ctx, table + slot * 8);
+            if (view == 0) {
+                continue;
             }
+            const u64 resource = valid(view) ? Rd<u64>(view, 0x30) : 0;
+            if (!valid(resource)) {
+                static std::atomic<u32> reports{0};
+                if (reports.fetch_add(1) < 6) {
+                    LOG_WARNING(Core, "native tracking: stage {} slot {} has view {:#x} with resource {:#x}: skipped", stage,
+                                slot, view, resource);
+                }
+                continue;
+            }
+            track(ctx, resource);
         }
     };
-    if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader); vs != 0 && Rd<u8>(vs + 0x30, 0xd6) == 0) {
-        run_stage(Rd<u64>(vs + 0x30, 0xc0), Rd<u64>(vs + 0x30, 0xc8), Ctx::ShaderResourceTable(0));
+    if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader); valid(vs) && Rd<u8>(vs + 0x30, 0xd6) == 0) {
+        run_stage(Rd<u64>(vs + 0x30, 0xc0), Rd<u64>(vs + 0x30, 0xc8), Ctx::ShaderResourceTable(0), 0);
     }
-    if (const u64 ps = Rd<u64>(ctx, Ctx::PixelShader); ps != 0 && Rd<u8>(ps, 0x106) == 0) {
-        run_stage(Rd<u64>(ps, 0xf0), Rd<u64>(ps, 0xf8), Ctx::ShaderResourceTable(1));
+    if (const u64 ps = Rd<u64>(ctx, Ctx::PixelShader); valid(ps) && Rd<u8>(ps, 0x106) == 0) {
+        run_stage(Rd<u64>(ps, 0xf0), Rd<u64>(ps, 0xf8), Ctx::ShaderResourceTable(1), 1);
     }
 }
 
@@ -2131,6 +2231,45 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     return 1;
 }
 
+/// CsCopyBufferDwords(writer, destination, source, bytes): the game's own code builds the descriptors and binds the copy
+/// shader; with execution the record replaces that and the dispatch packet.
+u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
+    const u64 ctx = writer - 0x47c0;
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || writer == 0 ||
+        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
+        return 0;
+    }
+    const u64 seq = MakeCopyRecord(ctx, destination, source, bytes, ret);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (3u << 8);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+                      (Rd<u8>(ctx, 0x13009) & 1) == 0 && ExecEligibleCompute(ctx, seq, ret);
+    if (exec) {
+        words[2] |= ExecFlag;
+    }
+    if (!WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    if (!exec) {
+        return 0;
+    }
+    compute_drawn.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+u64 PS4_SYSV_ABI TagCsCopyHandler(u64 writer, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return TagCsCopy(writer, a1, a2, a3 & 0xffffffff, ret);
+}
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
@@ -2162,6 +2301,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "draw_probe_auto") {
         return reinterpret_cast<u64>(&ProbeAuto);
+    }
+    if (name == "tag_cs_copy") {
+        return reinterpret_cast<u64>(&TagCsCopyHandler);
     }
     if (name == "tag_dispatch") {
         return reinterpret_cast<u64>(&TagDispatch);

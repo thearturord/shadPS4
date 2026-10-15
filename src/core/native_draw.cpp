@@ -2088,7 +2088,10 @@ std::atomic<u64> tags_failed{};
 std::atomic<u64> last_tag_log_ns{0};
 
 constexpr u32 ExecFlag = 1u << 16; ///< tag meta: the draw is executed from its record, the game wrote no packets for it
-constexpr u32 AuditEvery = 64;
+/// Every Nth draw of a call site takes the packet path (0 = never).
+u32 AuditPeriod() {
+    return VideoCore::ReadbackPolicy::Get().native_audit_every.load(std::memory_order_relaxed);
+}
 
 struct ExecContextState {
     u64 ctx{};
@@ -2184,7 +2187,8 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
     if (trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
         return no(FbTrustBad);
     }
-    if ((trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery == 0) {
+    if (const u32 period = AuditPeriod();
+        period != 0 && (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % period == 0) {
         return no(FbAudit);
     }
     return true;
@@ -2646,7 +2650,8 @@ bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
     if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
         return false;
     }
-    return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
+    const u32 period = AuditPeriod();
+    return period == 0 || (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % period != 0;
 }
 
 /// A dispatch wrapper (x, y, z thread groups): PrepareDispatch, the constant update engine flush and the dispatch packet.
@@ -2744,7 +2749,8 @@ bool ExecEligibleAsc(u64 seq, u64 caller) {
     if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
         return false;
     }
-    return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
+    const u32 period = AuditPeriod();
+    return period == 0 || (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % period != 0;
 }
 
 /// What the game's PrepareDispatch of the compute context and the constant update engine flush leave in the engine's
@@ -2836,8 +2842,11 @@ u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u6
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
+/// The fenced dispatch wrapper adds an in-stream scratch label that the dispatch writes at its end and a wait on it: a
+/// command processor stall that only orders the dispatch against later commands. The raster thread runs everything in
+/// order, so with execution the wait and its label are not needed (game-visible fences are other packets).
 u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return TagCompute(ctx, a1, a2, a3, ret, false);
+    return TagCompute(ctx, a1, a2, a3, ret, true);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 2, true);

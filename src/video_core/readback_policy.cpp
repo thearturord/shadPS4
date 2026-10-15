@@ -35,6 +35,7 @@ void InitFromSettings() {
     s.native_draw_classes = EmulatorSettings.GetNativeDrawClasses();
     s.native_synth_verify = EmulatorSettings.IsNativeSynthVerify() ? 1 : 0;
     s.native_draw_exec = EmulatorSettings.IsNativeDrawExec() ? 1 : 0;
+    s.native_audit_every = EmulatorSettings.GetNativeAuditEvery();
 }
 
 bool Set(std::string_view name, s64 value) {
@@ -75,6 +76,8 @@ bool Set(std::string_view name, s64 value) {
         s.native_synth_verify = static_cast<u32>(value);
     } else if (name == "native_draw_exec") {
         s.native_draw_exec = static_cast<u32>(value);
+    } else if (name == "native_audit_every") {
+        s.native_audit_every = static_cast<u32>(value);
     } else {
         return false;
     }
@@ -108,6 +111,7 @@ nlohmann::json Dump() {
             {"raster_core", s.raster_core.load()},
             {"native_draw_mode", s.native_draw_mode.load()},
             {"native_draw_classes", s.native_draw_classes.load()},
+            {"native_audit_every", s.native_audit_every.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};
 }

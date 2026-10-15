@@ -426,14 +426,34 @@ void Liverpool::DrainRasterWrites() {
 void Liverpool::RasterDispatch(const RasterCall& call_in) {
     RasterCall call = call_in;
     if (native_tag_pending.valid) {
-        // a dispatch tag belongs to a dispatch, the other kinds to draws; a tag that finds the wrong kind is dropped
-        const bool dispatch_call = call.kind == RasterCall::Kind::DispatchDirect ||
-                                   call.kind == RasterCall::Kind::DispatchIndirect;
-        if (((native_tag_pending.meta >> 8) & 0xff) == 3 ? dispatch_call : !dispatch_call) {
+        // The tag belongs to the draw or dispatch the game called. The game's own tracking may issue internal draws
+        // (full-screen quads) in between: a call that does not fit the tag (kind, count) leaves it pending.
+        const u32 tag_kind = (native_tag_pending.meta >> 8) & 0xff;
+        bool match = false;
+        switch (call.kind) {
+        case RasterCall::Kind::Draw:
+            // internal full-screen quads (resource transitions) run the emulator's embedded vertex shader, whose
+            // address has bits above the game's address space in SPI_SHADER_PGM_HI_VS
+            match = tag_kind <= 1 && (tag_kind == 0) == call.indexed &&
+                    regs.reg_array[Regs::ShRegWordOffset + 0x49] == 0 &&
+                    Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == regs.num_indices;
+            break;
+        case RasterCall::Kind::DrawIndirect:
+            match = tag_kind == 2;
+            break;
+        default:
+            match = tag_kind == 3;
+            break;
+        }
+        if (match) {
             call.tag = native_tag_pending;
+            native_tag_pending.valid = false;
+            native_tag_skips = 0;
+        } else if (++native_tag_skips > 6) {
+            native_tag_pending.valid = false;
+            native_tag_skips = 0;
         }
     }
-    native_tag_pending.valid = false;
     if (!split_active) {
         ExecRasterCall(call, nullptr, nullptr);
         return;

@@ -687,7 +687,8 @@ const ShaderLoads& ScanShaderLoads(u64 gnm) {
             const u32 opcode = (w >> 22) & 0x1f;
             if (opcode <= 4) {
                 const u32 sgpr = ((w >> 9) & 0x3f) * 2;
-                const u32 dwords = 1u << opcode;
+                // an x16 load reads a texture descriptor with its fmask words: only the first 8 dwords are the slot
+                const u32 dwords = opcode == 4 ? 8u : 1u << opcode;
                 if ((w >> 8) & 1) {
                     for (u32 k = 0; k < dwords && sgpr < 16; ++k) {
                         if ((w & 0xff) + k < 256) {
@@ -715,6 +716,22 @@ const ShaderLoads& ScanShaderLoads(u64 gnm) {
     return loads;
 }
 
+/// Slots of a table the game's constant update engine fills for this shader: the engine's own masks in the shader's
+/// stage block (shader resources 128 bits at +0xc0/+0xc8, constant buffers +0xb0, samplers +0xb4, RW resources +0xd0).
+/// The other slots hold whatever the packet memory had before.
+std::array<u64, 2> EngineUsedSlots(u64 block, u32 type) {
+    switch (type) {
+    case 19:
+        return {Rd<u64>(block, 0xc0), Rd<u64>(block, 0xc8)};
+    case 22:
+        return {Rd<u32>(block, 0xb0) & 0xffffu, 0};
+    case 21:
+        return {Rd<u32>(block, 0xb4) & 0xffffu, 0};
+    default:
+        return {Rd<u32>(block, 0xd0) & 0xffu, 0};
+    }
+}
+
 /// Entries of a table (`entry_dwords` per slot) the shader reads through the pointer in SGPR `sgpr`.
 std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dwords, u32 slots) {
     std::array<u64, 2> mask{};
@@ -734,6 +751,7 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
 
 thread_local u32 synth_flags;
 thread_local u64 synth_fetch_address;
+thread_local u64 synth_vs_gnm;
 thread_local u32 synth_rt_info; ///< count | view mask << 8 | empty block mask << 16
 thread_local u64 dbg_vs;
 thread_local u64 dbg_fetch;
@@ -742,8 +760,8 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out);
 
 /// User data of one stage (SGPR values the constant update engine would have written): descriptors of the bound
 /// objects copied by the shader's input usage table. `sgpr_base` = index of the stage's first user data register.
-void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr_base, SynthReg* out, u32& n,
-                        NativeRecord& record) {
+void SynthesizeUserData(u64 ctx, u32 stage, u64 shader_block, u64 gnm, u64 inputs_offset, u32 sgpr_base, SynthReg* out,
+                        u32& n, NativeRecord& record) {
     if (!gnm) {
         return;
     }
@@ -819,6 +837,55 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
             put(start, words.data(), 2);
             break;
         }
+        case 23: { // pointer to the vertex buffer table: one V# per element of the input layout
+            const u64 layout = stage == 0 ? Rd<u64>(ctx, Ctx::InputLayout) : 0;
+            const u32 elements = layout ? Rd<u32>(layout, Layout::ElementCount) : 0;
+            if (layout == 0 || elements == 0 || elements > 32 || pending_count >= pending.size() || start >= 15) {
+                ++record.unsupported_inputs;
+                record.unsupported_mask |= 1u << 23;
+                break;
+            }
+            const VAddr image = image_base.load(std::memory_order_relaxed);
+            const u64 format_table = image + 0x6b035a0 - 0x1000000;
+            const u64 empty_descriptor = image + 0x25380a0 - 0x1000000;
+            u32* table = AllocTable(elements * 4);
+            for (u32 e = 0; e < elements; ++e) {
+                const u64 element = layout + Layout::Elements + e * Layout::ElementStride;
+                const u32 vertex_slot = Rd<u32>(element, 8);
+                const u64 buffer = Rd<u64>(ctx, Ctx::VertexBufferSlots + vertex_slot * 8);
+                u32* v = table + e * 4;
+                if (buffer == 0 || vertex_slot >= 32) {
+                    for (u32 k = 0; k < 4; ++k) {
+                        v[k] = Rd<u32>(empty_descriptor, k * 4);
+                    }
+                    continue;
+                }
+                const u32 stride = Rd<u32>(ctx, Ctx::VertexStrides + vertex_slot * 4);
+                const u64 address = u64(Rd<u32>(ctx, Ctx::VertexOffsets + vertex_slot * 4)) + Rd<u32>(element, 12) +
+                                    Rd<u64>(buffer, 0x30);
+                const u32 format = Rd<u32>(format_table, Rd<u32>(element, 4) * 4);
+                u32 extra = 0;
+                if ((format & 0x800) < 0x800 && ((format & 0xff) - 1) < 0xe) {
+                    const u32 shifted = (format & 0xf) << 15;
+                    if ((format & 0xf00) == 0x700) {
+                        extra = shifted;
+                    }
+                    if ((format & 0xfe) != 6) {
+                        extra = shifted;
+                    }
+                }
+                v[0] = static_cast<u32>(address);
+                v[1] = (stride & 0x3fff) << 16 | static_cast<u32>(address >> 32) & 0xfff;
+                v[2] = stride != 0 ? Rd<u32>(buffer, 0x180) / stride : 0;
+                v[3] = (format >> 12 & 0xfff) | extra | (format & 0x700) << 4 | 0x20000000;
+            }
+            const u64 address = reinterpret_cast<u64>(table);
+            sgpr[start] = static_cast<u32>(address);
+            sgpr[start + 1] = static_cast<u32>(address >> 32);
+            sgpr_set[start] = sgpr_set[start + 1] = false;
+            pending[pending_count++] = {sgpr_base + start, type, table, elements * 4, 4, {~0ull, ~0ull}};
+            break;
+        }
         case 27: // pointer to the extended user data
             have_eud_ptr = true;
             eud_ptr_sgpr = start;
@@ -861,7 +928,7 @@ void SynthesizeUserData(u64 ctx, u32 stage, u64 gnm, u64 inputs_offset, u32 sgpr
                 sgpr[start + 1] = static_cast<u32>(address >> 32);
                 sgpr_set[start] = sgpr_set[start + 1] = false; // compared by content, not by value
                 pending[pending_count++] = {sgpr_base + start, type, table, slots * entry, entry,
-                                            UsedSlots(ScanShaderLoads(gnm), start, entry, slots)};
+                                            EngineUsedSlots(shader_block, type)};
             }
             break;
         }
@@ -930,8 +997,12 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
         if (raster == 0) {
             raster = Rd<u64>(dev.device, 0x30278);
         }
-        if (raster) {
-            context_reg(0x205, Rd<u32>(raster, 0x4c) & 0x393fff);
+        // PrepareDraw writes the rasterizer registers only while the state is marked dirty, and PA_SU_SC_MODE_CNTL only when
+        // its cached copy differs: a register file that holds something else (reset by the frame's default state) keeps it.
+        if (raster && Rd<u8>(ctx, 0x46d8) != 0) {
+            if (Rd<u32>(ctx, 0x46d0) != Rd<u32>(raster, 0x4c)) {
+                context_reg(0x205, Rd<u32>(raster, 0x4c) & 0x393fff);
+            }
             context_reg(0x204, Rd<u32>(raster, 0x50) & 0xf7fe03f);
         }
     }
@@ -1091,6 +1162,7 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
         const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
         const u64 gnm = vs ? Rd<u64>(vs, 0x120) : 0;
         *vs_gnm_out = gnm;
+        synth_vs_gnm = gnm;
         if (!gnm) {
             synth_flags |= NoVertexShader;
         }
@@ -1152,8 +1224,27 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             context_reg(0x8f, Rd<u32>(regs, 44));
             // SPI_PS_INPUT_CNTL_n: the interpolant table that follows the shader's input usage table
             const u64 interpolants = gnm + 0x3c + u64(Rd<u8>(gnm, 3)) * 4;
-            for (u32 k = 0; k < (Rd<u32>(regs, 32) & 0x3f) && k < 32; ++k) {
-                context_reg(0x191 + k, Rd<u16>(interpolants, k * 2));
+            // each entry is matched with the vertex shader's output semantics (same rule as the constant update engine)
+            const u64 vertex = synth_vs_gnm;
+            const u64 vertex_semantics =
+                vertex + u64(Rd<u8>(vertex, 3)) * 4 + 0x28 + u64(Rd<u8>(vertex, 0x24)) * 4;
+            const u32 vertex_semantic_count = Rd<u8>(vertex, 0x25);
+            for (u32 k = 0; vertex != 0 && k < Rd<u8>(gnm, 0x38) && k < 32; ++k) {
+                const u32 entry = Rd<u16>(interpolants, k * 2);
+                bool found = false;
+                u32 offset = 0;
+                for (u32 j = 0; j < vertex_semantic_count && !found; ++j) {
+                    if (Rd<u8>(vertex_semantics, j * 2) == (entry & 0xff)) {
+                        found = true;
+                        offset = Rd<u8>(vertex_semantics, j * 2 + 1) & 0x1f;
+                    }
+                }
+                u32 value = 0x20;
+                if (found) {
+                    value = ((entry >> 7) & 0x20) | offset;
+                    value |= (((entry >> 12) | (entry >> 10)) & 1) << 10;
+                }
+                context_reg(0x191 + k, ((entry >> 8) & 3) << 8 | value);
             }
         } else {
             sh_reg(8, 0);
@@ -1193,13 +1284,15 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.dbg_layout = Rd<u64>(ctx, 0x68);
     {
         u32 n = slot.count;
-        SynthesizeUserData(ctx, 0, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
-        SynthesizeUserData(ctx, 1, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
+        const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
+        const u64 pixel_shader = Rd<u64>(ctx, Ctx::PixelShader);
+        SynthesizeUserData(ctx, 0, vertex_shader + 0x30, slot.vs_gnm, 0x28, ShBase + 0x4c, slot.regs.data(), n, slot);
+        SynthesizeUserData(ctx, 1, pixel_shader + 0x30, slot.ps_gnm, 0x3c, ShBase + 0x0c, slot.regs.data(), n, slot);
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
         if (kind != 2) {
             slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
-            slot.regs[n++] = {UconfigBase + 0x24d, Rd<u32>(ctx, 0x4724)};
+            slot.regs[n++] = {UconfigBase + 0x24d, 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
         }
         if (kind == 2) {
             // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
@@ -1280,7 +1373,8 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         cs_reg(0x09, Rd<u32>(regs, 24));
         cs_reg(0x12, Rd<u32>(regs, 8)); // COMPUTE_PGM_RSRC1 / RSRC2
         cs_reg(0x13, Rd<u32>(regs, 12));
-        SynthesizeUserData(ctx, 5, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(), n, slot);
+        SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
+                           n, slot);
     }
     slot.flags = synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.count = n;
@@ -1352,6 +1446,7 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     auto& by_reg = record_kind == 3 ? s.by_register_cs : s.by_register;
     ++s.draws_checked;
     bool any = false;
+    bool critical = false;
     {
         static std::map<u64, u32> caller_dumps;
         u32& dumped_for_caller = caller_dumps[caller];
@@ -1359,7 +1454,7 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
             std::string diff;
             u32 differing = 0;
             for (u32 i = 0; i < count; ++i) {
-                if (reg_array[regs[i].index] != regs[i].value) {
+                if (reg_array[regs[i].index] != regs[i].value && regs[i].index != ShBase + 0x4a) {
                     ++differing;
                     if (differing <= 30) {
                         diff += fmt::format(" {:#x}:{:x}/{:x}", regs[i].index, regs[i].value, reg_array[regs[i].index]);
@@ -1369,8 +1464,9 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
             if (differing > 0 && count > 0) {
                 ++dumped_for_caller;
                 const VAddr base = image_base.load(std::memory_order_relaxed);
-                LOG_INFO(Core, "native draw diff: caller {:#x} kind {} class? {} regs differ {} (built/actual):{}",
-                         base ? caller - base + 0x1000000 : caller, slot.kind, flags, differing, diff);
+                LOG_INFO(Core, "native draw diff: caller {:#x} kind {} count {} actual count {} flags {} regs differ {} (built/actual):{}",
+                         base ? caller - base + 0x1000000 : caller, slot.kind, slot.a1,
+                         record_kind == 3 ? 0u : reg_array[UconfigBase + 0x24c], flags, differing, diff);
             }
         }
     }
@@ -1378,6 +1474,7 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         ++s.registers_compared;
         const u32 actual = reg_array[regs[i].index];
         if (actual != regs[i].value) {
+            critical |= regs[i].index != ShBase + 0x4a;
             if (regs[i].index == ShBase + 0x4c || regs[i].index == ShBase + 0x4a) {
                 static u32 fetch_dumps = 0;
                 static std::map<u64, u32> fetch_dumped_vs;
@@ -1428,8 +1525,10 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
             first_actual = Rd<u32>(ptr, 0);
         }
         if (!same) {
+            critical = true;
             static u32 table_dumps = 0;
-            if (ptr != 0 && table_dumps < 80 && Core::Memory::Instance()->IsValidMapping(ptr, check.dwords * 4)) {
+            static std::map<std::pair<u64, u32>, u32> table_dumped;
+            if (ptr != 0 && table_dumps < 300 && table_dumped[{caller, check.reg}]++ < 2 && Core::Memory::Instance()->IsValidMapping(ptr, check.dwords * 4)) {
                 ++table_dumps;
                 std::string text;
                 for (u32 k = 0; k < check.dwords && k < 48; ++k) {
@@ -1437,8 +1536,10 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                     const u32 a = Rd<u32>(ptr, k * 4);
                     text += b == a ? fmt::format(" {:x}", a) : fmt::format(" [{}:{:x}/{:x}]", k, b, a);
                 }
-                LOG_INFO(Core, "native table diff: kind {} reg {:#x} dwords {} (built/actual):{}", check.kind, check.reg,
-                         check.dwords, text);
+                const VAddr image = image_base.load(std::memory_order_relaxed);
+                LOG_INFO(Core, "native table diff: caller {:#x} kind {} reg {:#x} dwords {} used {:#x}/{:#x} (built/actual):{}",
+                         image ? caller - image + 0x1000000 : caller, check.kind, check.reg, check.dwords, check.slot_mask[0],
+                         check.slot_mask[1], text);
             }
             ++s.mismatches;
             any = true;
@@ -1529,10 +1630,10 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         s.compute_differ += any;
         s.compute_flagged += flags != 0;
     }
-    ++s.callers[{caller, any}];
+    ++s.callers[{caller, critical}];
     if (auto* trust = TrustFor(caller)) {
         trust->total.fetch_add(1, std::memory_order_relaxed);
-        trust->bad.fetch_add(any ? 1 : 0, std::memory_order_relaxed);
+        trust->bad.fetch_add(critical ? 1 : 0, std::memory_order_relaxed);
         if (trust->total.load(std::memory_order_relaxed) >= 4096) {
             trust->total.store(trust->total.load() / 2, std::memory_order_relaxed);
             trust->bad.store(trust->bad.load() / 2, std::memory_order_relaxed);
@@ -1659,6 +1760,12 @@ void VerifyComputeRecord(u64 seq, const u32* cs_dwords) {
     VerifyRecord(seq, cs_dwords - ComputeRegisterBase);
 }
 
+u32 RecordDrawCount(u64 seq) {
+    auto& slot = Slot(seq);
+    const u32 count = slot.a1;
+    return slot.seq.load(std::memory_order_acquire) == seq ? count : 0xffffffffu;
+}
+
 bool TakeExecDraw(u64 seq, ExecDraw& out) {
     NoteConsumed(seq);
     auto& slot = Slot(seq);
@@ -1771,10 +1878,34 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
         return false;
     }
     const u32 total = trust->total.load(std::memory_order_relaxed);
-    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 50 >= total) {
+    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
         return false;
     }
     return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
+}
+
+/// The resource tracking at the start of PrepareDraw: for every shader resource view the vertex and pixel shader
+/// use, the game's own tracking function runs (it may write barrier packets or draw internal full-screen quads).
+void RunResourceTracking(u64 ctx) {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
+    const auto run_stage = [&](u64 mask_lo, u64 mask_hi, u64 table) {
+        for (u32 slot = 0; slot < 128; ++slot) {
+            const u64 mask = slot < 64 ? mask_lo : mask_hi;
+            if (((mask >> (slot & 63)) & 1) == 0) {
+                continue;
+            }
+            if (const u64 view = Rd<u64>(ctx, table + slot * 8); view != 0) {
+                track(ctx, Rd<u64>(view, 0x30));
+            }
+        }
+    };
+    if (const u64 vs = Rd<u64>(ctx, Ctx::VertexShader); vs != 0 && Rd<u8>(vs + 0x30, 0xd6) == 0) {
+        run_stage(Rd<u64>(vs + 0x30, 0xc0), Rd<u64>(vs + 0x30, 0xc8), Ctx::ShaderResourceTable(0));
+    }
+    if (const u64 ps = Rd<u64>(ctx, Ctx::PixelShader); ps != 0 && Rd<u8>(ps, 0x106) == 0) {
+        run_stage(Rd<u64>(ps, 0xf0), Rd<u64>(ps, 0xf8), Ctx::ShaderResourceTable(1));
+    }
 }
 
 /// What the game's draw functions and PrepareDraw leave in the engine's objects besides command packets.
@@ -1806,9 +1937,19 @@ void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
             Wr<u32>(object, 0x2c, stamp);
         }
     }
+    if (const u64 layout = Rd<u64>(ctx, Ctx::InputLayout); layout != 0) {
+        Wr<u32>(layout, 0x2c, stamp);
+        const u32 elements = Rd<u32>(layout, Layout::ElementCount);
+        for (u32 e = 0; e < elements && e < 32; ++e) {
+            const u32 vertex_slot = Rd<u32>(layout + Layout::Elements + e * Layout::ElementStride, 8);
+            if (const u64 buffer = vertex_slot < 32 ? Rd<u64>(ctx, Ctx::VertexBufferSlots + vertex_slot * 8) : 0; buffer != 0) {
+                Wr<u32>(buffer, 0x2c, stamp);
+            }
+        }
+    }
 }
 
-u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
+u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
         return 0;
@@ -1817,6 +1958,38 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind) {
     if (((policy.native_draw_classes.load(std::memory_order_relaxed) >> cls) & 1) == 0) {
         tags_skipped_class.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
+    // and write barrier packets or draw internal quads, which then come before the tag.
+    if (track && policy.native_synth_verify.load(std::memory_order_relaxed) != 0) {
+        const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
+        if (vertex_shader != 0 && Rd<u64>(vertex_shader, 0x420) == 0 && Rd<u64>(ctx, 0x4680) == 0 &&
+            Rd<u64>(ctx, 0x4688) == 0 && Rd<u32>(ctx, 0x130c8) != 0x200) {
+            RunResourceTracking(ctx);
+        }
+    }
+    {
+        static std::atomic<u32> forward_dumps{0};
+        const VAddr base = image_base.load(std::memory_order_relaxed);
+        if (base != 0 && ret - base + 0x1000000 == 0x1c7819d && forward_dumps.fetch_add(1) < 8) {
+            const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
+            std::string text = fmt::format("ps {:#x} flags 106={:#x} 107={:#x} 108={:#x} masks {:#x}/{:#x}:", ps,
+                                           Rd<u8>(ps, 0x106), Rd<u8>(ps, 0x107), Rd<u32>(ps, 0x108), Rd<u64>(ps, 0xf0),
+                                           Rd<u64>(ps, 0xf8));
+            for (u32 slot = 0; slot < 16; ++slot) {
+                const u64 view = Rd<u64>(ctx, Ctx::ShaderResourceTable(1) + slot * 8);
+                if (view) {
+                    text += fmt::format(" [{}: view {:#x} kind {} T# {:x} {:x} res {:#x}]", slot, view, Rd<u32>(view, 0x44),
+                                        Rd<u32>(view, 0x58), Rd<u32>(view, 0x5c), Rd<u64>(view, 0x30));
+                }
+            }
+            const u64 ps_gnm_dump = Rd<u64>(ps, 0x120);
+            for (u32 k = 0; ps_gnm_dump && k < Rd<u8>(ps_gnm_dump, 3) && k < 40; ++k) {
+                const u64 e = ps_gnm_dump + 0x3c + k * 4;
+                text += fmt::format(" <{} s{} r{} f{}>", Rd<u8>(e, 0), Rd<u8>(e, 1), Rd<u8>(e, 2), Rd<u8>(e, 3));
+            }
+            LOG_INFO(Core, "native forward dump: {}", text);
+        }
     }
     const Signature sig = Compute(ctx, a1, a2, a3, kind);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
@@ -1894,7 +2067,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
 }
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return Tag(ctx, a1, a2, a3, ret, 0);
+    return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0);
 }
 bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
     if (Slot(seq).flags != 0 || (Rd<u8>(ctx, 0x13009) & 1) != 0) {
@@ -1908,7 +2081,7 @@ bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
         return false;
     }
     const u32 total = trust->total.load(std::memory_order_relaxed);
-    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 50 >= total) {
+    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
         return false;
     }
     return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
@@ -1924,6 +2097,12 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
+    // PrepareDispatch first (resource tracking, descriptor updates, the program packets); the wrapper runs it again
+    // when the dispatch is not executed natively, which finds nothing left to do
+    if (Rd<u64>(ctx, 0x4670) != 0) {
+        const VAddr base = image_base.load(std::memory_order_relaxed);
+        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(base + 0x2479b70 - 0x1000000)(ctx);
+    }
     const u64 seq = MakeComputeRecord(ctx, x, y, z, ret);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -1936,8 +2115,6 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     const bool exec = exec_capable && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
                       ExecEligibleCompute(ctx, seq, ret);
     if (exec) {
-        const VAddr base = image_base.load(std::memory_order_relaxed);
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(base + 0x2479b70 - 0x1000000)(ctx);
         words[2] |= ExecFlag;
     }
     if (!WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
@@ -1961,10 +2138,10 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     return TagCompute(ctx, a1, a2, a3, ret, false);
 }
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return Tag(ctx, a1, a2, a3, ret, 2);
+    return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
 u64 PS4_SYSV_ABI TagAuto(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return Tag(ctx, a1, a2, a3, ret, 1);
+    return Tag(ctx, a1, a2, a3, ret, 1, true);
 }
 
 u64 PS4_SYSV_ABI ProbeIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {

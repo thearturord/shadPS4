@@ -52,6 +52,9 @@ struct ExecDraw {
     u32 instance_sgpr{};
 };
 
+/// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).
+u32 RecordDrawCount(u64 seq);
+
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out);
 

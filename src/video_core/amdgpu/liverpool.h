@@ -238,6 +238,7 @@ private:
     /// Tag written by the game in front of the next draw (front thread only).
     VideoCore::NativeTag native_tag_pending{};
     u64 native_exec_calls{};
+    u32 native_tag_skips{};
     void StartRasterSplit();
     void StopRasterSplit();
     void RasterMain(std::stop_token stoken);

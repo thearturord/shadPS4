@@ -21,7 +21,12 @@ namespace Core::NativeDraw {
 u64 FindHandler(const std::string& name);
 
 /// Runtime address of the eboot image (callers are classified by their Ghidra address).
+/// Draw count of a record whose draw packet is not known yet (matches any count).
+constexpr u32 UnknownDrawCount = 0xfffffffe;
+
 void SetImageBase(VAddr base);
+/// Load address of the game's main module (0 until known).
+VAddr ImageBase();
 
 /// Raster thread: compares the register state recorded for tagged draw `seq` with the raster thread's register file
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).

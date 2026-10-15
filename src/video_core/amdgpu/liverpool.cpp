@@ -436,7 +436,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             // address has bits above the game's address space in SPI_SHADER_PGM_HI_VS
             match = tag_kind <= 1 && (tag_kind == 0) == call.indexed &&
                     regs.reg_array[Regs::ShRegWordOffset + 0x49] == 0 &&
-                    Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == regs.num_indices;
+                    (Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == regs.num_indices ||
+                     Core::NativeDraw::RecordDrawCount(native_tag_pending.seq) == Core::NativeDraw::UnknownDrawCount);
             break;
         case RasterCall::Kind::DrawIndirect:
             match = tag_kind == 2;
@@ -511,7 +512,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
 }
 
-void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid) {
+void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw)) {
@@ -574,6 +575,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid) {
     const u32 saved_initiator = regs.draw_initiator;
     regs.draw_initiator = 0;
     MirrorObject(&regs.draw_initiator, sizeof(regs.draw_initiator));
+    if (index_count != ~0u) {
+        regs.num_indices = index_count; // restored with the other registers
+        MirrorObject(&regs.num_indices, sizeof(regs.num_indices));
+    }
     RasterCall call{};
     if (draw.kind == 2) {
         call.kind = RasterCall::Kind::DrawIndirect;
@@ -1593,7 +1598,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
                         std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
                         std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
-                        if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
+                        native_follow_pending = (native_tag_pending.meta & VideoCore::NativeTagFollowFlag) != 0;
+                        if (native_follow_pending) {
+                            // executed when the draw packet comes
+                        } else if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
                             ExecuteNativeDraw();
                         }
                     }
@@ -1825,6 +1833,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
                 if (!rasterizer) {
+                    break;
+                }
+                if (native_follow_pending) {
+                    // the game skipped PrepareDraw for this draw: its registers come from the record
+                    native_follow_pending = false;
+                    ExecuteNativeDraw(nullptr, ~0u, draw_index->index_count);
+                    native_tag_pending.valid = false;
                     break;
                 }
                 RasterCall call{};

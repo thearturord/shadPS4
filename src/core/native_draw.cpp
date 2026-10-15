@@ -1315,8 +1315,12 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         // draw arguments: VGT_NUM_INDICES / VGT_NUM_INSTANCES, then for indexed draws the index buffer view
         // (IT_INDEX_BASE), the base vertex and the draw packet's maximum size
         if (kind != 2) {
-            slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
-            slot.regs[n++] = {UconfigBase + 0x24d, 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
+            // an inlined draw (the count is only known to the draw packet) keeps the instance count the game set
+            const bool unknown_count = a1 == Core::NativeDraw::UnknownDrawCount;
+            if (!unknown_count) {
+                slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
+            }
+            slot.regs[n++] = {UconfigBase + 0x24d, unknown_count ? Rd<u32>(ctx, 0x4724) : 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
         }
         if (kind == 2) {
             // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
@@ -2457,7 +2461,35 @@ void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     }
 }
 
-u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
+/// Set when the PrepareDraw hook skipped PrepareDraw of an inlined draw: the constant update engine flush that the
+/// game's code runs right after it is skipped too (the record carries the user data).
+thread_local bool skip_cue_flush = false;
+
+/// What PrepareDraw itself leaves in the engine's objects (the draw function around it does its own counters).
+void PrepareDrawSideEffects(u64 ctx) {
+    Wr<u32>(ctx, 0x47a0, 0);
+    const u32 stamp = Rd<u32>(ctx, 0x47ac);
+    for (const u64 object : {Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), Rd<u64>(ctx, Ctx::BlendState),
+                             Rd<u64>(ctx, Ctx::RasterizerState), Rd<u64>(ctx, Ctx::DepthStencilState)}) {
+        if (object != 0) {
+            Wr<u32>(object, 0x2c, stamp);
+        }
+    }
+    if (const u64 layout = Rd<u64>(ctx, Ctx::InputLayout); layout != 0) {
+        Wr<u32>(layout, 0x2c, stamp);
+        const u32 elements = Rd<u32>(layout, Layout::ElementCount);
+        for (u32 e = 0; e < elements && e < 32; ++e) {
+            const u32 vertex_slot = Rd<u32>(layout + Layout::Elements + e * Layout::ElementStride, 8);
+            if (const u64 buffer = vertex_slot < 32 ? Rd<u64>(ctx, Ctx::VertexBufferSlots + vertex_slot * 8) : 0; buffer != 0) {
+                Wr<u32>(buffer, 0x2c, stamp);
+            }
+        }
+    }
+}
+
+/// `follow`: the draw is an inlined copy of a draw function; PrepareDraw is what is hooked, the game writes the draw
+/// packet itself (its count is only known there). The tag then says "execute when the draw packet comes".
+u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool follow = false) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
         return 0;
@@ -2524,7 +2556,7 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
     words[12] = 0;
     const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
     if (exec) {
-        words[2] |= ExecFlag;
+        words[2] |= ExecFlag | (follow ? VideoCore::NativeTagFollowFlag : 0u);
     }
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
@@ -2533,8 +2565,13 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
                 state.target_pointers = TargetPointers(ctx);
                 ApplyTargetSideEffects(ctx);
             }
-            ExecSideEffects(ctx, kind, a1, a2, a3);
             exec_drawn.fetch_add(1, std::memory_order_relaxed);
+            if (follow) {
+                PrepareDrawSideEffects(ctx);
+                skip_cue_flush = true;
+                return 0x8000000000000001ull; // PrepareDraw returns true
+            }
+            ExecSideEffects(ctx, kind, a1, a2, a3);
             return 1;
         }
     } else {
@@ -2805,6 +2842,28 @@ u64 PS4_SYSV_ABI TagDispatchFenced(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 
 u64 PS4_SYSV_ABI TagIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 2, true);
 }
+/// PrepareDraw(ctx, 0, 1): its callers are the draw functions (hooked at their own entry) and one inlined copy of the auto
+/// draw in a render pass function, which is where this hook acts.
+u64 PS4_SYSV_ABI PrepareDrawHook(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const VAddr base = image_base.load(std::memory_order_relaxed);
+    if (ctx != 0 && base != 0 && ret - base + 0x1000000 == 0x1c727a7 &&
+        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
+        if (const u64 result = Tag(ctx, Core::NativeDraw::UnknownDrawCount, 0, 0, ret, 1, true, true); result != 0) {
+            return result;
+        }
+    }
+    return PrepareNote(ctx, a1, a2, a3, a4, a5, ret);
+}
+
+/// The constant update engine's flush before a draw packet (CUE + 0x0 as argument).
+u64 PS4_SYSV_ABI CueFlushHook(u64 cue, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (skip_cue_flush) {
+        skip_cue_flush = false;
+        return 1;
+    }
+    return 0;
+}
+
 u64 PS4_SYSV_ABI TagAuto(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return Tag(ctx, a1, a2, a3, ret, 1, true);
 }
@@ -2830,6 +2889,12 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_cs_copy") {
         return reinterpret_cast<u64>(&TagCsCopyHandler);
+    }
+    if (name == "tag_prepare_draw") {
+        return reinterpret_cast<u64>(&PrepareDrawHook);
+    }
+    if (name == "tag_cue_flush") {
+        return reinterpret_cast<u64>(&CueFlushHook);
     }
     if (name == "tag_asc_dispatch") {
         return reinterpret_cast<u64>(&TagAscDispatch);
@@ -2859,6 +2924,10 @@ u64 FindHandler(const std::string& name) {
         return reinterpret_cast<u64>(&TagAuto);
     }
     return 0;
+}
+
+VAddr ImageBase() {
+    return image_base.load(std::memory_order_relaxed);
 }
 
 void SetImageBase(VAddr base) {

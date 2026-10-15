@@ -4,6 +4,7 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include "core/native_draw.h"
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -406,7 +407,7 @@ void NoteGnmCall(const char* name, void* ret) {
         std::sort(top.rbegin(), top.rend());
         std::string text;
         for (size_t i = 0; i < top.size() && i < 16; ++i) {
-            text += fmt::format(" {}@{:#x}:{}", top[i].second.first, top[i].second.second - 0x54a0000 + 0x1000000, top[i].first);
+            text += fmt::format(" {}@{:#x}:{}", top[i].second.first, top[i].second.second - Core::NativeDraw::ImageBase() + 0x1000000, top[i].first);
         }
         LOG_INFO(Lib_GnmDriver, "game calls into the Gnm driver per 5 s:{}", text);
     }

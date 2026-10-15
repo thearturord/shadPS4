@@ -201,7 +201,7 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
 
 /// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
 /// handler(rdi, rsi, rdx, rcx, r8, r9, return address). A non-zero result skips the hooked function (the stub
-/// returns to its caller); zero runs the displaced instructions and continues in the function.
+/// returns to its caller; with bit 63 set the rest of the result is returned as its value); zero runs the displaced instructions and continues in the function.
 void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original, size_t displaced,
                   const u8* resume) {
     Xbyak::Label handled;
@@ -250,6 +250,14 @@ void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original,
     c.db(original, displaced);
     c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
     c.L(handled);
+    // a result with bit 63 set is also the return value of the skipped function (the saved rax is replaced)
+    Xbyak::Label plain;
+    c.mov(r10, 0x8000000000000000ull);
+    c.test(rax, r10);
+    c.jz(plain);
+    c.btr(rax, 63);
+    c.mov(ptr[rsp + 136 + 64], rax);
+    c.L(plain);
     restore();
     c.ret();
 }

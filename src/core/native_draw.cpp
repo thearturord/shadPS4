@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -3020,6 +3021,34 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
     return 1;
 }
 
+/// FUN_0247b920(context, mode): the draw context's mode switch between graphics (0) and compute (0x8000) work. The game's
+/// function writes a barrier (an end-of-shader event, a wait on a scratch label, a cache flush), three context registers that
+/// keep their default value (0) in these two modes, and sets the engine fields below. The raster thread runs in order, so with
+/// execution only the fields are set. The other modes (dispatch draw, tessellation and geometry stage sets) are never used by
+/// the game; the call then runs the game's own function.
+u64 PS4_SYSV_ABI TagModeSwitch(u64 ctx, u64 mode, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx == 0 || VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+    const u32 current = Rd<u32>(ctx, 0x278);
+    const u32 wanted = static_cast<u32>(mode);
+    if (current == wanted) {
+        return 1; // the game's function returns at once
+    }
+    if ((current != 0 && current != 0x8000) || (wanted != 0 && wanted != 0x8000)) {
+        return 0;
+    }
+    if (Rd<u8>(ctx, 0x47a4) != 0 || Rd<u32>(ctx, 0x130dc) != Rd<u32>(ctx, 0x130d8)) {
+        Wr<u32>(ctx, 0x130dc, Rd<u32>(ctx, 0x130d8));
+        Wr<u8>(ctx, 0x47a4, 0);
+    }
+    Wr<u32>(ctx, 0x4acc, wanted);
+    Wr<u8>(ctx, 0x47b4, 1);
+    Wr<u32>(ctx, 0x278, wanted);
+    Live().mode_switch_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
@@ -3093,6 +3122,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_cs_copy") {
         return reinterpret_cast<u64>(&TagCsCopyHandler);
+    }
+    if (name == "tag_mode_switch") {
+        return reinterpret_cast<u64>(&TagModeSwitch);
     }
     if (name == "tag_fill") {
         return reinterpret_cast<u64>(&TagFill);

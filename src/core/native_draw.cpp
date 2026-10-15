@@ -1392,6 +1392,8 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
         cs_reg(0x07, Rd<u32>(regs, 16)); // COMPUTE_NUM_THREAD_X / Y / Z
         cs_reg(0x08, Rd<u32>(regs, 20));
         cs_reg(0x09, Rd<u32>(regs, 24));
+        cs_reg(0x0c, Rd<u32>(regs, 0)); // COMPUTE_PGM_LO / HI: the shader bind
+        cs_reg(0x0d, 0);
         cs_reg(0x12, Rd<u32>(regs, 8)); // COMPUTE_PGM_RSRC1 / RSRC2
         cs_reg(0x13, Rd<u32>(regs, 12));
         SynthesizeUserData(ctx, 5, shader + 0x30, gnm, 0x28, Core::NativeDraw::ComputeRegisterBase + 0x40, slot.regs.data(),
@@ -2109,24 +2111,17 @@ void RunResourceTracking(u64 ctx) {
     }
 }
 
-/// The game's PrepareDispatch (0x2479b70) with the resource tracking done natively: the tracking of the compute
-/// shader's views, then the game's own mode switch, shader cache update and user data flush, which write the command
-/// packets that the dispatch record replaces.
-void PrepareDispatchNative(u64 ctx) {
+/// The resource tracking of PrepareDispatch (0x2479b70) for the compute shader's views, done natively.
+void RunComputeTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
-    const auto at = [&](u64 address) { return base + address - 0x1000000; };
-    if (!native) {
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64)>(at(0x2479b70))(ctx);
-        return;
-    }
-    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(at(0x2479db0));
+    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
     const auto track_view = [&](u64 view) {
         if (view != 0 && valid(view)) {
             if (const u64 resource = Rd<u64>(view, 0x30); valid(resource)) {
-                TrackResource(ctx, resource, true, track);
+                TrackResource(ctx, resource, native, track);
             }
         }
     };
@@ -2140,14 +2135,45 @@ void PrepareDispatchNative(u64 ctx) {
             track_view(Rd<u64>(ctx, 0x1980 + slot * 8));
         }
     }
-    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u32)>(at(0x247b920))(ctx, 0x8000);
-    const u64 gnm = Rd<u64>(cs, 0x120);
-    if (gnm != 0 && Rd<u64>(ctx, 0x12eb8) != gnm) {
-        reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u8)>(at(0x24a22a0))(ctx + 0x6d50, gnm + 0x28, Rd<u8>(gnm, 3));
+}
+
+/// What PrepareDispatch and the compute part of the constant update engine flush (FUN_0247dad0) leave in the engine's
+/// objects besides command packets: the last-use stamps of the shader, its samplers and views, and the append / consume
+/// counter range. The descriptor tables of the flush are rebuilt by the next flush that runs (nothing reads them here).
+void ComputeSideEffects(u64 ctx) {
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const u64 cs = Rd<u64>(ctx, 0x4670);
+    const u32 stamp = Rd<u32>(ctx, 0x47ac);
+    Wr<u32>(cs, 0x2c, stamp);
+    const u32 samplers = Rd<u32>(cs, 0xb0) & 0xffff;
+    for (u32 slot = 0; slot < 16; ++slot) {
+        if (((samplers >> slot) & 1) != 0) {
+            if (const u64 sampler = Rd<u64>(ctx, 5 * 0x80 + 0x280 + slot * 8); valid(sampler)) {
+                Wr<u32>(sampler, 0x2c, stamp);
+            }
+        }
     }
-    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64, u64)>(at(0x24a1370))(ctx + 0x4aa8, gnm, ctx + 0x6d50);
-    Wr<u32>(cs, 0x2c, Rd<u32>(ctx, 0x47ac));
-    reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u32, u32, u64)>(at(0x247dad0))(ctx, 0, 5, cs + 0x30);
+    for (u32 slot = 0; slot < 128; ++slot) {
+        if (((Rd<u64>(cs, slot < 64 ? 0xc0 : 0xc8) >> (slot & 63)) & 1) != 0) {
+            if (const u64 view = Rd<u64>(ctx, 0x1980 + slot * 8); valid(view)) {
+                Wr<u32>(view, 0x2c, stamp);
+                if (const u64 resource = Rd<u64>(view, 0x30); valid(resource)) {
+                    Wr<u32>(resource, 0x2c, stamp);
+                }
+            }
+        }
+    }
+    for (u32 bits = Rd<u32>(cs, 0xd0), slot = 0; bits != 0; bits >>= 1, ++slot) {
+        if ((bits & 1) != 0) {
+            if (const u64 view = Rd<u64>(ctx, 0x2098 + slot * 8); valid(view)) {
+                Wr<u32>(view, 0x2c, stamp);
+                if (Rd<u32>(view, 0x44) == 1) {
+                    Wr<u32>(view, 0x84, slot);
+                    Wr<u32>(ctx, 0x4f18, Rd<u32>(ctx, 0x130b8) << 16 | 0x10);
+                }
+            }
+        }
+    }
 }
 
 /// Cheap identity of the bound render and depth views (the flags and stamps of a target bind depend on these only).
@@ -2415,10 +2441,10 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
-    // PrepareDispatch first (resource tracking, descriptor updates, the program packets); the wrapper runs it again
-    // when the dispatch is not executed natively, which finds nothing left to do
+    // The resource tracking runs natively first; the descriptor flush and the program packets of PrepareDispatch are the
+    // game's own and only run (in the wrapper) when the dispatch is not executed from its record
     if (Rd<u64>(ctx, 0x4670) != 0) {
-        PrepareDispatchNative(ctx);
+        RunComputeTracking(ctx);
     }
     const u64 seq = MakeComputeRecord(ctx, x, y, z, ret);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
@@ -2442,6 +2468,7 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     if (!exec) {
         return 0;
     }
+    ComputeSideEffects(ctx);
     Wr<u32>(ctx, 0x34, Rd<u32>(ctx, 0x34) + 1);
     Wr<u32>(ctx, 0x3c, Rd<u32>(ctx, 0x3c) + static_cast<u32>(x) * static_cast<u32>(y) * static_cast<u32>(z));
     compute_drawn.fetch_add(1, std::memory_order_relaxed);

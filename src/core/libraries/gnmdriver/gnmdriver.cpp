@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <map>
+#include <mutex>
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -381,8 +384,40 @@ int PS4_SYSV_ABI sceGnmDisableMipStatsReport() {
     return ORBIS_OK;
 }
 
+namespace {
+/// Which game call sites still write draw packets through the Gnm driver (per 5 s, logged): name, return address.
+void NoteGnmCall(const char* name, void* ret) {
+    static std::mutex mutex;
+    static std::map<std::pair<const char*, u64>, u64> counts;
+    static u64 last_log_ns = 0;
+    const std::scoped_lock lock{mutex};
+    ++counts[{name, reinterpret_cast<u64>(ret)}];
+    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - last_log_ns <= 5'000'000'000ull) {
+        return;
+    }
+    if (last_log_ns != 0) {
+        std::vector<std::pair<u64, std::pair<const char*, u64>>> top;
+        for (const auto& [key, count] : counts) {
+            top.emplace_back(count, key);
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (size_t i = 0; i < top.size() && i < 16; ++i) {
+            text += fmt::format(" {}@{:#x}:{}", top[i].second.first, top[i].second.second - 0x54a0000 + 0x1000000, top[i].first);
+        }
+        LOG_INFO(Lib_GnmDriver, "game calls into the Gnm driver per 5 s:{}", text);
+    }
+    counts.clear();
+    last_log_ns = now;
+}
+} // namespace
+
 s32 PS4_SYSV_ABI sceGnmDispatchDirect(u32* cmdbuf, u32 size, u32 threads_x, u32 threads_y,
                                       u32 threads_z, u32 flags) {
+    NoteGnmCall("DispatchDirect", __builtin_return_address(0));
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 9) && ((s32)(threads_x | threads_y | threads_z) > -1)) {
@@ -462,6 +497,7 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
 s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr_t index_addr,
                                  u32 flags, u32 type) {
+    NoteGnmCall("DrawIndex", __builtin_return_address(0));
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 10) && (index_addr != 0) && (index_addr & 1) == 0 &&
@@ -482,6 +518,7 @@ s32 PS4_SYSV_ABI sceGnmDrawIndex(u32* cmdbuf, u32 size, u32 index_count, uintptr
 }
 
 s32 PS4_SYSV_ABI sceGnmDrawIndexAuto(u32* cmdbuf, u32 size, u32 index_count, u32 flags) {
+    NoteGnmCall("DrawIndexAuto", __builtin_return_address(0));
     LOG_TRACE(Lib_GnmDriver, "called");
 
     if (cmdbuf && (size == 7) &&

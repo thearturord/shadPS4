@@ -1417,6 +1417,116 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+namespace {
+/// With native execution on: which command packets the game's own code still writes, grouped by the native tag that
+/// came last in the stream (per 5 s, logged): 0 before any tag, 1 after the tag of an executed draw, 2 draw on the
+/// packet path, 3 executed dispatch, 4 dispatch on the packet path, 5 fast clear eliminate.
+void CountGameCommand(const PM4Header* header, PM4ItOpcode opcode, u32 count) {
+    constexpr u32 Groups = 6;
+    static std::array<std::array<u64, 256>, Groups> opcodes{};
+    static std::array<u64, Regs::NumRegs> registers{};
+    static std::array<u64, Groups> packets{};
+    static u64 last_log_ns = 0;
+    static u32 group = 0;
+    if (opcode == PM4ItOpcode::Nop && count >= VideoCore::NativeTagPayloadDwords &&
+        reinterpret_cast<const u32*>(header)[1] == VideoCore::NativeTagMagic) {
+        const u32 meta = reinterpret_cast<const u32*>(header)[2];
+        const bool exec = (meta & VideoCore::NativeTagExecFlag) != 0;
+        const u32 kind = (meta >> 8) & 0xff;
+        group = kind == 4 ? 5 : kind == 3 ? (exec ? 3 : 4) : (exec ? 1 : 2);
+    }
+    ++opcodes[group][static_cast<u32>(opcode) & 255];
+    ++packets[group];
+    if (opcode == PM4ItOpcode::SetContextReg || opcode == PM4ItOpcode::SetShReg ||
+        opcode == PM4ItOpcode::SetUconfigReg || opcode == PM4ItOpcode::SetConfigReg) {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        const u32 base = opcode == PM4ItOpcode::SetContextReg ? Regs::ContextRegWordOffset
+                         : opcode == PM4ItOpcode::SetShReg    ? Regs::ShRegWordOffset
+                                                              : 0;
+        for (u32 i = 0; i + 1 < count; ++i) {
+            if (const u32 index = base + set_data->reg_offset + i; index < Regs::NumRegs) {
+                ++registers[index];
+            }
+        }
+    }
+    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - last_log_ns <= 5'000'000'000ull) {
+        return;
+    }
+    if (last_log_ns != 0) {
+        static constexpr const char* Names[Groups] = {"before any tag", "after executed draw", "after packet-path draw",
+                                                      "after executed dispatch", "after packet-path dispatch",
+                                                      "after fast clear eliminate"};
+        for (u32 g = 0; g < Groups; ++g) {
+            std::vector<std::pair<u64, u32>> top;
+            for (u32 i = 0; i < 256; ++i) {
+                if (opcodes[g][i] != 0) {
+                    top.emplace_back(opcodes[g][i], i);
+                }
+            }
+            std::sort(top.rbegin(), top.rend());
+            std::string text;
+            for (size_t i = 0; i < top.size() && i < 12; ++i) {
+                text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
+            }
+            LOG_INFO(Render, "game packets {}: {} (opcode:count{})", Names[g], packets[g], text);
+        }
+        std::vector<std::pair<u64, u32>> top;
+        for (u32 i = 0; i < registers.size(); ++i) {
+            if (registers[i] != 0) {
+                top.emplace_back(registers[i], i);
+            }
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (size_t i = 0; i < top.size() && i < 60; ++i) {
+            text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
+        }
+        LOG_INFO(Render, "game register writes per 5 s (register index:count, top 60 of {}):{}", top.size(), text);
+    }
+    opcodes = {};
+    registers = {};
+    packets = {};
+    last_log_ns = now;
+}
+} // namespace
+
+namespace {
+/// Packets the game writes to its async compute queues (per 5 s, logged).
+void CountComputeQueueCommand(PM4ItOpcode opcode) {
+    static std::array<u64, 256> opcodes{};
+    static u64 total = 0;
+    static u64 last_log_ns = 0;
+    ++opcodes[static_cast<u32>(opcode) & 255];
+    ++total;
+    const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - last_log_ns <= 5'000'000'000ull) {
+        return;
+    }
+    if (last_log_ns != 0) {
+        std::vector<std::pair<u64, u32>> top;
+        for (u32 i = 0; i < 256; ++i) {
+            if (opcodes[i] != 0) {
+                top.emplace_back(opcodes[i], i);
+            }
+        }
+        std::sort(top.rbegin(), top.rend());
+        std::string text;
+        for (size_t i = 0; i < top.size() && i < 12; ++i) {
+            text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
+        }
+        LOG_INFO(Render, "async compute queue packets per 5 s: {} (opcode:count{})", total, text);
+    }
+    opcodes = {};
+    total = 0;
+    last_log_ns = now;
+}
+} // namespace
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -1455,6 +1565,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
             VideoCore::ReadbackStats::CpPacket(GfxQueueId, static_cast<u32>(opcode));
+            if (VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
+                CountGameCommand(header, opcode, count);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -2322,6 +2435,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
+        CountComputeQueueCommand(opcode);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <unordered_set>
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -381,6 +383,7 @@ u64 BufferCache::CollectDownloadCopies(const Buffer* arena, VAddr device_addr, u
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
         gpu_modified_ranges.Subtract(address, range_size);
+        range_epoch.fetch_add(1, std::memory_order_acq_rel);
     });
     return total_size_bytes;
 }
@@ -631,6 +634,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         }
         return {&stream_buffer, offset};
     }
+    const bool memoizable = !is_texel_buffer && VideoCore::ReadbackPolicy::Get().native_draw_mode.load(
+                                                    std::memory_order_relaxed) >= 2;
+    ObtainMemo* memo = nullptr;
+    u64 epoch_before = 0;
+    if (memoizable) {
+        if (!obtain_memo) {
+            obtain_memo = std::make_unique<ObtainMemo[]>(ObtainMemoSlots);
+        }
+        const u64 hash = (device_addr * 0x9E3779B97F4A7C15ull) ^ (u64(size) * 0xC2B2AE3D27D4EB4Full) ^ (is_written ? 0x55 : 0);
+        memo = &obtain_memo[(hash >> 20) & (ObtainMemoSlots - 1)];
+        epoch_before = memory_tracker->Epoch() + range_epoch.load(std::memory_order_acquire);
+        if (memo->addr == device_addr && memo->size == size && memo->flags == (is_written ? 1u : 0u) &&
+            memo->epoch == epoch_before && memo->tick == scheduler.CurrentTick()) {
+            return {memo->arena, memo->offset};
+        }
+
+    }
     const u64 first_block = device_addr >> block_shift;
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
@@ -640,7 +660,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
     }
-    return {arena, arena->Offset(device_addr)};
+    const u64 offset = arena->Offset(device_addr);
+    if (memo) {
+        // the epoch read before the work: an upload this call did makes the entry stale, as it should
+        *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.CurrentTick()};
+    }
+    return {arena, offset};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
@@ -723,6 +748,7 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     for (u32 page = 0; page < (last_size >> ARENA_PAGE_BITS); ++page) {
         address_space[base_page + page] = new_arena;
     }
+    range_epoch.fetch_add(1, std::memory_order_acq_rel); // answers that name the old arenas are stale
     return new_arena;
 }
 

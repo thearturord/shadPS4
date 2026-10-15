@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <vector>
 
@@ -22,6 +23,12 @@ public:
     explicit MemoryTracker(PageManager& tracker_)
         : tracker{&tracker_}, readbacks_mode{EmulatorSettings.GetReadbacksMode()} {}
     ~MemoryTracker() = default;
+
+    /// Changes whenever the CPU / GPU modified state of any page changes (a request for the same range answered
+    /// before, with the same epoch, finds nothing to upload).
+    [[nodiscard]] u64 Epoch() const noexcept {
+        return epoch.load(std::memory_order_acquire);
+    }
 
     /// Returns true if a region has been modified from the GPU
     bool IsRegionGpuModified(VAddr cpu_addr, u64 size) noexcept {
@@ -46,6 +53,7 @@ public:
                 manager->template ChangeRegionState<StateOp::None, StateOp::Clear>(offset, size);
             }
         });
+        Bump();
     }
 
     /// Mark region as modified from the CPU
@@ -53,6 +61,7 @@ public:
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
         });
+        Bump();
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
@@ -72,6 +81,7 @@ public:
             should_flush |= modified;
             manager->Unlock(bounds);
         });
+        Bump();
         if (should_flush) {
             on_flush();
         }
@@ -79,17 +89,25 @@ public:
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
+        bool any = false;
+        const auto counted = [&func, &any](u64 address, u64 range_size) {
+            any = true;
+            func(address, range_size);
+        };
         IteratePages<true>(
-            cpu_addr, size, [&func, is_written](RegionManager* manager, u64 offset, u64 size) {
+            cpu_addr, size, [&counted, is_written](RegionManager* manager, u64 offset, u64 size) {
                 if (is_written) {
                     manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
-                        offset, size, func);
+                        offset, size, counted);
                 } else {
                     manager
                         ->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::None>(
-                            offset, size, func);
+                            offset, size, counted);
                 }
             });
+        if (any) {
+            Bump();
+        }
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
@@ -100,9 +118,18 @@ public:
             manager->template ForEachModifiedRange<Type::GPU, StateOp::None, gpu_op>(offset, size,
                                                                                      func);
         });
+        if constexpr (clear) {
+            Bump();
+        }
     }
 
 private:
+    void Bump() noexcept {
+        epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    std::atomic<u64> epoch{1};
+
     template <bool create_region_on_fail = false, typename Func>
     bool IteratePages(VAddr cpu_address, u64 size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, RegionManager*, u64, size_t>::type;

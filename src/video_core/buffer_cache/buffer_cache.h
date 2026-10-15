@@ -240,6 +240,21 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+
+    /// Answers of ObtainBuffer for large read-only and for written ranges: the same request in the same command
+    /// buffer with the tracker and the range bookkeeping unchanged has nothing to upload and nothing to mark.
+    struct ObtainMemo {
+        VAddr addr{};
+        u32 size{};
+        u32 flags{};
+        const Buffer* arena{};
+        u64 offset{};
+        u64 epoch{~0ull};
+        u64 tick{~0ull};
+    };
+    static constexpr u32 ObtainMemoSlots = 8192;
+    std::unique_ptr<ObtainMemo[]> obtain_memo;
+    std::atomic<u64> range_epoch{0}; ///< bumped when the GPU modified ranges shrink or the arenas move
     /// Guards gpu_modified_ranges.
     mutable std::shared_mutex gpu_ranges_mutex;
 

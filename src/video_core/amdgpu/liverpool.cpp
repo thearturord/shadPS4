@@ -511,7 +511,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
 }
 
-void Liverpool::ExecuteNativeDraw() {
+void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid) {
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw)) {
@@ -532,8 +532,17 @@ void Liverpool::ExecuteNativeDraw() {
         }
         RasterCall dispatch{};
         dispatch.kind = RasterCall::Kind::DispatchDirect;
-        dispatch.marker = "gfx:{}:NativeDispatch";
-        RasterDispatch(dispatch);
+        if (asc_vqid != ~0u) {
+            dispatch.asc = true;
+            dispatch.vqid = asc_vqid;
+            dispatch.cmd_address = header;
+            dispatch.marker = "asc[{}]:{}:NativeDispatch";
+        } else {
+            dispatch.marker = "gfx:{}:NativeDispatch";
+        }
+        if ((program.dispatch_initiator & 1) != 0) {
+            RasterDispatch(dispatch);
+        }
         program = saved_program;
         return;
     }
@@ -2441,6 +2450,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            if (nop->header.count.Value() != 0 && nop->data_block[0] == PM4CmdNop::PayloadType::NativeDrawTag &&
+                nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
+                native_tag_pending.valid = true;
+                native_tag_pending.meta = nop->data_block[1];
+                std::memcpy(&native_tag_pending.k1, &nop->data_block[2], sizeof(u64));
+                std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
+                std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
+                std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
+                if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
+                    ExecuteNativeDraw(header, vqid);
+                }
+            }
             break;
         }
         case PM4ItOpcode::IndirectBuffer: {

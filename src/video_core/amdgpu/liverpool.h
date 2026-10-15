@@ -254,7 +254,7 @@ private:
     /// Queues a draw or dispatch. Without the split it runs right away.
     void RasterDispatch(const RasterCall& call);
     /// Draws the pending native draw tag from its record instead of from command packets.
-    void ExecuteNativeDraw();
+    void ExecuteNativeDraw(const void* header = nullptr, u32 asc_vqid = ~0u);
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.
     void DrainRasterWrites();

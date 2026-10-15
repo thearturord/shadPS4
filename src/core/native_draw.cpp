@@ -448,8 +448,7 @@ inline void Wr(u64 base, u64 offset, T value) {
     std::memcpy(reinterpret_cast<void*>(base + offset), &value, sizeof(T));
 }
 
-bool WriteDwords(u64 ctx, const u32* words, u32 count) {
-    const u64 writer = ctx + 0x47c0;
+bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
     u64 cur = Rd<u64>(writer, 0x10);
     const u64 end = Rd<u64>(writer, 0x08);
     if (cur == 0 || cur > end) {
@@ -466,6 +465,10 @@ bool WriteDwords(u64 ctx, const u32* words, u32 count) {
     std::memcpy(reinterpret_cast<void*>(cur), words, count * sizeof(u32));
     Wr<u64>(writer, 0x10, cur + count * sizeof(u32));
     return true;
+}
+
+bool WriteDwords(u64 ctx, const u32* words, u32 count) {
+    return WriteDwordsAt(ctx + 0x47c0, words, count);
 }
 
 // ---- the native front end: the register state the game's objects describe -------------------------------------------
@@ -1405,6 +1408,181 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
     return seq;
 }
 
+/// Guest thread: the record of a dispatch of the game's async compute context (JsComputeContext, the SDK's lightweight
+/// compute constant update engine at +0xa0). The engine objects (shader at +0x1d10, samplers +0x2178, constant buffers
+/// +0x21f8, shader resource views +0x1d18, unordered access views +0x2118) are described to the shader through user
+/// data: small descriptors go straight into the user data registers, the others into a table (the engine's staging
+/// copy at +0x138 holds its content) that a register points to. Returns 0 when this dispatch needs the game's own path.
+u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    const u64 cs_obj = Rd<u64>(jcc, 0x1d10);
+    const u64 gnm = valid(cs_obj) ? Rd<u64>(cs_obj, 0x120) : 0;
+    if (!valid(cs_obj) || !valid(gnm) || Rd<u8>(jcc, 0x1c7c) == 0) {
+        return 0;
+    }
+    const u64 offs = cs_obj + 0x130;
+    const u32 table_dwords = Rd<u16>(offs, 0);
+    if (table_dwords > 0x600) {
+        return 0;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.unsupported_inputs = 0;
+    slot.unsupported_mask = 0;
+    slot.kind = 3;
+    slot.caller = caller;
+    slot.a1 = static_cast<u32>(x);
+    slot.a2 = static_cast<u32>(y);
+    slot.rt_info = 0;
+    slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
+    slot.ps_gnm = 0;
+    slot.vs_gnm = gnm;
+    u32 n = 0;
+    const auto cs_reg = [&](u32 dword, u32 value) { slot.regs[n++] = {Core::NativeDraw::ComputeRegisterBase + dword, value}; };
+    const u64 shader_regs = gnm + 8;
+    cs_reg(0x00, ((Rd<u8>(gnm, 0x24) & 3u) << 3) + 1); // dispatch initiator
+    cs_reg(0x01, static_cast<u32>(x));
+    cs_reg(0x02, static_cast<u32>(y));
+    cs_reg(0x03, static_cast<u32>(z));
+    cs_reg(0x07, Rd<u32>(shader_regs, 16)); // COMPUTE_NUM_THREAD_X / Y / Z
+    cs_reg(0x08, Rd<u32>(shader_regs, 20));
+    cs_reg(0x09, Rd<u32>(shader_regs, 24));
+    cs_reg(0x0c, Rd<u32>(shader_regs, 0)); // COMPUTE_PGM_LO / HI
+    cs_reg(0x0d, 0);
+    cs_reg(0x12, Rd<u32>(shader_regs, 8)); // COMPUTE_PGM_RSRC1 / RSRC2
+    cs_reg(0x13, Rd<u32>(shader_regs, 12));
+    // the descriptor table: the engine's staging copy with this dispatch's descriptors placed in it
+    u32* table = AllocTable(std::max(table_dwords, 4u));
+    std::memcpy(table, reinterpret_cast<const void*>(jcc + 0x138), table_dwords * sizeof(u32));
+    bool ok = true;
+    const auto place = [&](u16 offset, const u32* source, u32 dwords) {
+        if (offset == 0xffff) {
+            return;
+        }
+        const u32 index = offset & 0x3fff;
+        if ((offset & 0x8000) != 0) {
+            for (u32 k = 0; k < dwords; ++k) {
+                cs_reg(0x40 + index + k, source[k]);
+            }
+        } else if (index + dwords <= table_dwords) {
+            std::memcpy(table + index, source, dwords * sizeof(u32));
+        } else {
+            ok = false;
+        }
+    };
+    std::array<u32, 8> descriptor;
+    const auto read_descriptor = [&](u64 address, u32 dwords) {
+        for (u32 k = 0; k < dwords; ++k) {
+            descriptor[k] = Rd<u32>(address, k * 4);
+        }
+    };
+    for (u32 mask = Rd<u32>(cs_obj, 0xe4), index = 0; mask != 0 && ok; mask >>= 1, ++index) { // samplers
+        if ((mask & 1) != 0) {
+            const u64 sampler = Rd<u64>(jcc, 0x2178 + index * 8);
+            if (!valid(sampler)) {
+                ok = false;
+                break;
+            }
+            read_descriptor(sampler + 0x64, 4);
+            place(Rd<u16>(offs, 0x142 + index * 2), descriptor.data(), 4);
+        }
+    }
+    for (u32 mask = Rd<u32>(cs_obj, 0xe0), index = 0; mask != 0 && ok; mask >>= 1, ++index) { // constant buffers
+        if ((mask & 1) != 0) {
+            const u64 buffer = Rd<u64>(jcc, 0x21f8 + index * 8);
+            if (!valid(buffer)) {
+                ok = false;
+                break;
+            }
+            read_descriptor(buffer + 0x60, 4);
+            place(Rd<u16>(offs, 0x162 + index * 2), descriptor.data(), 4);
+        }
+    }
+    for (u32 mask = Rd<u32>(cs_obj, 0xf0), index = 0; mask != 0 && ok; mask >>= 1, ++index) { // shader resource views
+        if ((mask & 1) != 0) {
+            const u64 view = Rd<u64>(jcc, 0x1d18 + index * 8);
+            if (!valid(view)) {
+                ok = false;
+                break;
+            }
+            const u32 kind = Rd<u32>(view, 0x44);
+            if (kind == 0xb || kind == 1) { // buffer: the engine rewrites two fields of its V# first
+                descriptor[0] = Rd<u32>(view, 0x78);
+                descriptor[1] = (Rd<u32>(view, 0x7c) & 0xffff0fffu) | 0xb000u;
+                descriptor[2] = Rd<u32>(view, 0x80);
+                descriptor[3] = (Rd<u32>(view, 0x84) & 0xc7ffffffu) | 0x18000000u;
+                place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 4);
+            } else {
+                read_descriptor(view + 0x58, 8);
+                place(Rd<u16>(offs, 0x22 + index * 2), descriptor.data(), 8);
+            }
+        }
+    }
+    u32 counter_range = Rd<u32>(jcc, 0x1940);
+    for (u32 mask = Rd<u32>(cs_obj, 0x100), index = 0; mask != 0 && ok; mask >>= 1, ++index) { // unordered access views
+        if ((mask & 1) != 0) {
+            const u64 view = Rd<u64>(jcc, 0x2118 + index * 8);
+            if (!valid(view)) {
+                ok = false;
+                break;
+            }
+            if (Rd<u32>(view, 0x44) == 1) {
+                read_descriptor(view + 0x74, 4);
+                place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
+                if ((Rd<u8>(view, 0x50) & 2) != 0) {
+                    if (Rd<u32>(jcc, 0x2158 + index * 4) != 0xffffffffu) {
+                        ok = false; // the game initializes the append / consume counter with a packet
+                        break;
+                    }
+                    if (Rd<u8>(offs, 0xd) != 0xff) {
+                        counter_range = Rd<u32>(jcc, 0x22f8) << 16 | 0x10;
+                    }
+                }
+            } else {
+                read_descriptor(view + 0x54, 8);
+                place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 8);
+            }
+        }
+    }
+    if (!ok) {
+        return 0;
+    }
+    // what the flush of the constant update engine puts into user data: pointers into the table and two immediates
+    const u64 table_address = reinterpret_cast<u64>(table);
+    u32 checks = 0;
+    const auto pointer = [&](u32 start, u64 address, u32 dwords) {
+        if (start == 0xff) {
+            return;
+        }
+        slot.checks[checks] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 20 + checks, dwords, address, 0, {~0ull, ~0ull}};
+        ++checks;
+    };
+    pointer(Rd<u8>(offs, 7), table_address, table_dwords);
+    static constexpr std::array<u32, 4> table_offsets{0x16, 0x1a, 0x1c, 0x1e};
+    for (u32 k = 0; k < 4; ++k) {
+        const u32 offset = Rd<u16>(offs, table_offsets[k]);
+        pointer(Rd<u8>(offs, 8 + k), table_address + offset * 4ull, offset < table_dwords ? table_dwords - offset : 0);
+    }
+    if (const u32 start = Rd<u8>(offs, 0xc); start != 0xff) {
+        const u64 global_table = Rd<u64>(jcc, 0x118);
+        cs_reg(0x40 + start, static_cast<u32>(global_table));
+        cs_reg(0x40 + start + 1, static_cast<u32>(global_table >> 32));
+    }
+    if (const u32 start = Rd<u8>(offs, 0xd); start != 0xff) {
+        cs_reg(0x40 + start, counter_range);
+    }
+    if (const u32 start = Rd<u8>(offs, 0xe); start != 0xff) {
+        cs_reg(0x40 + start, Rd<u32>(jcc, 0x1944));
+    }
+    slot.check_count = checks;
+    slot.flags = 0;
+    slot.count = n;
+    slot.seq.store(seq, std::memory_order_release);
+    return seq;
+}
+
 /// Guest thread: the record of a CsCopyBufferDwords dispatch. The state is fully given by the arguments and the device's
 /// copy shader: the source buffer is the shader resource of slot 0, the destination the RW resource of slot 0, both
 /// described by V# words built from the addresses. No program packets are written by the game's path for this one
@@ -1967,6 +2145,7 @@ u64 PS4_SYSV_ABI PrepareNote(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u6
 }
 
 std::atomic<u64> exec_drawn{};
+std::atomic<u64> asc_drawn{}, asc_packet_path{}, asc_no_record{};
 std::atomic<u64> compute_drawn{};
 std::atomic<u64> exec_fallback{};
 
@@ -2372,6 +2551,8 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track) {
             why += fmt::format(" {}: {};", FallbackNames[k], fallback_counts[k].exchange(0));
         }
         LOG_INFO(Core, "native draws on the packet path:{}", why);
+        LOG_INFO(Core, "async compute dispatches: {} from records, {} on the packet path, {} without a record",
+                 asc_drawn.exchange(0), asc_packet_path.exchange(0), asc_no_record.exchange(0));
         LOG_INFO(Core, "native tracking: {} resources, {} fast clear eliminates; game function: {} second resource, {} depth state",
                  track_native.exchange(0), track_eliminated.exchange(0), track_game_second.exchange(0),
                  track_game_depth.exchange(0));
@@ -2514,6 +2695,107 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
 u64 PS4_SYSV_ABI TagCsCopyHandler(u64 writer, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return TagCsCopy(writer, a1, a2, a3 & 0xffffffff, ret);
 }
+bool ExecEligibleAsc(u64 seq, u64 caller) {
+    if (Slot(seq).flags != 0 || seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+        return false;
+    }
+    CallerTrust* trust = TrustFor(caller);
+    if (trust == nullptr) {
+        return false;
+    }
+    const u32 total = trust->total.load(std::memory_order_relaxed);
+    if (total < 16 || trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
+        return false;
+    }
+    return (trust->since_audit.fetch_add(1, std::memory_order_relaxed) + 1) % AuditEvery != 0;
+}
+
+/// What the game's PrepareDispatch of the compute context and the constant update engine flush leave in the engine's
+/// objects besides command packets: last-use stamps, the two fields of a buffer view the engine rewrites, the append /
+/// consume counter range and the constant buffer cache.
+void AscSideEffects(u64 jcc, u64 x, u64 y, u64 z) {
+    const u64 cs_obj = Rd<u64>(jcc, 0x1d10);
+    const u64 offs = cs_obj + 0x130;
+    const u32 stamp = Rd<u32>(jcc, 0x22fc);
+    Wr<u32>(cs_obj, 0x2c, stamp);
+    for (u32 mask = Rd<u32>(cs_obj, 0xe0), index = 0; mask != 0; mask >>= 1, ++index) {
+        if ((mask & 1) != 0) {
+            const u64 buffer = Rd<u64>(jcc, 0x21f8 + index * 8);
+            Wr<u64>(jcc, 0x2278 + index * 8, Rd<u64>(buffer, 0x160));
+            Wr<u32>(buffer, 0x2c, stamp);
+        }
+    }
+    for (u32 mask = Rd<u32>(cs_obj, 0xf0), index = 0; mask != 0; mask >>= 1, ++index) {
+        if ((mask & 1) != 0) {
+            const u64 view = Rd<u64>(jcc, 0x1d18 + index * 8);
+            if (const u32 kind = Rd<u32>(view, 0x44); kind == 0xb || kind == 1) {
+                Wr<u32>(view, 0x84, (Rd<u32>(view, 0x84) & 0xc7ffffffu) | 0x18000000u);
+                Wr<u32>(view, 0x7c, (Rd<u32>(view, 0x7c) & 0xffff0fffu) | 0xb000u);
+            }
+            Wr<u32>(view, 0x2c, stamp);
+            Wr<u32>(Rd<u64>(view, 0x30), 0x2c, stamp);
+        }
+    }
+    for (u32 mask = Rd<u32>(cs_obj, 0x100), index = 0; mask != 0; mask >>= 1, ++index) {
+        if ((mask & 1) != 0) {
+            const u64 view = Rd<u64>(jcc, 0x2118 + index * 8);
+            if (Rd<u32>(view, 0x44) == 1 && (Rd<u8>(view, 0x50) & 2) != 0) {
+                Wr<u32>(view, 0x84, index);
+                if (Rd<u8>(offs, 0xd) != 0xff) {
+                    Wr<u32>(jcc, 0x1940, Rd<u32>(jcc, 0x22f8) << 16 | 0x10);
+                }
+            }
+            Wr<u32>(Rd<u64>(view, 0x30), 0x2c, stamp);
+        }
+    }
+    Wr<u32>(jcc, 0x34, Rd<u32>(jcc, 0x34) + 1);
+    Wr<u32>(jcc, 0x3c, Rd<u32>(jcc, 0x3c) + static_cast<u32>(x) * static_cast<u32>(y) * static_cast<u32>(z));
+}
+
+/// Dispatch of the async compute context: PrepareDispatch, the constant update engine flush and the dispatch packet.
+/// With execution the record replaces all of it (the packets are only written when the game's own path runs).
+u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || jcc == 0 || x == 0 || y == 0 || z == 0 ||
+        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
+        return 0;
+    }
+    const u64 seq = MakeAscRecord(jcc, x, y, z, ret);
+    if (seq == 0) {
+        asc_no_record.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (3u << 8);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    if (exec) {
+        words[2] |= ExecFlag;
+    }
+    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    if (!exec) {
+        asc_packet_path.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    AscSideEffects(jcc, x, y, z);
+    asc_drawn.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
+    return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
+}
+
 u64 PS4_SYSV_ABI TagDispatch(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return TagCompute(ctx, a1, a2, a3, ret, true);
 }
@@ -2548,6 +2830,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_cs_copy") {
         return reinterpret_cast<u64>(&TagCsCopyHandler);
+    }
+    if (name == "tag_asc_dispatch") {
+        return reinterpret_cast<u64>(&TagAscDispatch);
     }
     if (name == "tag_dispatch") {
         return reinterpret_cast<u64>(&TagDispatch);

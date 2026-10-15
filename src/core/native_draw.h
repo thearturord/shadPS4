@@ -27,6 +27,12 @@ void SetImageBase(VAddr base);
 /// (`reg_array`, index = register dword offset) and counts the differences (shadow mode).
 void VerifyRecord(u64 seq, const u32* reg_array);
 
+/// Index base of the compute program registers in a record: dword `d` of the compute program is index `ComputeRegisterBase + d`.
+constexpr u32 ComputeRegisterBase = 0xE000;
+
+/// Raster thread: the same comparison for a dispatch; `cs_dwords` is the compute program the dispatch runs with.
+void VerifyComputeRecord(u64 seq, const u32* cs_dwords);
+
 struct ExecRegister {
     u32 index; ///< index in the register file (dword offset)
     u32 value;

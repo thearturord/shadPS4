@@ -425,8 +425,13 @@ void Liverpool::DrainRasterWrites() {
 
 void Liverpool::RasterDispatch(const RasterCall& call_in) {
     RasterCall call = call_in;
-    if (call.kind == RasterCall::Kind::Draw && native_tag_pending.valid) {
-        call.tag = native_tag_pending;
+    if (native_tag_pending.valid) {
+        // a dispatch tag belongs to a dispatch, the other kinds to draws; a tag that finds the wrong kind is dropped
+        const bool dispatch_call = call.kind == RasterCall::Kind::DispatchDirect ||
+                                   call.kind == RasterCall::Kind::DispatchIndirect;
+        if (((native_tag_pending.meta >> 8) & 0xff) == 3 ? dispatch_call : !dispatch_call) {
+            call.tag = native_tag_pending;
+        }
     }
     native_tag_pending.valid = false;
     if (!split_active) {
@@ -492,6 +497,24 @@ void Liverpool::ExecuteNativeDraw() {
     if (!rasterizer || !Core::NativeDraw::TakeExecDraw(native_tag_pending.seq, draw)) {
         native_tag_pending.valid = false;
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
+        return;
+    }
+    if (draw.kind == 3) {
+        // dispatch: the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
+        ComputeProgram& program = GetCsRegs();
+        const ComputeProgram saved_program = program;
+        auto* dwords = reinterpret_cast<u32*>(&program);
+        for (u32 i = 0; i < draw.count; ++i) {
+            const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
+            if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
+                dwords[dword] = draw.regs[i].value;
+            }
+        }
+        RasterCall dispatch{};
+        dispatch.kind = RasterCall::Kind::DispatchDirect;
+        dispatch.marker = "gfx:{}:NativeDispatch";
+        RasterDispatch(dispatch);
+        program = saved_program;
         return;
     }
     // The registers of this draw are applied for the draw only: the game's own command packets, which it still writes
@@ -579,6 +602,9 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     case RasterCall::Kind::DrawIndirect:
         rasterizer->NativeInvalidate();
+        if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
+            Core::NativeDraw::VerifyRecord(c.tag.seq, RasterRegs().reg_array.data());
+        }
         run([&] {
             rasterizer->DrawIndirect(c.indexed, c.args_addr, c.offset, c.stride, c.max_count,
                                      c.count_addr, c.vertex_sgpr_offset, c.instance_sgpr_offset,
@@ -587,6 +613,16 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     case RasterCall::Kind::DispatchDirect:
         rasterizer->NativeInvalidate();
+        if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
+            static u32 compute_debug = 0;
+            if (compute_debug++ < 6) {
+                const auto& program = RasterCsRegs();
+                LOG_INFO(Render, "native compute verify: marker {} initiator {:#x} dims {} {} {} address {:#x} split {}",
+                         c.marker, program.dispatch_initiator, program.dim_x, program.dim_y, program.dim_z,
+                         static_cast<u64>(program.address), split_active);
+            }
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&RasterCsRegs()));
+        }
         run([&] { rasterizer->DispatchDirect(dispatch_plan); });
         break;
     case RasterCall::Kind::DispatchIndirect:

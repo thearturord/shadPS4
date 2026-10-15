@@ -687,10 +687,12 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             LOG_INFO(Render,
                      "Raster thread wall time (ms per interval): draws {}, dispatches {}, memory "
                      "write closures {}, other closures (fences, submit end, flips) {}, "
-                     "SendCommand callbacks {}",
+                     "SendCommand callbacks {}; draws {} of which depth-only {} ms, {} draws of which "
+                     "depth-only {}",
                      sp.ns_draws / 1'000'000, sp.ns_dispatches / 1'000'000,
                      sp.ns_write_closures / 1'000'000, sp.ns_other_closures / 1'000'000,
-                     sp.ns_callbacks / 1'000'000);
+                     sp.ns_callbacks / 1'000'000, sp.ns_draws / 1'000'000,
+                     sp.ns_depth_only_draws / 1'000'000, sp.n_draws, sp.n_depth_only_draws);
             {
                 static constexpr const char* names[] = {"front_working", "front_waiting_for_game_submit",
                                                         "front_draining_writes", "queue_full"};

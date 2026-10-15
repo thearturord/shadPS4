@@ -986,12 +986,20 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             const u32 r2 = Rd<u32>(regs, 8);
             sh_reg(0x48, Rd<u32>(regs, 0));
             sh_reg(0x49, 0);
-            sh_reg(0x4a, modifier == 0 ? r2 : (r2 & 0xfcfffc3fu) | modifier);
+            // the modifier of the fetch shader object goes into the shader's first resource word; a vertex shader whose
+            // fetch object does not exist yet gets it created during this draw
+            if (fetch_obj) {
+                sh_reg(0x4a, (r2 & 0xfcfffc3fu) | modifier);
+            }
             sh_reg(0x4b, Rd<u32>(regs, 12));
             context_reg(0x207, Rd<u32>(regs, 24));
             context_reg(0x1b1, Rd<u32>(regs, 16));
             context_reg(0x1c3, Rd<u32>(regs, 20));
-            if (fetch_addr) {
+            bool user_data_in_first_sgprs = false;
+            for (u32 k = 0; k < Rd<u8>(gnm, 3) && k < 40; ++k) {
+                user_data_in_first_sgprs |= Rd<u8>(gnm + 0x28 + k * 4, 2) < 2;
+            }
+            if (fetch_addr && !user_data_in_first_sgprs) {
                 sh_reg(0x4c, static_cast<u32>(fetch_addr));
                 sh_reg(0x4d, static_cast<u32>(fetch_addr >> 32));
             }
@@ -1105,16 +1113,16 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         ++s.registers_compared;
         const u32 actual = reg_array[regs[i].index];
         if (actual != regs[i].value) {
-            if (regs[i].index == ShBase + 0x4c) {
+            if (regs[i].index == ShBase + 0x4c || regs[i].index == ShBase + 0x4a) {
                 static u32 fetch_dumps = 0;
                 if (fetch_dumps < 40 && dbg_vs != 0) {
                     ++fetch_dumps;
                     const auto rd = [](u64 base, u64 off) { return base ? Rd<u64>(base, off) : u64{0}; };
                     const u64 alt = rd(dbg_vs + 0x330, 0xe0);
                     LOG_INFO(Core,
-                             "native fetch diff: vs {:#x} variant420 {:#x} fetch_obj {:#x} built {:#x} actual {:#x}/{:#x} "
+                             "native fetch diff: reg {:#x} vs {:#x} variant420 {:#x} fetch_obj {:#x} built {:#x} actual {:#x}/{:#x} "
                              "obj30 {:#x} 38 {:#x} 40 {:#x} 48 {:#x} | variant330 obj {:#x}: 30 {:#x} 40 {:#x}",
-                             dbg_vs, rd(dbg_vs, 0x420), dbg_fetch, regs[i].value, actual, reg_array[ShBase + 0x4d],
+                             regs[i].index, dbg_vs, rd(dbg_vs, 0x420), dbg_fetch, regs[i].value, actual, reg_array[ShBase + 0x4d],
                              rd(dbg_fetch, 0x30), rd(dbg_fetch, 0x38), rd(dbg_fetch, 0x40), rd(dbg_fetch, 0x48), alt,
                              rd(alt, 0x30), rd(alt, 0x40));
                 }

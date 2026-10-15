@@ -489,6 +489,8 @@ struct NativeRecord {
     u64 ps_gnm{};
     u64 dbg_vs{};
     u64 dbg_fetch{};
+    u32 rt_info{};
+    u32 flags{}; ///< RecordFlag bits: why this draw cannot run natively
     /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
     /// content with what the register `reg` points to in the packet path's state.
     struct TableCheck {
@@ -505,7 +507,14 @@ struct NativeRecord {
     std::array<SynthReg, MaxSynthRegs> regs{};
 };
 
-constexpr u32 RecordSlots = 8192;
+enum RecordFlag : u32 {
+    NoVertexShader = 1,
+    NoFetchObject = 2,
+    OddRenderTarget = 4,
+    SpecialPipeline = 8,
+};
+
+constexpr u32 RecordSlots = 16384;
 std::unique_ptr<NativeRecord[]> records;
 std::once_flag records_once;
 std::atomic<u64> next_seq{1};
@@ -659,6 +668,8 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
     return mask;
 }
 
+thread_local u32 synth_flags;
+thread_local u32 synth_rt_info; ///< count | view mask << 8 | empty block mask << 16
 thread_local u64 dbg_vs;
 thread_local u64 dbg_fetch;
 
@@ -872,10 +883,22 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
     // view + 0x54, an unbound one clears CB_COLORi_INFO). Target 7 is the object at ctx + 0x130e0.
     {
         const u32 count = Rd<u32>(ctx, Ctx::RenderTargetCount);
+        synth_rt_info = count & 0xff;
+        for (u32 slot = 0; slot < 7; ++slot) {
+            if (const u64 view = Rd<u64>(ctx, Ctx::RenderTargets + slot * 8); view != 0) {
+                synth_rt_info |= 1u << (8 + slot);
+                if (Rd<u32>(view + 0x54, 0) == 0) {
+                    synth_rt_info |= 1u << (16 + slot);
+                }
+            }
+        }
         const auto emit_target = [&](u32 slot, u64 view) {
             const u32 base = 0x318 + 0xf * slot;
             if (view) {
                 const u64 block = view + 0x54;
+                if (Rd<u32>(block, 0) == 0 && slot < 7) {
+                    synth_flags |= OddRenderTarget;
+                }
                 if (Rd<u32>(block, 0) != 0) {
                     for (u32 k = 0; k < 14; ++k) {
                         context_reg(base + k, Rd<u32>(block, k * 4));
@@ -886,7 +909,8 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             context_reg(base + 4, 0);
         };
         for (u32 slot = 0; slot < 7; ++slot) {
-            emit_target(slot, slot < count ? Rd<u64>(ctx, Ctx::RenderTargets + slot * 8) : 0);
+            const u64 view = slot < count ? Rd<u64>(ctx, Ctx::RenderTargets + slot * 8) : 0;
+            emit_target(slot, view);
         }
         emit_target(7, Rd<u64>(ctx, 0x130e0));
     }
@@ -976,9 +1000,16 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
         const u64 vs = Rd<u64>(ctx, Ctx::VertexShader);
         const u64 gnm = vs ? Rd<u64>(vs, 0x120) : 0;
         *vs_gnm_out = gnm;
+        if (!gnm) {
+            synth_flags |= NoVertexShader;
+        }
         if (gnm) {
             const u64 regs = gnm + 8;
             const u64 fetch_obj = Rd<u64>(vs + 0x30, 0xe0);
+            if (Rd<u64>(vs, 0x420) != 0 || Rd<u64>(ctx, 0x4680) != 0 || Rd<u64>(ctx, 0x4688) != 0 ||
+                Rd<u32>(ctx, 0x130c8) == 0x200) {
+                synth_flags |= SpecialPipeline;
+            }
             dbg_vs = vs;
             dbg_fetch = fetch_obj;
             const u32 modifier = fetch_obj ? Rd<u32>(fetch_obj, 0x40) : 0;
@@ -1055,7 +1086,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     slot.seq.store(0, std::memory_order_release);
     slot.check_count = 0;
     slot.unsupported_inputs = 0;
+    synth_flags = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    slot.flags = synth_flags;
+    slot.rt_info = synth_rt_info;
     slot.dbg_vs = dbg_vs;
     slot.dbg_fetch = dbg_fetch;
     {
@@ -1071,6 +1105,9 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
+                if (Rd<u32>(ctx, 0x60) != 0x39) {
+                    slot.flags |= SpecialPipeline;
+                }
             }
             slot.regs[n++] = {ContextBase + 0x29e, static_cast<u32>(a1)};
         }
@@ -1087,6 +1124,11 @@ struct VerifyStats {
     u64 registers_compared{};
     u64 mismatches{};
     u64 draws_with_mismatch{};
+    u64 draws_flagged{};
+    u64 draws_clean_mismatch{};
+    std::array<u64, 4> flag_counts{};
+    std::unordered_map<u64, u64> index_type_pairs;
+    std::unordered_map<u32, u64> rt_odd_info;
     struct PerReg {
         u64 count{};
         u32 expected{};
@@ -1112,6 +1154,8 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
     const u32 count = slot.count;
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
+    const u32 flags = slot.flags;
+    const u32 rt_info = slot.rt_info;
     const u64 dbg_vs = slot.dbg_vs;
     const u64 dbg_fetch = slot.dbg_fetch;
     const u32 check_count = slot.check_count;
@@ -1143,6 +1187,9 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                              rd(dbg_fetch, 0x30), rd(dbg_fetch, 0x38), rd(dbg_fetch, 0x40), rd(dbg_fetch, 0x48), alt,
                              rd(alt, 0x30), rd(alt, 0x40));
                 }
+            }
+            if (regs[i].index == ContextBase + 0x29f) {
+                ++s.index_type_pairs[(u64(regs[i].value) << 32) | actual];
             }
             ++s.mismatches;
             any = true;
@@ -1238,8 +1285,27 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                               : slot_index < ContextCount + ShCount ? ShFirst + slot_index - ContextCount
                                                                     : UconfigFirst + slot_index - ContextCount - ShCount;
             const u32 value = reg_array[index];
-            if (have_previous && value != previous[slot_index] && covered_in[slot_index] != stamp) {
+            if (have_previous && flags == 0 && value != previous[slot_index] && covered_in[slot_index] != stamp) {
                 ++s.uncovered[index];
+                if (index == ShFirst + 0x0c || index == ShFirst + 0x54 || index == ShFirst + 0x58) {
+                    static std::array<u32, 3> sgpr_dumps{};
+                    u32& dumped_count = sgpr_dumps[index == ShFirst + 0x0c ? 0 : index == ShFirst + 0x54 ? 1 : 2];
+                    if (dumped_count < 8) {
+                        ++dumped_count;
+                        const u64 gnm = index == ShFirst + 0x0c ? ps_gnm : vs_gnm;
+                        std::string inputs, ud;
+                        for (u32 k = 0; gnm && k < Rd<u8>(gnm, 3) && k < 40; ++k) {
+                            const u64 e = gnm + (index == ShFirst + 0x0c ? 0x3c : 0x28) + k * 4;
+                            inputs += fmt::format("[{} s{} r{} f{}]", Rd<u8>(e, 0), Rd<u8>(e, 1), Rd<u8>(e, 2), Rd<u8>(e, 3));
+                        }
+                        const u32 base = index == ShFirst + 0x0c ? ShFirst + 0x0c : ShFirst + 0x4c;
+                        for (u32 k = 0; k < 16; ++k) {
+                            ud += fmt::format(" {:x}", reg_array[base + k]);
+                        }
+                        LOG_INFO(Core, "native uncovered user data {:#x}: shader {:#x} inputs {} | actual{}", index, gnm,
+                                 inputs, ud);
+                    }
+                }
                 s.uncovered_values[index] = {value, previous[slot_index]};
             }
             previous[slot_index] = value;
@@ -1247,6 +1313,14 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
         have_previous = true;
     }
     s.draws_with_mismatch += any;
+    s.draws_flagged += flags != 0;
+    if (flags & OddRenderTarget) {
+        ++s.rt_odd_info[rt_info];
+    }
+    for (u32 bit = 0; bit < 4; ++bit) {
+        s.flag_counts[bit] += (flags >> bit) & 1;
+    }
+    s.draws_clean_mismatch += any && flags == 0;
     if (any || true) {
         // the first draws of each distinct vertex/pixel shader pair: input table and the actual user data
         static std::unordered_map<u64, u32> dumped;
@@ -1288,9 +1362,22 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                      "native front end check: {} draws checked, {} without record, {} registers compared, {} differ "
                      "({} draws with a difference)",
                      s.draws_checked, s.draws_missing, s.registers_compared, s.mismatches, s.draws_with_mismatch);
+            LOG_INFO(Core,
+                     "native front end check: {} draws cannot run natively (no vertex shader {}, no fetch object {}, odd "
+                     "render target {}, special pipeline {}); {} of the others differ",
+                     s.draws_flagged, s.flag_counts[0], s.flag_counts[1], s.flag_counts[2], s.flag_counts[3],
+                     s.draws_clean_mismatch);
             for (size_t k = 0; k < top.size() && k < 12; ++k) {
                 LOG_INFO(Core, "native front end check: register {:#x} differs {} times (last: built {:#x}, actual {:#x})",
                          top[k].first, top[k].second.count, top[k].second.expected, top[k].second.actual);
+            }
+            for (const auto& [pair, count] : s.index_type_pairs) {
+                LOG_INFO(Core, "native front end check: index type built {:#x} actual {:#x}: {} draws", pair >> 32,
+                         pair & 0xffffffff, count);
+            }
+            for (const auto& [info, count] : s.rt_odd_info) {
+                LOG_INFO(Core, "native front end check: odd render targets: count {} views {:#x} empty blocks {:#x}: {} draws",
+                         info & 0xff, (info >> 8) & 0xff, (info >> 16) & 0xff, count);
             }
             std::vector<std::pair<u32, u64>> gaps(s.uncovered.begin(), s.uncovered.end());
             std::ranges::sort(gaps, [](const auto& x, const auto& y) { return x.second > y.second; });
@@ -1304,8 +1391,12 @@ void VerifyRecord(u64 seq, const u32* reg_array) {
                      gaps.size(), gap_text);
         }
         s.draws_checked = s.draws_missing = s.registers_compared = s.mismatches = s.draws_with_mismatch = 0;
+        s.draws_flagged = s.draws_clean_mismatch = 0;
+        s.flag_counts = {};
         s.by_register.clear();
         s.uncovered.clear();
+        s.index_type_pairs.clear();
+        s.rt_odd_info.clear();
         s.uncovered_values.clear();
         s.last_log_ns = now;
     }

@@ -29,7 +29,7 @@ constexpr u32 UnknownDrawCount = 0xfffffffe;
 struct LiveCounters {
     std::atomic<u64> gfx_tags{}, gfx_exec{};
     std::atomic<u64> compute_tags{}, compute_exec{};
-    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{};
+    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
     /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
@@ -70,6 +70,7 @@ struct ExecDraw {
     u32 kind{};        ///< 0 = indexed, 1 = auto
     u32 start_index{}; ///< indexed draws
     u64 args_addr{};   ///< indirect draws (kind 2)
+    u64 extra_addr{};  ///< copy records (kind 10): the source address
     u32 offset{};
     u32 vertex_sgpr{};
     u32 instance_sgpr{};

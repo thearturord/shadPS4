@@ -597,6 +597,29 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
     }
+    if (draw.kind == 10) {
+        // memory copy: destination, source and the number of bytes travel in the record
+        native_tag_pending.valid = false;
+        if (rasterizer) {
+            RasterRun(
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr),
+                 bytes = draw.a1] { rasterizer->CopyBuffer(destination, source, bytes, false, false); },
+                false, true);
+        }
+        return;
+    }
+    if (draw.kind == 9) {
+        // append / consume counter read-back: four bytes of GDS to the buffer's memory
+        native_tag_pending.valid = false;
+        if (rasterizer) {
+            RasterRun(
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index] {
+                    rasterizer->CopyBuffer(destination, source, sizeof(u32), false, true);
+                },
+                false, true);
+        }
+        return;
+    }
     if (draw.kind == 6 || draw.kind == 8) {
         // buffer fill (kind 8: GDS, an append / consume counter): destination, value and the number of dwords travel in the record
         native_tag_pending.valid = false;
@@ -626,8 +649,8 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         OverlayRestore();
         return;
     }
-    if (draw.kind == 3) {
-        // dispatch: the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
+    if (draw.kind == 3 || draw.kind == 11) {
+        // dispatch (kind 11: indirect, the group counts are read from the argument buffer): the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
         ComputeProgram& program = GetCsRegs();
         const ComputeProgram saved_program = program;
         auto* dwords = reinterpret_cast<u32*>(&program);
@@ -639,6 +662,12 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         RasterCall dispatch{};
         dispatch.kind = RasterCall::Kind::DispatchDirect;
+        if (draw.kind == 11) {
+            dispatch.kind = RasterCall::Kind::DispatchIndirect;
+            dispatch.args_addr = draw.args_addr;
+            dispatch.offset = draw.start_index;
+            dispatch.dispatch_size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
+        }
         if (asc_vqid != ~0u) {
             dispatch.asc = true;
             dispatch.vqid = asc_vqid;

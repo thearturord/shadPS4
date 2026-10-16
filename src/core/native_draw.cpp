@@ -550,6 +550,7 @@ struct NativeRecord {
     u32 cb_extent_mask{};
     u32 db_extent{};
     u64 args_addr{};      ///< indirect draws: the argument buffer
+    u64 extra_addr{};     ///< copy records: the source address
     u32 vertex_sgpr{};    ///< indirect draws: user data registers that receive the base vertex / start instance
     u32 instance_sgpr{};
     u32 rt_info{};
@@ -1950,6 +1951,124 @@ u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 so
     return seq;
 }
 
+/// Guest thread: the record of FUN_02485c00 with a source of several different dwords: the device's copy-with-wrap shader
+/// (destination[i] = source[i mod size]; the variant for a power-of-two size is a mask) with the destination as read-write
+/// buffer, the source as buffer and a constant buffer holding the element count and the size mask. `writer` is the draw
+/// context's command buffer structure (context + 0x47c0).
+u64 MakeFillPatternRecord(u64 writer, u64 destination, u32 count, u64 source, u32 size, u64 caller) {
+    const u64 ctx = writer - 0x47c0;
+    const VAddr image = image_base.load(std::memory_order_relaxed);
+    if (image == 0 || count == 0 || size == 0) {
+        return 0;
+    }
+    const bool power_of_two = ((size - 1) & size) == 0;
+    const u64 device = Rd<u64>(image + (power_of_two ? 0x6b03550 : 0x6b03548) - 0x1000000, 0);
+    const u64 gnm = device ? Rd<u64>(device, 0x120) : 0;
+    if (gnm == 0) {
+        return 0;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.unsupported_inputs = 0;
+    slot.unsupported_mask = 0;
+    synth_flags = 0;
+    slot.kind = 3;
+    slot.caller = caller;
+    slot.a1 = (count + 0x3f) >> 6;
+    slot.a2 = 1;
+    slot.rt_info = 0;
+    slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
+    slot.ps_gnm = 0;
+    slot.vs_gnm = gnm;
+    u32 n = 0;
+    const auto cs_reg = [&](u32 dword, u32 value) { slot.regs[n++] = {Core::NativeDraw::ComputeRegisterBase + dword, value}; };
+    const u64 program = gnm + 8;
+    cs_reg(0x00, (u32(Rd<u8>(ctx, 0x13015)) * 8 & 0x18) + 1);
+    cs_reg(0x01, slot.a1);
+    cs_reg(0x02, 1);
+    cs_reg(0x03, 1);
+    cs_reg(0x07, Rd<u32>(program, 16));
+    cs_reg(0x08, Rd<u32>(program, 20));
+    cs_reg(0x09, Rd<u32>(program, 24));
+    cs_reg(0x0c, Rd<u32>(program, 0));
+    cs_reg(0x0d, 0);
+    cs_reg(0x12, Rd<u32>(program, 8));
+    cs_reg(0x13, Rd<u32>(program, 12));
+    const std::array<u32, 4> uav{static_cast<u32>(destination), static_cast<u32>(destination >> 32) & 0xfff | 0x47000, count, 0x18024004u};
+    const std::array<u32, 4> srv{static_cast<u32>(source), static_cast<u32>(source >> 32) & 0xfff | 0x40000, size, 0x20024004u};
+    u32* constants = AllocTable(4);
+    constants[0] = count;
+    constants[1] = size - (power_of_two ? 1u : 0u);
+    constants[2] = constants[3] = 0;
+    const u64 constants_address = reinterpret_cast<u64>(constants);
+    const std::array<u32, 2> constant_descriptor_tail{1u, 0x20077facu};
+    std::array<u32, 16> eud{};
+    u32 eud_dwords = 0;
+    bool have_eud_pointer = false;
+    u32 eud_pointer_sgpr = 0;
+    u32 checks = 0;
+    const auto put = [&](u32 start, const u32* words, u32 words_count) {
+        for (u32 k = 0; k < words_count; ++k) {
+            const u32 reg = start + k;
+            if (reg < 16) {
+                cs_reg(0x40 + reg, words[k]);
+            } else if (reg - 16 < eud.size()) {
+                eud[reg - 16] = words[k];
+                eud_dwords = std::max(eud_dwords, reg - 16 + 1);
+            } else {
+                ++slot.unsupported_inputs;
+            }
+        }
+    };
+    for (u32 i = 0; i < Rd<u8>(gnm, 3) && i < 40; ++i) {
+        const u64 e = gnm + 0x28 + i * 4;
+        const u32 type = Rd<u8>(e, 0);
+        const u32 slot_index = Rd<u8>(e, 1);
+        const u32 start = Rd<u8>(e, 2);
+        const bool big = (Rd<u8>(e, 3) & 1) != 0;
+        if (type == 27) {
+            have_eud_pointer = true;
+            eud_pointer_sgpr = start;
+        } else if (type == 26) {
+            const u64 table = Rd<u64>(ctx, 0x12f30);
+            const std::array<u32, 2> words{static_cast<u32>(table), static_cast<u32>(table >> 32)};
+            put(start, words.data(), 2);
+        } else if (slot_index != 0 || big || (type != 0 && type != 2 && type != 4)) {
+            ++slot.unsupported_inputs;
+        } else if (type == 0) {
+            put(start, srv.data(), 4);
+        } else if (type == 4) {
+            put(start, uav.data(), 4);
+        } else if (start + 4 > 16 || checks >= slot.checks.size()) {
+            ++slot.unsupported_inputs;
+        } else {
+            // the constant buffer descriptor holds the address of the constants: compared by content
+            slot.checks[checks++] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 31, 2, constants_address, 0, {~0ull, ~0ull}, 0x100000};
+            put(start + 2, constant_descriptor_tail.data(), 2);
+        }
+    }
+    if (have_eud_pointer) {
+        if (eud_pointer_sgpr + 2 > 16 || checks >= slot.checks.size() || eud_dwords == 0) {
+            ++slot.unsupported_inputs;
+        } else {
+            u32* table = AllocTable(eud_dwords);
+            std::memcpy(table, eud.data(), eud_dwords * sizeof(u32));
+            slot.checks[checks++] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + eud_pointer_sgpr, 27, eud_dwords,
+                                     reinterpret_cast<u64>(table), 0, {~0ull, ~0ull}};
+        }
+    } else if (eud_dwords != 0) {
+        ++slot.unsupported_inputs;
+    }
+    slot.check_count = checks;
+    slot.count = n;
+    slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.seq.store(seq, std::memory_order_release);
+    return seq;
+}
+
 struct VerifyStats {
     std::mutex mutex;
     u64 draws_checked{};
@@ -2406,6 +2525,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.start_index = slot.a2;
     out.a1 = slot.a1;
     out.args_addr = slot.args_addr;
+    out.extra_addr = slot.extra_addr;
     out.offset = slot.a2;
     out.vertex_sgpr = slot.vertex_sgpr;
     out.cb_extent = slot.cb_extent;
@@ -3055,6 +3175,62 @@ u64 TagCompute(u64 ctx, u64 x, u64 y, u64 z, u64 ret, bool exec_capable) {
     return 1;
 }
 
+/// JsDeviceContext::DispatchIndirect(context, argument buffer, offset): PrepareDispatch, the set-base packet with the
+/// argument buffer and the indirect dispatch packet. The record is the compute record without the group counts (they are
+/// read from the argument buffer when the dispatch runs); while the call site is not verified it is tagged like a direct
+/// dispatch and compared with the game's packets.
+u64 PS4_SYSV_ABI TagDispatchIndirect(u64 ctx, u64 buffer, u64 offset, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0 || !valid(buffer) ||
+        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0 ||
+        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 11) & 1) == 0 || Rd<u64>(ctx, 0x4670) == 0) {
+        return 0;
+    }
+    RunComputeTracking(ctx);
+    const u64 seq = Guarded([&] { return MakeComputeRecord(ctx, 1, 1, 1, ret); });
+    auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        return 0;
+    }
+    u32 kept = 0;
+    for (u32 i = 0; i < slot.count; ++i) {
+        const u32 index = slot.regs[i].index;
+        if (index < Core::NativeDraw::ComputeRegisterBase + 1 || index > Core::NativeDraw::ComputeRegisterBase + 3) {
+            slot.regs[kept++] = slot.regs[i]; // the group counts come from the argument buffer
+        }
+    }
+    slot.count = kept;
+    const u64 address = (static_cast<u64>(Rd<u32>(buffer, 0x30)) & 0xfffffff8ull) | (static_cast<u64>(Rd<u32>(buffer, 0x34)) & 0xff) << 32;
+    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(ctx, seq, ret);
+    slot.kind = exec ? 11 : 3;
+    slot.args_addr = address;
+    slot.a2 = static_cast<u32>(offset);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | ((exec ? 11u : 3u) << 8) | (exec ? ExecFlag : 0u);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
+    if (!exec) {
+        return 0;
+    }
+    Live().compute_exec.fetch_add(1, std::memory_order_relaxed);
+    ComputeSideEffects(ctx);
+    Wr<u32>(ctx, 0x34, Rd<u32>(ctx, 0x34) + 1);
+    compute_drawn.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 /// CsCopyBufferDwords(writer, destination, source, bytes): the game's own code builds the descriptors and binds the copy
 /// shader; with execution the record replaces that and the dispatch packet.
 u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
@@ -3137,6 +3313,138 @@ u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_ar
 
 using GuestFunction6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 bool StripPackets(u64 begin, u64 end);
+
+/// FUN_02471530(async compute context, counter buffer, unordered access view): hands an append / consume counter back to its
+/// buffer. A counter without a GDS slot or with a pending initial value is a CPU write of that value; otherwise the GPU
+/// counter in GDS is copied to the buffer's memory (a DMA packet and a scratch label in the game's function): a GDS read-back
+/// record (kind 9).
+u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (jcc == 0 || !valid(buffer) || !valid(view) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 512) == 0) {
+        return 0;
+    }
+    const u64 memory = ((static_cast<u64>(Rd<u32>(buffer, 0x64)) & 0xfff) << 32) + Rd<u32>(buffer, 0x60);
+    if (memory == 0 || (memory & 3) != 0) {
+        return 0;
+    }
+    const u32 slot = Rd<u32>(view, 0x84);
+    u32 pending = 0xffffffffu;
+    if (slot != 0xffffffffu) {
+        if (slot >= 8) {
+            return 0;
+        }
+        pending = Rd<u32>(jcc, 0x2158 + slot * 4);
+    }
+    if (slot != 0xffffffffu && pending == 0xffffffffu) {
+        // the GPU counter: GDS to memory, in stream order
+        const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+        if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+            return 0;
+        }
+        auto& record = Slot(seq);
+        record.seq.store(0, std::memory_order_release);
+        record.check_count = 0;
+        record.count = 0;
+        record.kind = 9;
+        record.flags = 0;
+        record.caller = ret;
+        record.a1 = 1;
+        record.a2 = static_cast<u32>(Rd<u32>(jcc, 0x22f8) + slot * 4ull); // GDS byte offset
+        record.args_addr = memory;
+        record.seq.store(seq, std::memory_order_release);
+        u32 words[2 + VideoCore::NativeTagPayloadDwords];
+        words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+        words[1] = VideoCore::NativeTagMagic;
+        words[2] = static_cast<u32>(Other) | (9u << 8) | ExecFlag;
+        std::memset(&words[3], 0, 3 * sizeof(u64));
+        std::memcpy(&words[9], &seq, sizeof(u64));
+        words[11] = 0;
+        words[12] = 0;
+        if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+            return 0;
+        }
+        tags_written.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // CPU write of the counter's value
+        u32 value = pending;
+        if (slot == 0xffffffffu) {
+            value = Rd<u32>(view, 0x88) != 0xffffffffu ? Rd<u32>(view, 0x88) : 0;
+        }
+        Wr<u32>(memory, 0, value);
+    }
+    Wr<u32>(buffer, 0x2c, Rd<u32>(jcc, 0x22fc));
+    Live().counter_readback.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+/// FUN_024717c0(async compute context, destination resource, source resource): AsyncCopyResource. The game copies the
+/// resource memory with DMA packets (a buffer's bytes, a texture's width x height bytes) and orders it with a scratch label;
+/// with execution it is a memory copy record (kind 10). Copies of more than one DMA chunk keep the game's function.
+u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (jcc == 0 || !valid(destination) || !valid(source) || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 1024) == 0) {
+        return 0;
+    }
+    const VAddr image = image_base.load(std::memory_order_relaxed);
+    if (image == 0) {
+        return 0;
+    }
+    const auto texture_base = reinterpret_cast<u32(PS4_SYSV_ABI*)(u64)>(image + 0x246b850 - 0x1000000);
+    const auto address_of = [&](u64 resource) -> u64 {
+        if (Rd<u32>(resource, 0x124) == 1) {
+            return static_cast<u64>(Rd<u32>(resource, 0x60)) | (static_cast<u64>(Rd<u32>(resource, 0x64)) & 0xfff) << 32;
+        }
+        return static_cast<u64>(texture_base(resource + 0x70)) << 8;
+    };
+    u64 bytes;
+    if (Rd<u32>(source, 0x124) == 1) {
+        const u32 stride = (Rd<u32>(source, 0x64) >> 16) & 0x3fff;
+        bytes = static_cast<u64>(stride != 0 ? stride : 1) * Rd<u32>(source, 0x68);
+    } else {
+        bytes = (static_cast<u64>((Rd<u32>(source, 0x78) >> 14) & 0x3fff) + 1) * (((Rd<u32>(source, 0x80) >> 13) & 0x3fff) + 1);
+    }
+    bytes = (bytes + 3) & ~3ull;
+    const u64 to = address_of(destination);
+    const u64 from = address_of(source);
+    if (bytes == 0 || bytes >= 0x1ffffc || to == 0 || from == 0) {
+        return 0;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+        return 0;
+    }
+    auto& record = Slot(seq);
+    record.seq.store(0, std::memory_order_release);
+    record.check_count = 0;
+    record.count = 0;
+    record.kind = 10;
+    record.flags = 0;
+    record.caller = ret;
+    record.a1 = static_cast<u32>(bytes);
+    record.args_addr = to;
+    record.extra_addr = from;
+    record.seq.store(seq, std::memory_order_release);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (10u << 8) | ExecFlag;
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    Wr<u32>(destination, 0x2c, Rd<u32>(jcc, 0x22fc));
+    Wr<u32>(source, 0x2c, Rd<u32>(jcc, 0x22fc));
+    Live().async_copy_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
 
 /// JsComputeContext / JsDeviceContext::SetComputeResourceLimits (FUN_024720f0, FUN_02480ed0): one COMPUTE_RESOURCE_LIMITS
 /// register write; nothing of the host reads it.
@@ -3461,6 +3769,20 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     return 1;
 }
 
+/// True when the `size` dwords at `source` are all the same (a fill with a pattern of equal dwords is a fill with one value).
+bool SourceDwordsEqual(u64 source, u32 size) {
+    if (source < 0x200000 || size == 0 || size > 64) {
+        return false;
+    }
+    const u32 first = Rd<u32>(source, 0);
+    for (u32 k = 1; k < size; ++k) {
+        if (Rd<u32>(source, k * 4) != first) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// FUN_02485c00(context, destination, dwords, source, source dwords): the SDK's compute copy with wrap, a shader that
 /// writes destination[i] = source[i mod size]. Every call of the game has a source of one dword: a buffer fill. With
 /// execution it is a fill operation of the command processor (record kind 6); any other size keeps the game's path.
@@ -3469,8 +3791,61 @@ u64 PS4_SYSV_ABI TagFill(u64 ctx, u64 destination, u64 count_arg, u64 source, u6
     const u32 count = static_cast<u32>(count_arg);
     const u32 size = static_cast<u32>(size_arg);
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        ctx == 0 || size != 1 || count == 0 || count > (64u << 20) / 4 || source == 0 || destination == 0 ||
-        (Rd<u8>(ctx, 0xe849) & 1) != 0 || (destination & 3) != 0) {
+        ctx == 0 || size == 0 || size > 64 || count == 0 || count > (64u << 20) / 4 || source == 0 || destination == 0 ||
+        (Rd<u8>(ctx, 0xe849) & 1) != 0 || (destination & 3) != 0 || !SourceDwordsEqual(source, size)) {
+        if (ctx != 0 && size >= 2 && size <= 64 && count != 0 && count <= (64u << 20) / 4 && source != 0 && destination != 0 &&
+            (destination & 3) == 0 && (Rd<u8>(ctx, 0xe849) & 1) == 0 && policy.native_draw_mode.load(std::memory_order_relaxed) != 0 &&
+            policy.native_synth_verify.load(std::memory_order_relaxed) != 0 &&
+            ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 12) & 1) != 0) {
+            const u64 writer = ctx;
+            if (const u64 seq = Guarded([&] { return MakeFillPatternRecord(writer, destination, count, source, size, ret); });
+                seq != 0) {
+                u32 words[2 + VideoCore::NativeTagPayloadDwords];
+                words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+                words[1] = VideoCore::NativeTagMagic;
+                words[2] = static_cast<u32>(Other) | (3u << 8);
+                std::memset(&words[3], 0, 3 * sizeof(u64));
+                std::memcpy(&words[9], &seq, sizeof(u64));
+                words[11] = 0;
+                words[12] = 0;
+                const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(writer - 0x47c0, seq, ret);
+                if (exec) {
+                    words[2] |= ExecFlag;
+                }
+                if (WriteDwordsAt(writer, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+                    tags_written.fetch_add(1, std::memory_order_relaxed);
+                    Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
+                    if (exec) {
+                        Live().compute_exec.fetch_add(1, std::memory_order_relaxed);
+                        compute_drawn.fetch_add(1, std::memory_order_relaxed);
+                        return 1;
+                    }
+                    return 0;
+                }
+            }
+        }
+        if (ctx != 0) {
+            static std::mutex mutex;
+            static std::map<std::tuple<u32, u32, u32, u64>, u32> shapes; ///< count, size, flag, caller -> calls
+            static u64 last_ms = 0;
+            std::lock_guard lock{mutex};
+            ++shapes[{count, size, static_cast<u32>(Rd<u8>(ctx, 0xe849) & 1), ret - ImageBase() + 0x1000000}];
+            if (source >= 0x200000 && size >= 2) {
+                static std::atomic<u32> value_logs{0};
+                if (value_logs.fetch_add(1) < 6) {
+                    LOG_INFO(Core, "fill/copy source of {} dwords: {:#x} {:#x}", size, Rd<u32>(source, 0), Rd<u32>(source, 4));
+                }
+            }
+            const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now - last_ms >= 5000) {
+                last_ms = now;
+                for (const auto& [key, calls] : shapes) {
+                    LOG_INFO(Core, "fill/copy on the packet path per 5 s: dwords {} source dwords {} post-draw flag {} caller {:#x}: {} calls",
+                             std::get<0>(key), std::get<1>(key), std::get<2>(key), std::get<3>(key), calls);
+                }
+                shapes.clear();
+            }
+        }
         return 0;
     }
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
@@ -3891,6 +4266,15 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "measure_excs_depth_copy") {
         return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
+    }
+    if (name == "tag_dispatch_indirect") {
+        return reinterpret_cast<u64>(&TagDispatchIndirect);
+    }
+    if (name == "tag_asc_copy_resource") {
+        return reinterpret_cast<u64>(&TagAscCopyResource);
+    }
+    if (name == "tag_asc_counter_readback") {
+        return reinterpret_cast<u64>(&TagAscCounterReadback);
     }
     if (name == "skip_resource_limits") {
         return reinterpret_cast<u64>(&SkipResourceLimits);

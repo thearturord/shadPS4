@@ -2878,6 +2878,66 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
     return 1;
 }
 
+/// JsDeviceContext::ExCsDepthCopy(context, destination, source): the depth surface and its HTILE surface copied as raw
+/// dwords with the device's copy shader, two dispatches (the buffer copy of CsCopyBufferDwords), with event and scratch
+/// label fences in between. With execution: two copy records, the fields the function sets at its end, nothing else.
+u64 PS4_SYSV_ABI TagExCsDepthCopy(u64 ctx, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 3) & 1) == 0 || ctx == 0 || !valid(destination) ||
+        !valid(source) || destination == source || (Rd<u8>(ctx, 0x13009) & 1) != 0) {
+        return 0;
+    }
+    const std::array<u64, 2> surfaces{0x30, 0x48};
+    std::array<u64, 2> seqs{};
+    for (u32 i = 0; i < 2; ++i) {
+        const u64 bytes = Rd<u64>(destination, surfaces[i] + 8);
+        const u64 to = Rd<u64>(destination, surfaces[i]);
+        const u64 from = Rd<u64>(source, surfaces[i]);
+        if (bytes == 0 || bytes > (1ull << 30) || to == 0 || from == 0) {
+            return 0;
+        }
+        seqs[i] = Guarded([&] { return MakeCopyRecord(ctx, to, from, bytes, ret); });
+        if (seqs[i] == 0 || Slot(seqs[i]).flags != 0 || seqs[i] - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+            return 0;
+        }
+    }
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    u32 words[2 * TagDwords];
+    for (u32 i = 0; i < 2; ++i) {
+        u32* tag = &words[i * TagDwords];
+        tag[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
+        tag[1] = VideoCore::NativeTagMagic;
+        tag[2] = static_cast<u32>(Other) | (3u << 8) | ExecFlag;
+        std::memset(&tag[3], 0, 3 * sizeof(u64));
+        std::memcpy(&tag[9], &seqs[i], sizeof(u64));
+        tag[11] = 0;
+        tag[12] = 0;
+    }
+    if (!WriteDwords(ctx, words, 2 * TagDwords)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    tags_written.fetch_add(2, std::memory_order_relaxed);
+    Live().compute_tags.fetch_add(2, std::memory_order_relaxed);
+    Live().compute_exec.fetch_add(2, std::memory_order_relaxed);
+    compute_drawn.fetch_add(2, std::memory_order_relaxed);
+    // what the function leaves behind: the compute mode, three cleared engine caches and the destination's state copied
+    // from the source
+    Wr<u64>(ctx, 0x20f8, 0);
+    Wr<u64>(ctx, 0x2478, 0);
+    Wr<u64>(ctx, 0x43f8, 0);
+    Wr<u32>(ctx, 0x278, 0x8000);
+    Wr<u32>(destination, 0x144, Rd<u32>(source, 0x144));
+    Wr<u32>(destination, 0x158, Rd<u32>(source, 0x158));
+    Wr<u8>(destination, 0x15c, Rd<u8>(source, 0x15c));
+    Wr<u32>(destination, 0x178, Rd<u32>(source, 0x178));
+    Wr<u32>(destination, 0x17c, Rd<u32>(source, 0x17c));
+    return 1;
+}
+
 u64 PS4_SYSV_ABI TagCsCopyHandler(u64 writer, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return TagCsCopy(writer, a1, a2, a3 & 0xffffffff, ret);
 }
@@ -3306,6 +3366,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "measure_excs_depth_copy") {
         return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
+    }
+    if (name == "tag_excs_depth_copy") {
+        return reinterpret_cast<u64>(&TagExCsDepthCopy);
     }
     if (name == "measure_htile_clear") {
         return reinterpret_cast<u64>(&MeasureHtileClear);

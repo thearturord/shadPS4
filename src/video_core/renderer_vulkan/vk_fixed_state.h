@@ -9,6 +9,19 @@
 
 namespace Vulkan {
 
+/// Blend state of one colour target, in Vulkan terms (no padding: compared and hashed bytewise as part of a pipeline key).
+struct BlendTarget {
+    vk::BlendFactor src_color{};
+    vk::BlendFactor dst_color{};
+    vk::BlendFactor src_alpha{};
+    vk::BlendFactor dst_alpha{};
+    vk::BlendOp color_op{};
+    vk::BlendOp alpha_op{};
+    u32 enable{};
+
+    bool operator==(const BlendTarget&) const = default;
+};
+
 /// The fixed-function state of a draw as Vulkan wants it: viewports, scissors, depth, stencil, culling, blend constants.
 /// Nothing in it is an AMD register field. It is built either from the register state of a draw
 /// (`MakeFixedState`, the packet path) or by the native path straight from the game's state objects; the rasterizer reads
@@ -49,6 +62,30 @@ struct FixedState {
     vk::FrontFace front_face{};
     float line_width{};
     std::array<float, 4> blend_constants{};
+
+    // what a pipeline is built with
+    bool color_enabled{};                                       ///< false: the draw writes no colour target
+    std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> target_write_mask{}; ///< R, G, B, A bits per colour target
+    std::array<BlendTarget, AmdGpu::NUM_COLOR_BUFFERS> blend{};
+    u8 alpha_not_exported{}; ///< bit per colour target: the pixel shader does not write alpha
+    bool logic_op_enabled{};
+    vk::LogicOp logic_op{};
+    vk::PolygonMode polygon_mode{};
+    bool depth_clamp{};
+    bool depth_clip{};
+    bool negative_one_to_one{}; ///< clip space -w..w (otherwise 0..w)
+    bool provoking_first{};
+
+    /// True when the first target's blend state reads the second pixel shader output.
+    bool DualSourceBlending() const {
+        const auto& b = blend[0];
+        const auto second = [](vk::BlendFactor f) {
+            return f == vk::BlendFactor::eSrc1Color || f == vk::BlendFactor::eOneMinusSrc1Color ||
+                   f == vk::BlendFactor::eSrc1Alpha || f == vk::BlendFactor::eOneMinusSrc1Alpha;
+        };
+        return b.enable && (second(b.src_color) || second(b.dst_color) || second(b.src_alpha) ||
+                            second(b.dst_alpha));
+    }
 };
 
 /// The packet path: the fixed-function state of the draw described by `regs`.

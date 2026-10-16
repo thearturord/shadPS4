@@ -101,13 +101,12 @@ GraphicsPipeline::GraphicsPipeline(
             .depthClampEnable = key.depth_clamp_enable &&
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
             .rasterizerDiscardEnable = false,
-            .polygonMode = LiverpoolToVK::PolygonMode(key.polygon_mode),
+            .polygonMode = key.polygon_mode,
             .lineWidth = 1.0f,
         },
         vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT{
-            .provokingVertexMode = key.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First
-                                       ? vk::ProvokingVertexModeEXT::eFirstVertex
-                                       : vk::ProvokingVertexModeEXT::eLastVertex,
+            .provokingVertexMode = key.provoking_first ? vk::ProvokingVertexModeEXT::eFirstVertex
+                                                       : vk::ProvokingVertexModeEXT::eLastVertex,
         },
         vk::PipelineRasterizationDepthClipStateCreateInfoEXT{
             .depthClipEnable = key.depth_clip_enable,
@@ -132,7 +131,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
-        .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
+        .negativeOneToOne = key.negative_one_to_one,
     };
 
     const vk::PipelineViewportStateCreateInfo viewport_info = {
@@ -296,20 +295,15 @@ GraphicsPipeline::GraphicsPipeline(
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
-        const auto& control = key.blend_controls[i];
+        const auto& control = key.blend[i];
 
-        const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
-        const auto color_blend = LiverpoolToVK::BlendOp(control.color_func);
+        const auto src_color = control.src_color;
+        const auto dst_color = control.dst_color;
+        const auto color_blend = control.color_op;
 
-        const auto src_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
-                                   : src_color;
-        const auto dst_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
-                                   : dst_color;
-        const auto alpha_blend =
-            control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
+        const auto src_alpha = control.src_alpha;
+        const auto dst_alpha = control.dst_alpha;
+        const auto alpha_blend = control.alpha_op;
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
@@ -342,8 +336,7 @@ GraphicsPipeline::GraphicsPipeline(
         // to 1 and perform the blending, while shader normally outputs 0 in the last component.
         // Unfortunatelly, Vulkan doesn't provide any control on blend inputs, so below we detecting
         // such cases and override alpha value in order to emulate HW behaviour.
-        const auto has_alpha_masked_out =
-            (key.cb_shader_mask.GetMask(i) & AmdGpu::ColorBufferMask::ComponentA) == 0;
+        const auto has_alpha_masked_out = ((key.alpha_not_exported >> i) & 1) != 0;
         const auto has_src_alpha_in_src_blend = src_color == vk::BlendFactor::eSrcAlpha ||
                                                 src_color == vk::BlendFactor::eOneMinusSrcAlpha;
         const auto has_src_alpha_in_dst_blend = dst_color == vk::BlendFactor::eSrcAlpha ||
@@ -385,9 +378,8 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     const vk::PipelineColorBlendStateCreateInfo color_blending = {
-        .logicOpEnable =
-            instance.IsLogicOpSupported() && key.logic_op != AmdGpu::ColorControl::LogicOp::Copy,
-        .logicOp = LiverpoolToVK::LogicOp(key.logic_op),
+        .logicOpEnable = instance.IsLogicOpSupported() && key.logic_op_enable,
+        .logicOp = key.logic_op,
         .attachmentCount = key.num_color_attachments,
         .pAttachments = attachments.data(),
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},

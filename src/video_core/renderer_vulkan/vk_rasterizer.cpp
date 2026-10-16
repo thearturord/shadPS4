@@ -265,8 +265,8 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     if (!plan) {
         plan = std::make_unique<DrawPlan>();
     }
-    pipeline_cache.PlanGraphics(regs, params, *plan);
     plan->fixed = MakeFixedState(regs);
+    pipeline_cache.PlanGraphics(regs, plan->fixed, params, *plan);
     return plan;
 }
 

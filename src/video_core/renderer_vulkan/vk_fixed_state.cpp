@@ -182,7 +182,9 @@ void FillDepthStencil(FixedState& out, const AmdGpu::DrawRegs& regs) {
 }
 
 void FillPrimitive(FixedState& out, const AmdGpu::DrawRegs& regs) {
-    const auto topology = LiverpoolToVK::PrimitiveType(regs.primitive_type);
+    const auto topology = regs.primitive_type != AmdGpu::PrimitiveType::None
+                              ? LiverpoolToVK::PrimitiveType(regs.primitive_type)
+                              : vk::PrimitiveTopology::ePatchList;
     out.list_topology = topology == vk::PrimitiveTopology::ePointList ||
                         topology == vk::PrimitiveTopology::eLineList ||
                         topology == vk::PrimitiveTopology::eTriangleList ||
@@ -203,6 +205,41 @@ void FillPrimitive(FixedState& out, const AmdGpu::DrawRegs& regs) {
     out.blend_constants = regs.blend_constants;
 }
 
+BlendTarget MakeBlendTarget(const AmdGpu::BlendControl& control) {
+    BlendTarget out;
+    out.src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
+    out.dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
+    out.color_op = LiverpoolToVK::BlendOp(control.color_func);
+    out.src_alpha = control.separate_alpha_blend
+                        ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
+                        : out.src_color;
+    out.dst_alpha = control.separate_alpha_blend
+                        ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
+                        : out.dst_color;
+    out.alpha_op =
+        control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : out.color_op;
+    out.enable = control.enable;
+    return out;
+}
+
+void FillPipelineState(FixedState& out, const AmdGpu::DrawRegs& regs) {
+    out.color_enabled = regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Disable;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        out.target_write_mask[cb] = static_cast<u8>(regs.color_target_mask.GetMask(cb));
+        out.blend[cb] = MakeBlendTarget(regs.blend_control[cb]);
+        if ((regs.color_shader_mask.GetMask(cb) & AmdGpu::ColorBufferMask::ComponentA) == 0) {
+            out.alpha_not_exported |= 1u << cb;
+        }
+    }
+    out.logic_op_enabled = regs.color_control.rop3 != AmdGpu::ColorControl::LogicOp::Copy;
+    out.logic_op = LiverpoolToVK::LogicOp(regs.color_control.rop3);
+    out.polygon_mode = LiverpoolToVK::PolygonMode(regs.polygon_control.PolyMode());
+    out.depth_clamp = !regs.depth_render_override.disable_viewport_clamp;
+    out.depth_clip = regs.clipper_control.ZclipEnable();
+    out.negative_one_to_one = regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+    out.provoking_first = regs.polygon_control.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First;
+}
+
 } // namespace
 
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs) {
@@ -210,6 +247,7 @@ FixedState MakeFixedState(const AmdGpu::DrawRegs& regs) {
     FillViewports(out, regs);
     FillDepthStencil(out, regs);
     FillPrimitive(out, regs);
+    FillPipelineState(out, regs);
     return out;
 }
 

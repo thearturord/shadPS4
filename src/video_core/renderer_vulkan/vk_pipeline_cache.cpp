@@ -189,19 +189,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
-        const auto& cb0_blend = regs.blend_control[0];
-        if (cb0_blend.enable) {
-            info.hw.fs.dual_source_blending =
-                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_dst_factor) ||
-                LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.color_src_factor);
-            if (cb0_blend.separate_alpha_blend) {
-                info.hw.fs.dual_source_blending |=
-                    LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_dst_factor) ||
-                    LiverpoolToVK::IsDualSourceBlendFactor(cb0_blend.alpha_src_factor);
-            }
-        } else {
-            info.hw.fs.dual_source_blending = false;
-        }
+        info.hw.fs.dual_source_blending = lookup_fixed->DualSourceBlending();
         const auto& ps_inputs = regs.ps_inputs;
         for (u32 i = 0; i < regs.num_interp; i++) {
             info.hw.fs.inputs[i] = {
@@ -282,6 +270,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes},
       stage_lookup_reuse{EmulatorSettings.GetStageLookupReuse()} {
     lookup_regs = &liverpool->RasterRegs();
+    lookup_fixed = &lookup_fixed_storage;
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -351,6 +340,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     if (!lookup_regs_pinned) {
         lookup_regs = &liverpool->RasterRegs();
+        lookup_fixed_storage = MakeFixedState(*lookup_regs);
+        lookup_fixed = &lookup_fixed_storage;
     }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
@@ -443,9 +434,10 @@ void PipelineCache::CapturePlan(StagePlan& out, Shader::Info* clone, const Shade
     out.pgm_base = shared.pgm_base;
 }
 
-void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, DrawIndirectParams params,
-                                 DrawPlan& plan) {
+void PipelineCache::PlanGraphics(const AmdGpu::DrawRegs& regs, const FixedState& fixed,
+                                 DrawIndirectParams params, DrawPlan& plan) {
     lookup_regs = &regs;
+    lookup_fixed = &fixed;
     lookup_regs_pinned = true;
     const GraphicsPipeline* pipeline = GetGraphicsPipeline(params);
     lookup_regs_pinned = false;
@@ -538,6 +530,7 @@ void PipelineCache::ApplyPlan(const DispatchPlan& plan) {
 bool PipelineCache::RefreshGraphicsKey() {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = *lookup_regs;
+    const auto& fixed = *lookup_fixed;
     auto& key = graphics_key;
 
     const bool db_enabled = regs.depth_buffer.DepthValid() || regs.depth_buffer.StencilValid();
@@ -547,26 +540,26 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.stencil_format = regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
-    key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
-    key.depth_clip_enable = regs.clipper_control.ZclipEnable();
-    key.clip_space = regs.clipper_control.clip_space;
-    key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
+    key.depth_clamp_enable = fixed.depth_clamp;
+    key.depth_clip_enable = fixed.depth_clip;
+    key.negative_one_to_one = fixed.negative_one_to_one;
+    key.provoking_first = fixed.provoking_first;
     key.prim_type = regs.primitive_type;
-    key.polygon_mode = regs.polygon_control.PolyMode();
+    key.polygon_mode = fixed.polygon_mode;
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;
-    key.logic_op = regs.color_control.rop3;
+    key.logic_op = fixed.logic_op;
+    key.logic_op_enable = fixed.logic_op_enabled;
     key.depth_samples = db_enabled ? regs.depth_buffer.NumSamples() : 1;
     key.num_samples = key.depth_samples;
-    key.cb_shader_mask = regs.color_shader_mask;
+    key.alpha_not_exported = fixed.alpha_not_exported;
 
-    const bool skip_cb_binding =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    const bool skip_cb_binding = !fixed.color_enabled;
 
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
-        if (!col_buf || !regs.color_target_mask.GetMask(cb)) {
+        if (!col_buf || !fixed.target_write_mask[cb]) {
             // No attachment bound or writing to it is disabled.
             continue;
         }
@@ -579,13 +572,12 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.export_format = regs.color_export_format.GetFormat(cb);
         color_buffer.swizzle = col_buf.Swizzle();
 
-        const auto& bc = regs.blend_control[cb];
+        const auto& bc = fixed.blend[cb];
         color_buffer.blend_self_scale =
             bc.enable && !col_buf.info.blend_bypass &&
-            (bc.color_func == AmdGpu::BlendControl::BlendFunc::Min ||
-             bc.color_func == AmdGpu::BlendControl::BlendFunc::Max) &&
-            bc.color_src_factor == AmdGpu::BlendControl::BlendFactor::SrcColor &&
-            bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
+            (bc.color_op == vk::BlendOp::eMin || bc.color_op == vk::BlendOp::eMax) &&
+            bc.src_color == vk::BlendFactor::eSrcColor &&
+            bc.dst_color == vk::BlendFactor::eDstColor;
     }
 
     // Compile and bind shader stages
@@ -602,7 +594,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     bool all_color_samples_same = true;
     for (s32 cb = 0; cb < key.num_color_attachments && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
-        const u32 target_mask = regs.color_target_mask.GetMask(cb);
+        const u32 target_mask = fixed.target_write_mask[cb];
         if (!col_buf || !target_mask) {
             continue;
         }
@@ -612,8 +604,8 @@ bool PipelineCache::RefreshGraphicsKey() {
         }
 
         // Fill color blending information
-        if (regs.blend_control[cb].enable && !col_buf.info.blend_bypass) {
-            key.blend_controls[cb] = regs.blend_control[cb];
+        if (fixed.blend[cb].enable && !col_buf.info.blend_bypass) {
+            key.blend[cb] = fixed.blend[cb];
         }
 
         // Apply swizzle to target mask

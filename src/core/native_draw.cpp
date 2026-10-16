@@ -3076,7 +3076,7 @@ struct EmitStat {
     const char* name;
     std::atomic<u64> calls{0}, dwords{0}, packets{0}, draws{0}, split{0}, stripped{0};
 };
-EmitStat emit_stats[6] = {{"ResTransition"}, {"RenderTargetEliminate"}, {"ClearQuad"}, {"CopyResource"}, {"ExCsDepthCopy"}, {"Other"}};
+EmitStat emit_stats[6] = {{"ResTransition"}, {"RenderTargetEliminate"}, {"ClearQuad"}, {"CopyResource"}, {"ExCsDepthCopy"}, {"HtileClear"}};
 
 void ReportEmitStats() {
     static std::atomic<u64> last{0};
@@ -3095,6 +3095,42 @@ void ReportEmitStats() {
 }
 
 using GuestFunction6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
+
+/// Replaces the packets a helper wrote by NOP packets, packet by packet merged into runs: the memory stays as it was (tables
+/// and labels the engine still points to are untouched), only the first two dwords of a run change. Our own tag packets stay.
+bool StripPackets(u64 begin, u64 end) {
+    u64 run_start = 0;
+    const auto flush = [&](u64 run_end) {
+        if (run_start == 0) {
+            return;
+        }
+        const u64 dwords = (run_end - run_start) / 4;
+        if (dwords >= 2 && dwords - 2 < 0x4000) {
+            Wr<u32>(run_start, 0, 0xC0000000u | (static_cast<u32>(dwords - 2) << 16) | (0x10u << 8));
+            if (dwords >= 2) {
+                Wr<u32>(run_start, 4, 0);
+            }
+        }
+        run_start = 0;
+    };
+    for (u64 at = begin; at < end;) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            return false;
+        }
+        const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
+        const bool is_tag = ((header >> 8) & 0xff) == 0x10 && ((header >> 16) & 0x3fff) != 0 &&
+                            Rd<u32>(at, 4) == static_cast<u32>(VideoCore::NativeTagMagic);
+        if (is_tag) {
+            flush(at);
+        } else if (run_start == 0) {
+            run_start = at;
+        }
+        at += size;
+    }
+    flush(end);
+    return true;
+}
 
 /// `dcb` is the address of the command buffer structure (end at +8, cursor at +0x10) the function writes to.
 u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
@@ -3132,14 +3168,9 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
         }
         stat.packets.fetch_add(packets, std::memory_order_relaxed);
         stat.draws.fetch_add(draws, std::memory_order_relaxed);
-        const u64 total = (cursor_after - cursor_before) / 4;
         if (strip_bit != 0 && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & strip_bit) != 0 &&
-            VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && total >= 3 && total < 0x4000 &&
-            packets != 0 && at == cursor_after) {
-            // one NOP over everything the helper wrote; the memory stays as it was, so tables and labels the engine still
-            // points to are untouched
-            Wr<u32>(cursor_before, 0, 0xC0000000u | (static_cast<u32>(total - 2) << 16) | (0x10u << 8));
-            Wr<u32>(cursor_before, 4, 0);
+            VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && packets != 0 &&
+            at == cursor_after && StripPackets(cursor_before, cursor_after)) {
             stat.stripped.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -3168,6 +3199,11 @@ u64 PS4_SYSV_ABI MeasureTargetEliminate(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4,
 }
 u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return dcb ? RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, a1, a2, a3, a4, a5) : 0;
+}
+/// FUN_02487e40(command buffer, depth target, value): the clear of a depth target's HTILE surface. The fill itself is a native
+/// record (FUN_02485c00); the event and the scratch label fence around it are of no use to the command processor.
+u64 PS4_SYSV_ABI MeasureHtileClear(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return dcb ? RunAndMeasure(emit_stats[5], "HtileClear", dcb, dcb, a1, a2, a3, a4, a5, 4) : 0;
 }
 u64 PS4_SYSV_ABI MeasureCopyResource(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return ctx ? RunAndMeasure(emit_stats[3], "CopyResource", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5) : 0;
@@ -3270,6 +3306,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "measure_excs_depth_copy") {
         return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
+    }
+    if (name == "measure_htile_clear") {
+        return reinterpret_cast<u64>(&MeasureHtileClear);
     }
     if (name == "tag_fill") {
         return reinterpret_cast<u64>(&TagFill);

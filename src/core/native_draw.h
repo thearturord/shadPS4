@@ -107,4 +107,8 @@ struct StateTemplate {
 /// Null when the packets contain anything but register writes, clear state and no-ops.
 const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords, const u32* sequence, u32 sequence_dwords);
 
+/// The template of a small indirect buffer that holds nothing but register writes, clear state and padding (the game records its
+/// default state once and submits it every frame). Cached by the content; null for anything else.
+const StateTemplate* IndirectStateTemplate(const u32* packets, u32 dwords);
+
 } // namespace Core::NativeDraw

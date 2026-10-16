@@ -2501,6 +2501,72 @@ void VerifyComputeRecord(u64 seq, const u32* cs_dwords) {
     VerifyRecord(seq, cs_dwords - ComputeRegisterBase);
 }
 
+namespace {
+
+/// Appends the register writes of `packets` to `out`; false when something else is in them. `strict_nops`: padding must be
+/// plain (no markers, tags or flips).
+bool ParseStateSequence(const u32* packets, u32 dwords, StateTemplate& out, bool strict_nops, bool log) {
+    for (u32 at = 0; at < dwords;) {
+        const u32 header = packets[at];
+        if ((header >> 30) != 3) {
+            return false;
+        }
+        const u32 opcode = (header >> 8) & 0xff;
+        const u32 size = ((header >> 16) & 0x3fff) + 2;
+        if (at + size > dwords) {
+            if (opcode == 0x10 && !strict_nops) {
+                return true; // padding that runs to the end of the buffer
+            }
+            if (log) {
+                LOG_INFO(Core, "hardware state sequence: packet {:#x} at dword {} of {} runs past the table", opcode, at, dwords);
+            }
+            return false;
+        }
+        switch (opcode) {
+        case 0x10: // NOP
+            if (strict_nops && size > 2 && ((packets[at + 1] >> 16) == 0x6875 || packets[at + 1] == VideoCore::NativeTagMagic)) {
+                return false;
+            }
+            break;
+        case 0x28: // CONTEXT_CONTROL
+        case 0x58: // ACQUIRE_MEM
+            break;
+        case 0x12:
+            out.writes.push_back({StateWrite::ClearState, 0, 0});
+            break;
+        case 0x2f:
+            out.writes.push_back({StateWrite::NumInstances, 0, packets[at + 1]});
+            break;
+        case 0x69:
+        case 0x76:
+        case 0x79: {
+            const u32 offset = packets[at + 1];
+            const u8 kind = opcode == 0x69 ? StateWrite::Context : opcode == 0x76 ? StateWrite::Sh : StateWrite::Uconfig;
+            for (u32 k = 0; k + 2 < size; ++k) {
+                // colour and depth target registers carry a trailing extent hint the packet handler reads
+                if (kind == StateWrite::Context && ((offset + k >= 0x318 && offset + k < 0x3a0) || (offset + k >= 0x10 && offset + k < 0x20))) {
+                    if (log) {
+                        LOG_INFO(Core, "hardware state sequence: target register {:#x} is written", offset + k);
+                    }
+                    return false;
+                }
+                out.writes.push_back({kind, offset + k, packets[at + 2 + k]});
+            }
+            break;
+        }
+        default:
+            if (log) {
+                LOG_INFO(Core, "hardware state sequence: unsupported packet {:#x} at dword {}", opcode, at);
+            }
+            return false;
+        }
+        at += size;
+    }
+    return true;
+}
+
+} // namespace
+
 const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords, const u32* sequence, u32 sequence_dwords) {
     static std::mutex mutex;
     static std::map<const u32*, std::unique_ptr<StateTemplate>> templates;
@@ -2509,65 +2575,46 @@ const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords,
         return it->second.get();
     }
     auto result = std::make_unique<StateTemplate>();
-    bool supported = true;
-    const auto parse = [&](const u32* packets, u32 dwords) {
-        for (u32 at = 0; at < dwords && supported;) {
-            const u32 header = packets[at];
-            if ((header >> 30) != 3) {
-                supported = false;
-                return;
-            }
-            const u32 opcode = (header >> 8) & 0xff;
-            const u32 size = ((header >> 16) & 0x3fff) + 2;
-            if (at + size > dwords) {
-                if (opcode == 0x10) {
-                    return; // padding that runs to the end of the buffer
-                }
-                LOG_INFO(Core, "hardware state sequence: packet {:#x} at dword {} of {} runs past the table", opcode, at, dwords);
-                supported = false;
-                return;
-            }
-            switch (opcode) {
-            case 0x10: // NOP
-            case 0x28: // CONTEXT_CONTROL
-            case 0x58: // ACQUIRE_MEM
-                break;
-            case 0x12:
-                result->writes.push_back({StateWrite::ClearState, 0, 0});
-                break;
-            case 0x2f:
-                result->writes.push_back({StateWrite::NumInstances, 0, packets[at + 1]});
-                break;
-            case 0x69:
-            case 0x76:
-            case 0x79: {
-                const u32 offset = packets[at + 1];
-                const u8 kind = opcode == 0x69 ? StateWrite::Context : opcode == 0x76 ? StateWrite::Sh : StateWrite::Uconfig;
-                for (u32 k = 0; k + 2 < size; ++k) {
-                    // colour and depth target registers carry a trailing extent hint the packet handler reads
-                    if (kind == StateWrite::Context && ((offset + k >= 0x318 && offset + k < 0x3a0) || (offset + k >= 0x10 && offset + k < 0x20))) {
-                        LOG_INFO(Core, "hardware state sequence: target register {:#x} is written", offset + k);
-                        supported = false;
-                    }
-                    result->writes.push_back({kind, offset + k, packets[at + 2 + k]});
-                }
-                break;
-            }
-            default:
-                LOG_INFO(Core, "hardware state sequence: unsupported packet {:#x} at dword {}", opcode, at);
-                supported = false;
-                break;
-            }
-            at += size;
-        }
-    };
-    parse(prefix, prefix_dwords);
-    parse(sequence, sequence_dwords);
+    const bool supported = ParseStateSequence(prefix, prefix_dwords, *result, false, true) &&
+                           ParseStateSequence(sequence, sequence_dwords, *result, false, true);
     if (!supported) {
         LOG_INFO(Core, "hardware state sequence {} is not a plain register sequence: it stays packets", static_cast<const void*>(sequence));
     }
     const StateTemplate* out = supported ? result.get() : nullptr;
     templates[sequence] = supported ? std::move(result) : nullptr;
+    return out;
+}
+
+const StateTemplate* IndirectStateTemplate(const u32* packets, u32 dwords) {
+    struct Entry {
+        std::unique_ptr<StateTemplate> state;
+        u32 dwords{};
+    };
+    static std::mutex mutex;
+    static std::unordered_map<u64, Entry> templates;
+    u64 hash = 0xcbf29ce484222325ull ^ dwords;
+    for (u32 i = 0; i < dwords; ++i) {
+        hash = (hash ^ packets[i]) * 0x100000001b3ull;
+    }
+    std::lock_guard lock{mutex};
+    if (const auto it = templates.find(hash); it != templates.end()) {
+        return it->second.dwords == dwords ? it->second.state.get() : nullptr;
+    }
+    if (templates.size() > 256) {
+        return nullptr; // the buffers are not constant: stop spending time on them
+    }
+    auto result = std::make_unique<StateTemplate>();
+    const bool supported = ParseStateSequence(packets, dwords, *result, true, false);
+    if (supported) {
+        LOG_INFO(Core, "indirect buffer of {} dwords is a constant state sequence: {} register writes", dwords, result->writes.size());
+    }
+    Entry entry;
+    entry.dwords = dwords;
+    if (supported) {
+        entry.state = std::move(result);
+    }
+    const StateTemplate* out = entry.state.get();
+    templates.emplace(hash, std::move(entry));
     return out;
 }
 
@@ -4090,7 +4137,7 @@ bool StripPackets(u64 begin, u64 end) {
 
 /// `dcb` is the address of the command buffer structure (end at +8, cursor at +0x10) the function writes to.
 u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
-                  u32 strip_bit = 0) {
+                  u32 strip_bit = 0, u64 strip_from = 0) {
     static std::atomic<u64> originals[8]{};
     const u64 index = &stat - emit_stats;
     u64 original = originals[index].load(std::memory_order_relaxed);
@@ -4126,7 +4173,7 @@ u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1
         stat.draws.fetch_add(draws, std::memory_order_relaxed);
         if (strip_bit != 0 && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & strip_bit) != 0 &&
             VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && packets != 0 &&
-            at == cursor_after && StripPackets(cursor_before, cursor_after)) {
+            at == cursor_after && StripPackets(strip_from != 0 ? strip_from : cursor_before, cursor_after)) {
             stat.stripped.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -4153,41 +4200,105 @@ u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4,
 u64 PS4_SYSV_ABI MeasureTargetEliminate(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return ctx ? RunAndMeasure(emit_stats[1], "Fn247c680", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5, 1) : 0;
 }
+/// Where the depth / stencil clear of the render layer (FUN_024860c0) began writing packets: the register setup it writes
+/// before the SDK helpers it calls (clear quad, HTILE clear) is part of the clear.
+struct ClearPrelude {
+    u64 dcb{};
+    u64 begin{};
+};
+thread_local ClearPrelude clear_prelude;
+
+u64 PS4_SYSV_ABI NoteClearDsv(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx != 0) {
+        clear_prelude = {ctx + 0x47c0, Rd<u64>(ctx, 0x47d0)};
+    }
+    return 0;
+}
+
+/// The start of the clear's own packets for a helper that begins writing at `begin` in `dcb` (== `begin` when the helper is not
+/// part of a clear or the packets in between are anything but register state). `values` receives the last value written to
+/// the clear registers (render control, stencil / depth clear value, depth control) in the prelude.
+u64 TakeClearPrelude(u64 dcb, u64 begin, std::array<std::pair<u32, u32>, 4>* values = nullptr) {
+    const ClearPrelude prelude = std::exchange(clear_prelude, {});
+    if (prelude.dcb != dcb || prelude.begin == 0 || prelude.begin > begin || begin - prelude.begin > 4096 || (prelude.begin & 3) != 0) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 8) {
+            LOG_INFO(Core, "clear prelude not used: noted dcb {:#x} begin {:#x}, helper dcb {:#x} begin {:#x}", prelude.dcb, prelude.begin, dcb, begin);
+        }
+        return begin;
+    }
+    std::array<std::pair<u32, u32>, 4> found{{{0x0, ~0u}, {0xa, ~0u}, {0xb, ~0u}, {0x200, ~0u}}};
+    for (u64 at = prelude.begin; at < begin;) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            return begin;
+        }
+        const u32 opcode = (header >> 8) & 0xff;
+        const u32 size = (((header >> 16) & 0x3fff) + 2) * 4;
+        if (opcode == 0x69) {
+            const u32 offset = Rd<u32>(at, 4);
+            for (u32 k = 0; k + 2 < size / 4; ++k) {
+                for (auto& entry : found) {
+                    if (entry.first == offset + k) {
+                        entry.second = Rd<u32>(at, 8 + k * 4);
+                    }
+                }
+            }
+        } else if (opcode == 0x10) {
+            if (size > 8 && (Rd<u32>(at, 4) == VideoCore::NativeTagMagic)) {
+                return begin; // one of our own records
+            }
+        } else if (opcode != 0x2f && opcode != 0x28 && opcode != 0x58 && opcode != 0x46) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 8) {
+                LOG_INFO(Core, "clear prelude has packet {:#x} ({} dwords) at +{} dwords: not folded", opcode, size / 4, (at - prelude.begin) / 4);
+            }
+            return begin;
+        }
+        at += size;
+    }
+    if (values != nullptr) {
+        *values = found;
+    }
+    return prelude.begin;
+}
+
 /// The SDK's depth / stencil clear quad (FUN_024879c0(command buffer, depth target)). The game's function runs; its
 /// packets (state, embedded vertex shader, the quad) are replaced by one depth clear record carrying the target's
 /// registers, except for the two register writes that end the function (color target mask, depth render control).
-bool ConvertClearQuad(u64 target, u64 begin, u64 end, u64 caller) {
+bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, const std::array<std::pair<u32, u32>, 4>& prelude_values) {
     constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
-    const u64 total = (end - begin) / 4;
+    const u64 total = (end - start) / 4;
     if (total < TagDwords + 6 || (Rd<u32>(target, 0) & 3) == 0) {
         return false;
     }
     u64 tag_end_is_boundary = 0;
     u64 last_two[2] = {0, 0};
     bool target_registers = false;
-    u64 at = begin;
+    u64 at = start;
     while (at < end) {
         const u32 header = Rd<u32>(at, 0);
         if ((header >> 30) != 3) {
             return false;
         }
-        if (at == begin + TagDwords * 4) {
+        if (at == start + TagDwords * 4) {
             tag_end_is_boundary = 1;
         }
-        if (header == 0xc0086900u && Rd<u32>(at, 4) == 0x10) {
+        if (header == 0xc0086900u && Rd<u32>(at, 4) == 0x10 && at >= begin) {
             target_registers = true;
         }
         last_two[0] = last_two[1];
         last_two[1] = at;
         at += (((header >> 16) & 0x3fff) + 2) * 4ull;
     }
-    if (at != end || !target_registers || tag_end_is_boundary == 0 || last_two[0] == 0 ||
+    (void)tag_end_is_boundary;
+    if (at != end || !target_registers || last_two[0] == 0 ||
         Rd<u32>(last_two[0], 0) != 0xc0016900u || Rd<u32>(last_two[0], 4) != 0x8e || Rd<u32>(last_two[0], 8) != 0xf ||
         Rd<u32>(last_two[1], 0) != 0xc0016900u || Rd<u32>(last_two[1], 4) != 0 || last_two[0] + 12 != last_two[1] ||
-        last_two[1] + 12 != end || last_two[0] < begin + TagDwords * 4) {
+        last_two[1] + 12 != end || last_two[0] < start + TagDwords * 4) {
         return false;
     }
-    const u64 middle = (last_two[0] - begin) / 4 - TagDwords;
+    const u64 middle = (last_two[0] - start) / 4 - TagDwords;
     if (middle == 1) {
         return false;
     }
@@ -4210,6 +4321,11 @@ bool ConvertClearQuad(u64 target, u64 begin, u64 end, u64 caller) {
     slot.regs[n++] = {ContextBase + 0x2, Rd<u32>(target, 0x20)};
     slot.regs[n++] = {ContextBase + 0x5, Rd<u32>(target, 0x24)};
     slot.regs[n++] = {ContextBase + 0x2af, Rd<u32>(target, 0x28)};
+    for (const auto& [reg, value] : prelude_values) {
+        if (value != ~0u) {
+            slot.regs[n++] = {ContextBase + reg, value}; // what the clear's setup wrote for the clear
+        }
+    }
     slot.count = n;
     slot.cb_extent = {};
     slot.cb_extent_mask = 0;
@@ -4224,10 +4340,10 @@ bool ConvertClearQuad(u64 target, u64 begin, u64 end, u64 caller) {
     words[11] = 0;
     words[12] = 0;
     for (u32 k = 0; k < TagDwords; ++k) {
-        Wr<u32>(begin, k * 4, words[k]);
+        Wr<u32>(start, k * 4, words[k]);
     }
     if (middle >= 2) {
-        const u64 run = begin + TagDwords * 4;
+        const u64 run = start + TagDwords * 4;
         Wr<u32>(run, 0, 0xC0000000u | (static_cast<u32>(middle - 2) << 16) | (0x10u << 8));
         Wr<u32>(run, 4, 0);
     }
@@ -4240,11 +4356,15 @@ u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 target, u64 a2, u64 a3, u64 a4, u
     }
     const u64 begin = Rd<u64>(dcb, 0x10);
     const u64 end_marker = Rd<u64>(dcb, 8);
+    std::array<std::pair<u32, u32>, 4> prelude_values{{{0x0, ~0u}, {0xa, ~0u}, {0xb, ~0u}, {0x200, ~0u}}};
+    const u64 start = TakeClearPrelude(dcb, begin, &prelude_values);
     const u64 result = RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, target, a2, a3, a4, a5);
     const u64 end = Rd<u64>(dcb, 0x10);
     if (result != 0 && Rd<u64>(dcb, 8) == end_marker && end > begin && target >= 0x200000000ull && target < 0x400000000ull &&
         (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32) != 0 &&
-        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && ConvertClearQuad(target, begin, end, ret)) {
+        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+        (ConvertClearQuad(target, start, begin, end, ret, prelude_values) ||
+         (start != begin && ConvertClearQuad(target, begin, begin, end, ret, {{{0x0, ~0u}, {0xa, ~0u}, {0xb, ~0u}, {0x200, ~0u}}})))) {
         emit_stats[2].stripped.fetch_add(1, std::memory_order_relaxed);
         Live().clear_exec.fetch_add(1, std::memory_order_relaxed);
     }
@@ -4254,7 +4374,12 @@ u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 target, u64 a2, u64 a3, u64 a4, u
 /// FUN_02487e40(command buffer, depth target, value): the clear of a depth target's HTILE surface. The fill itself is a native
 /// record (FUN_02485c00); the event and the scratch label fence around it are of no use to the command processor.
 u64 PS4_SYSV_ABI MeasureHtileClear(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return dcb ? RunAndMeasure(emit_stats[5], "HtileClear", dcb, dcb, a1, a2, a3, a4, a5, 4) : 0;
+    if (dcb == 0) {
+        return 0;
+    }
+    const u64 begin = Rd<u64>(dcb, 0x10);
+    const u64 start = TakeClearPrelude(dcb, begin);
+    return RunAndMeasure(emit_stats[5], "HtileClear", dcb, dcb, a1, a2, a3, a4, a5, 4, start);
 }
 u64 PS4_SYSV_ABI MeasureCopyResource(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     if (ctx == 0) {
@@ -4393,6 +4518,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_begin") {
         return reinterpret_cast<u64>(&TagAscBegin);
+    }
+    if (name == "note_clear_dsv") {
+        return reinterpret_cast<u64>(&NoteClearDsv);
     }
     if (name == "tag_asc_cs_copy") {
         return reinterpret_cast<u64>(&TagAscCsCopy);

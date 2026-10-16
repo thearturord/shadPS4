@@ -1744,6 +1744,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     cblock.Reset();
 
+    if (ccb.empty() && !dcb.empty() && dcb.size() <= 256 &&
+        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+        (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8192) != 0) {
+        // a small command buffer of register writes only (the game's default state, submitted every frame): its effect
+        if (const auto* state = Core::NativeDraw::IndirectStateTemplate(dcb.data(), dcb.size())) {
+            ApplyStateTemplate(*state);
+            dcb = {};
+        }
+    }
+
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
     Task ce_task{};
@@ -2536,6 +2546,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                if (indirect_buffer->ib_size <= 256 &&
+                    VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+                    (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8192) != 0) {
+                    // a small buffer of register writes only (the game's default state, recorded once): its effect, not its packets
+                    if (const auto* state =
+                            Core::NativeDraw::IndirectStateTemplate(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size)) {
+                        ApplyStateTemplate(*state);
+                        break;
+                    }
+                }
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);

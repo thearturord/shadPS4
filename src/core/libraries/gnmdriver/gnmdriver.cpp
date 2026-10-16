@@ -745,6 +745,13 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
 /// naming its parsed register writes, followed by padding; false when the sequence has other packets in it.
 static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_dwords) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
+    {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 6) {
+            LOG_INFO(Lib_GnmDriver, "default hardware state requested: exec {} strip {:#x} sequence {} dwords", policy.native_draw_exec.load(),
+                     policy.native_sdk_strip.load(), sequence_dwords);
+        }
+    }
     if (policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
         (policy.native_sdk_strip.load(std::memory_order_relaxed) & 8192) == 0) {
         return false;

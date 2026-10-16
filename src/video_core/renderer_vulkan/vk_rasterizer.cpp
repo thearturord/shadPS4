@@ -936,6 +936,11 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 
     // Map buffers for merged ranges
     for (auto& range : ranges_merged) {
+        if (range.GetSize() >= (1ull << 30) && !memory->IsValidMapping(range.base_address)) {
+            LOG_ERROR(Render, "vertex buffer range at unmapped address {:#x} of {} bytes: ignored", range.base_address, range.GetSize());
+            range.buffer = nullptr;
+            continue;
+        }
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         std::tie(range.buffer, range.offset) =
             buffer_cache.ObtainBuffer(range.base_address, size, false);
@@ -992,8 +997,13 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     const u32 num_indices =
         is_indirect ? regs.max_index_size : std::min(regs.num_indices, regs.max_index_size);
     const u64 requested_size = u64(num_indices) * index_size;
-    const u64 mapped_size =
-        base_address != 0 ? memory->ClampRangeSize(index_address, requested_size) : 0;
+    if (base_address != 0 && requested_size >= (1ull << 30) && !memory->IsValidMapping(index_address)) {
+        LOG_ERROR(Render, "index buffer at unmapped address {:#x}: {} indices of {} bytes (indirect {}, num_indices {}, max_index_size {}): ignored",
+                  index_address, num_indices, index_size, is_indirect, regs.num_indices, regs.max_index_size);
+    }
+    const u64 mapped_size = base_address != 0 && (requested_size < (1ull << 30) || memory->IsValidMapping(index_address))
+                                ? memory->ClampRangeSize(index_address, requested_size)
+                                : 0;
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
@@ -1251,6 +1261,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         } else {
             const auto vsharp = desc.GetSharp(stage);
             if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else if (vsharp.GetSize() >= (1ull << 30) && !memory->IsValidMapping(vsharp.base_address)) {
+                LOG_ERROR(Render, "buffer sharp at unmapped address {:#x} of {} bytes for stage {:#x}: bound as null", vsharp.base_address,
+                          vsharp.GetSize(), stage.pgm_hash);
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());

@@ -26,6 +26,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/native_draw_tag.h"
 #include "video_core/readback_policy.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -740,6 +741,35 @@ s32 PS4_SYSV_ABI sceGnmDrawIndirectMulti(u32* cmdbuf, u32 size, u32 data_offset,
     return -1;
 }
 
+/// With native execution the hardware default state block (clear state and a constant register sequence) is one tag packet
+/// naming its parsed register writes, followed by padding; false when the sequence has other packets in it.
+static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_dwords) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 8192) == 0) {
+        return false;
+    }
+    static constexpr std::array ClearStateSequence{
+        0xc0012800u, 0x80000000u, 0x80000000u, 0xc0001200u, 0u, 0xc0055800u,
+        0x2ec47fc0u, 0xffffffffu, 0u,          0u,          0u, 10u,
+    };
+    const auto* state = Core::NativeDraw::HardwareStateTemplate(ClearStateSequence.data(), static_cast<u32>(ClearStateSequence.size()),
+                                                                sequence, sequence_dwords);
+    if (state == nullptr) {
+        return false;
+    }
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    static_assert(TagDwords < HwInitPacketSize - 2);
+    cmdbuf[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    cmdbuf[1] = VideoCore::NativeTagMagic;
+    cmdbuf[2] = (12u << 8) | VideoCore::NativeTagExecFlag;
+    std::memset(&cmdbuf[3], 0, (TagDwords - 3) * sizeof(u32));
+    const u64 pointer = reinterpret_cast<u64>(state);
+    std::memcpy(&cmdbuf[3], &pointer, sizeof(pointer));
+    WriteNop(cmdbuf + TagDwords, HwInitPacketSize - TagDwords - 1);
+    return true;
+}
+
 u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     LOG_TRACE(Lib_GnmDriver, "called");
 
@@ -748,6 +778,9 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState(u32* cmdbuf, u32 size) {
     }
 
     const auto& SetupContext = [](u32* cmdbuf, u32 size, bool clear_state) {
+        if (clear_state && WriteNativeInitState(cmdbuf, &InitSequence[2], static_cast<u32>(InitSequence.size() - 2))) {
+            return HwInitPacketSize;
+        }
         const auto* cmdbuf_end = cmdbuf + HwInitPacketSize;
         if (clear_state) {
             cmdbuf = ClearContextState(cmdbuf);
@@ -772,6 +805,9 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState175(u32* cmdbuf, u32 size) {
         return 0;
     }
 
+    if (WriteNativeInitState(cmdbuf, &InitSequence175[2], static_cast<u32>(InitSequence175.size() - 2))) {
+        return HwInitPacketSize;
+    }
     const auto* cmdbuf_end = cmdbuf + HwInitPacketSize;
     cmdbuf = ClearContextState(cmdbuf);
     std::memcpy(cmdbuf, &InitSequence175[2], (InitSequence175.size() - 2) * 4);
@@ -791,6 +827,22 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState200(u32* cmdbuf, u32 size) {
     }
 
     const auto& SetupContext200 = [](u32* cmdbuf, u32 size, bool clear_state) {
+        if (clear_state) {
+            const u32* sequence = InitSequence200.data();
+            u32 sequence_dwords = static_cast<u32>(InitSequence200.size());
+            if (sceKernelIsNeoMode()) {
+                if (!UseNeoCompatSequences) {
+                    sequence = InitSequence200Neo.data();
+                    sequence_dwords = static_cast<u32>(InitSequence200Neo.size());
+                } else {
+                    sequence = InitSequence200NeoCompat.data();
+                    sequence_dwords = static_cast<u32>(InitSequence200NeoCompat.size());
+                }
+            }
+            if (WriteNativeInitState(cmdbuf, sequence + 2, sequence_dwords - 2)) {
+                return HwInitPacketSize;
+            }
+        }
         const auto* cmdbuf_end = cmdbuf + HwInitPacketSize;
         if (clear_state) {
             cmdbuf = ClearContextState(cmdbuf);
@@ -827,6 +879,22 @@ u32 PS4_SYSV_ABI sceGnmDrawInitDefaultHardwareState350(u32* cmdbuf, u32 size) {
     }
 
     const auto& SetupContext350 = [](u32* cmdbuf, u32 size, bool clear_state) {
+        if (clear_state) {
+            const u32* sequence = InitSequence350.data();
+            u32 sequence_dwords = static_cast<u32>(InitSequence350.size());
+            if (sceKernelIsNeoMode()) {
+                if (!UseNeoCompatSequences) {
+                    sequence = InitSequence350Neo.data();
+                    sequence_dwords = static_cast<u32>(InitSequence350Neo.size());
+                } else {
+                    sequence = InitSequence350NeoCompat.data();
+                    sequence_dwords = static_cast<u32>(InitSequence350NeoCompat.size());
+                }
+            }
+            if (WriteNativeInitState(cmdbuf, sequence + 2, sequence_dwords - 2)) {
+                return HwInitPacketSize;
+            }
+        }
         const auto* cmdbuf_end = cmdbuf + HwInitPacketSize;
         if (clear_state) {
             cmdbuf = ClearContextState(cmdbuf);

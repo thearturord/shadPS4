@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "core/native_draw.h"
+
 #include "video_core/native_draw_tag.h"
 
 #include <source_location>
@@ -268,6 +270,7 @@ private:
     /// Register writes made by the command processor: copied to the raster mirror.
     void MirrorRegs(u32 dword_offset, u32 count);
     void MirrorRegsRaw(u32 dword_offset, u32 count);
+    void ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state);
     void MirrorObject(const void* object, size_t size);
     void MirrorSetDefaults();
 

@@ -2172,7 +2172,7 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
     {
         static std::map<u64, u32> caller_dumps;
         u32& dumped_for_caller = caller_dumps[caller];
-        if (dumped_for_caller < 2) {
+        if (dumped_for_caller < (flags == 0 ? 12u : 2u)) {
             std::string diff;
             u32 differing = 0;
             for (u32 i = 0; i < count; ++i) {
@@ -2355,7 +2355,9 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
     ++s.callers[{caller, critical}];
     if (auto* trust = TrustFor(caller)) {
         trust->total.fetch_add(1, std::memory_order_relaxed);
-        trust->bad.fetch_add(critical ? 1 : 0, std::memory_order_relaxed);
+        // a record the builder itself flagged (a shader whose fetch object does not exist yet, ...) never executes; its
+        // difference says nothing about the call site
+        trust->bad.fetch_add(critical && flags == 0 ? 1 : 0, std::memory_order_relaxed);
         if (trust->total.load(std::memory_order_relaxed) >= 4096) {
             trust->total.store(trust->total.load() / 2, std::memory_order_relaxed);
             trust->bad.store(trust->bad.load() / 2, std::memory_order_relaxed);
@@ -2497,6 +2499,76 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
 
 void VerifyComputeRecord(u64 seq, const u32* cs_dwords) {
     VerifyRecord(seq, cs_dwords - ComputeRegisterBase);
+}
+
+const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords, const u32* sequence, u32 sequence_dwords) {
+    static std::mutex mutex;
+    static std::map<const u32*, std::unique_ptr<StateTemplate>> templates;
+    std::lock_guard lock{mutex};
+    if (const auto it = templates.find(sequence); it != templates.end()) {
+        return it->second.get();
+    }
+    auto result = std::make_unique<StateTemplate>();
+    bool supported = true;
+    const auto parse = [&](const u32* packets, u32 dwords) {
+        for (u32 at = 0; at < dwords && supported;) {
+            const u32 header = packets[at];
+            if ((header >> 30) != 3) {
+                supported = false;
+                return;
+            }
+            const u32 opcode = (header >> 8) & 0xff;
+            const u32 size = ((header >> 16) & 0x3fff) + 2;
+            if (at + size > dwords) {
+                if (opcode == 0x10) {
+                    return; // padding that runs to the end of the buffer
+                }
+                LOG_INFO(Core, "hardware state sequence: packet {:#x} at dword {} of {} runs past the table", opcode, at, dwords);
+                supported = false;
+                return;
+            }
+            switch (opcode) {
+            case 0x10: // NOP
+            case 0x28: // CONTEXT_CONTROL
+            case 0x58: // ACQUIRE_MEM
+                break;
+            case 0x12:
+                result->writes.push_back({StateWrite::ClearState, 0, 0});
+                break;
+            case 0x2f:
+                result->writes.push_back({StateWrite::NumInstances, 0, packets[at + 1]});
+                break;
+            case 0x69:
+            case 0x76:
+            case 0x79: {
+                const u32 offset = packets[at + 1];
+                const u8 kind = opcode == 0x69 ? StateWrite::Context : opcode == 0x76 ? StateWrite::Sh : StateWrite::Uconfig;
+                for (u32 k = 0; k + 2 < size; ++k) {
+                    // colour and depth target registers carry a trailing extent hint the packet handler reads
+                    if (kind == StateWrite::Context && ((offset + k >= 0x318 && offset + k < 0x3a0) || (offset + k >= 0x10 && offset + k < 0x20))) {
+                        LOG_INFO(Core, "hardware state sequence: target register {:#x} is written", offset + k);
+                        supported = false;
+                    }
+                    result->writes.push_back({kind, offset + k, packets[at + 2 + k]});
+                }
+                break;
+            }
+            default:
+                LOG_INFO(Core, "hardware state sequence: unsupported packet {:#x} at dword {}", opcode, at);
+                supported = false;
+                break;
+            }
+            at += size;
+        }
+    };
+    parse(prefix, prefix_dwords);
+    parse(sequence, sequence_dwords);
+    if (!supported) {
+        LOG_INFO(Core, "hardware state sequence {} is not a plain register sequence: it stays packets", static_cast<const void*>(sequence));
+    }
+    const StateTemplate* out = supported ? result.get() : nullptr;
+    templates[sequence] = supported ? std::move(result) : nullptr;
+    return out;
 }
 
 u32 RecordDrawCount(u64 seq) {
@@ -2642,6 +2714,22 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
         return no(FbTrustNew);
     }
     if (trust->bad.load(std::memory_order_relaxed) * 500 >= total) {
+        static std::mutex log_mutex;
+        static std::map<u64, std::array<u32, 3>> seen; ///< caller -> draws refused, total, bad
+        static u64 last_log_ms = 0;
+        std::lock_guard lock{log_mutex};
+        auto& entry = seen[caller - ImageBase() + 0x1000000];
+        ++entry[0];
+        entry[1] = total;
+        entry[2] = trust->bad.load(std::memory_order_relaxed);
+        const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_log_ms >= 5000) {
+            last_log_ms = now;
+            for (const auto& [site, values] : seen) {
+                LOG_INFO(Core, "untrusted draw call site {:#x}: {} draws refused, trust total {} bad {}", site, values[0], values[1], values[2]);
+            }
+            seen.clear();
+        }
         return no(FbTrustBad);
     }
     if (const u32 period = AuditPeriod();
@@ -3032,6 +3120,21 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     const bool exec = seq != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligible(ctx, seq, ret);
     if (exec) {
         words[2] |= ExecFlag;
+    } else {
+        static std::mutex mutex;
+        static std::map<std::tuple<u64, u32, u32>, u32> not_executed; ///< caller, kind, record flags -> draws
+        static u64 last_ms = 0;
+        std::lock_guard lock{mutex};
+        ++not_executed[{ret - ImageBase() + 0x1000000, kind, seq != 0 ? Slot(seq).flags : 0xffffu}];
+        const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_ms >= 5000) {
+            last_ms = now;
+            for (const auto& [key, count] : not_executed) {
+                LOG_INFO(Core, "draws left on the packet path per 5 s: caller {:#x} kind {} record flags {:#x}: {} draws", std::get<0>(key),
+                         std::get<1>(key), std::get<2>(key), count);
+            }
+            not_executed.clear();
+        }
     }
     if (WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
         tags_written.fetch_add(1, std::memory_order_relaxed);
@@ -3067,6 +3170,15 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             why += fmt::format(" {}: {};", FallbackNames[k], fallback_counts[k].exchange(0));
         }
         LOG_INFO(Core, "native draws on the packet path:{}", why);
+        for (const auto& entry : caller_trust) {
+            const u64 caller = entry.caller.load(std::memory_order_relaxed);
+            const u32 total = entry.total.load(std::memory_order_relaxed);
+            const u32 bad = entry.bad.load(std::memory_order_relaxed);
+            if (caller != 0 && bad != 0 && bad * 500 >= total) {
+                LOG_INFO(Core, "native call site {:#x} stays on the packet path: {} of {} records differ", caller - ImageBase() + 0x1000000, bad,
+                         total);
+            }
+        }
         LOG_INFO(Core, "async compute dispatches: {} from records, {} on the packet path, {} without a record",
                  asc_drawn.exchange(0), asc_packet_path.exchange(0), asc_no_record.exchange(0));
         LOG_INFO(Core, "native tracking: {} resources, {} fast clear eliminates; game function: {} second resource, {} depth state",

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <array>
 #include <string>
 #include "common/types.h"
@@ -87,5 +89,22 @@ u32 RecordDrawCount(u64 seq);
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out);
+
+/// The register effect of a constant command packet sequence of the emulated Gnm driver (the hardware default state the game
+/// sends at the start of every command buffer): the writes in order, parsed once. A tag record names the template; the
+/// command processor applies the writes in place of the packets.
+struct StateWrite {
+    enum Kind : u8 { Context, Sh, Uconfig, NumInstances, ClearState };
+    u8 kind;
+    u32 reg;   ///< register offset within its range
+    u32 value;
+};
+struct StateTemplate {
+    std::vector<StateWrite> writes;
+};
+
+/// The template of `prefix` followed by `sequence` (both packet dwords); the same pointers always give the same template.
+/// Null when the packets contain anything but register writes, clear state and no-ops.
+const StateTemplate* HardwareStateTemplate(const u32* prefix, u32 prefix_dwords, const u32* sequence, u32 sequence_dwords);
 
 } // namespace Core::NativeDraw

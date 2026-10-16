@@ -330,6 +330,38 @@ void Liverpool::PushDelta(u32 index, u32 value) {
     pending[old_size + 2] = value;
 }
 
+void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
+    using Core::NativeDraw::StateWrite;
+    for (const StateWrite& write : state.writes) {
+        switch (write.kind) {
+        case StateWrite::ClearState:
+            regs.SetDefaults();
+            MirrorSetDefaults();
+            break;
+        case StateWrite::Context:
+            regs.reg_array[Regs::ContextRegWordOffset + write.reg] = write.value;
+            MirrorRegs(Regs::ContextRegWordOffset + write.reg, 1);
+            break;
+        case StateWrite::Sh:
+            if (write.reg >= 0x200 && write.reg <= (0x200 + sizeof(ComputeProgram) / 4)) {
+                reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state)[write.reg - 0x200] = write.value;
+            } else {
+                regs.reg_array[Regs::ShRegWordOffset + write.reg] = write.value;
+                MirrorRegs(Regs::ShRegWordOffset + write.reg, 1);
+            }
+            break;
+        case StateWrite::Uconfig:
+            regs.reg_array[Regs::UconfigRegWordOffset + write.reg] = write.value;
+            MirrorRegs(Regs::UconfigRegWordOffset + write.reg, 1);
+            break;
+        case StateWrite::NumInstances:
+            regs.num_instances.num_instances = write.value;
+            MirrorObject(&regs.num_instances, sizeof(regs.num_instances));
+            break;
+        }
+    }
+}
+
 void Liverpool::OverlaySet(u32 index, u32 value) {
     u32* const word = front_state.Word(index);
     if (word == nullptr || *word == value) {
@@ -524,11 +556,25 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             match = tag_kind == 3;
             break;
         }
+        if (!match && call.kind == RasterCall::Kind::Draw) {
+            static u32 unmatched_logs = 0;
+            if (unmatched_logs++ < 40) {
+                LOG_INFO(Render, "native tag not matched: seq {} tag kind {} record count {:#x} call indexed {} num_indices {} vs hi {:#x}",
+                         native_tag_pending.seq, tag_kind, Core::NativeDraw::RecordDrawCount(native_tag_pending.seq), call.indexed,
+                         front_state.num_indices, static_cast<u64>(front_state.vs_program.address >> 32));
+            }
+        }
         if (match) {
             call.tag = native_tag_pending;
             native_tag_pending.valid = false;
             native_tag_skips = 0;
         } else if (++native_tag_skips > 6) {
+            static u32 dropped_logs = 0;
+            if (dropped_logs++ < 24) {
+                LOG_INFO(Render, "native tag dropped unmatched: seq {} kind {} record count {} call kind {} indexed {} num_indices {} vs hi {:#x} caller {:#x}",
+                         native_tag_pending.seq, tag_kind, Core::NativeDraw::RecordDrawCount(native_tag_pending.seq), static_cast<u32>(call.kind),
+                         call.indexed, front_state.num_indices, static_cast<u64>(front_state.vs_program.address >> 32), native_tag_pending.k1);
+            }
             native_tag_pending.valid = false;
             native_tag_skips = 0;
         }
@@ -806,6 +852,9 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     case RasterCall::Kind::DispatchIndirect:
         rasterizer->NativeInvalidate();
+        if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&RasterCsRegs()));
+        }
         run([&] {
             rasterizer->DispatchIndirect(c.args_addr, c.offset, c.dispatch_size, dispatch_plan);
         });
@@ -1748,7 +1797,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
                         std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
                         native_follow_pending = (native_tag_pending.meta & VideoCore::NativeTagFollowFlag) != 0;
-                        if (native_follow_pending) {
+                        if (((native_tag_pending.meta >> 8) & 0xff) == 12) {
+                            // hardware default state: the register writes of a constant packet sequence, applied directly
+                            native_tag_pending.valid = false;
+                            native_follow_pending = false;
+                            if (native_tag_pending.k1 != 0) {
+                                ApplyStateTemplate(*reinterpret_cast<const Core::NativeDraw::StateTemplate*>(native_tag_pending.k1));
+                            }
+                        } else if (native_follow_pending) {
                             // executed when the draw packet comes
                         } else if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
                             ExecuteNativeDraw();

@@ -42,7 +42,14 @@ void FillViewports(FixedState& out, const AmdGpu::DrawRegs& regs) {
 
     out.clip_disabled = regs.IsClipDisabled();
     out.viewport_count = 0;
+    out.viewport_empty = false;
     const auto& vp_ctl = regs.viewport_control;
+    out.transform = {
+        .x_offset = vp_ctl.xoffset_enable ? regs.viewports[0].xoffset : 0.f,
+        .x_scale = vp_ctl.xscale_enable ? regs.viewports[0].xscale : 1.f,
+        .y_offset = vp_ctl.yoffset_enable ? regs.viewports[0].yoffset : 0.f,
+        .y_scale = vp_ctl.yscale_enable ? regs.viewports[0].yscale : 1.f,
+    };
     for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
         const auto& vp = regs.viewports[i];
         if (vp.xscale == 0) {
@@ -94,7 +101,7 @@ void FillViewports(FixedState& out, const AmdGpu::DrawRegs& regs) {
 
     if (out.viewport_count == 0) {
         // Vulkan requires providing at least one viewport.
-        out.clip_disabled = false;
+        out.viewport_empty = true;
         out.viewport_count = 1;
         out.viewports[0] = vk::Viewport{
             .x = -1.0f,
@@ -225,11 +232,14 @@ void FillPipelineState(FixedState& out, const AmdGpu::DrawRegs& regs) {
     out.depth_clip = regs.clipper_control.ZclipEnable();
     out.negative_one_to_one = regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
     out.provoking_first = regs.polygon_control.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First;
+    out.user_clip_plane_mask = static_cast<u8>(regs.clipper_control.user_clip_plane_enable);
+    out.degamma = regs.color_control.degamma_enable;
 }
 
 } // namespace
 
 void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode) {
+    out.primitive_type = type;
     const auto topology = type != AmdGpu::PrimitiveType::None
                               ? LiverpoolToVK::PrimitiveType(type)
                               : vk::PrimitiveTopology::ePatchList;
@@ -247,7 +257,7 @@ void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::Cull
 
 void TakeFromRegisters(FixedState& out, const AmdGpu::DrawRegs& regs, u32 groups) {
     if ((groups & StaleSurface) != 0) {
-        SetFixedStateTopology(out, regs.primitive_type,
+        SetFixedStateTopology(out, out.primitive_type,
                               LiverpoolToVK::CullMode(regs.polygon_control.CullingMode()));
         out.front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
         out.polygon_mode = LiverpoolToVK::PolygonMode(regs.polygon_control.PolyMode());
@@ -262,6 +272,7 @@ void TakeFromRegisters(FixedState& out, const AmdGpu::DrawRegs& regs, u32 groups
         out.depth_clip = regs.clipper_control.ZclipEnable();
         out.negative_one_to_one = regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         out.rasterizer_discard = regs.clipper_control.dx_rasterization_kill;
+        out.user_clip_plane_mask = static_cast<u8>(regs.clipper_control.user_clip_plane_enable);
         out.clip_disabled = regs.IsClipDisabled();
     }
 }
@@ -304,6 +315,13 @@ std::string DiffFixedState(const FixedState& a, const FixedState& b) {
     note(!same_viewports(), "viewports");
     note(!same_rects(), "scissors");
     note(a.clip_disabled != b.clip_disabled, "clip_disabled");
+    note(a.viewport_empty != b.viewport_empty, "viewport_empty");
+    note(a.transform.x_offset != b.transform.x_offset || a.transform.x_scale != b.transform.x_scale ||
+             a.transform.y_offset != b.transform.y_offset || a.transform.y_scale != b.transform.y_scale,
+         "viewport_transform");
+    note(a.primitive_type != b.primitive_type, "primitive_type");
+    note(a.user_clip_plane_mask != b.user_clip_plane_mask, "user_clip_plane_mask");
+    note(a.degamma != b.degamma, "degamma");
     note(a.depth_target != b.depth_target, "depth_target");
     note(a.depth_test != b.depth_test, "depth_test");
     note(a.depth_write != b.depth_write, "depth_write");

@@ -1558,6 +1558,9 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
         }
         Vulkan::SetFixedStateTopology(s, prim, cull_mode);
         s.clip_disabled = prim == AmdGpu::PrimitiveType::RectList;
+        s.user_clip_plane_mask = 0;
+        s.degamma = false;
+        s.viewport_empty = false;
     }
     // depth-stencil: D3D11_DEPTH_STENCIL_DESC as dwords (depth enable, write mask, function; stencil enable / read mask /
     // write mask packed in dword 3; front operations and function at 4..7, back at 8..11)
@@ -1612,6 +1615,13 @@ const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale)
         const u32 bottom = to_u32(y + h);
         const float height = static_cast<float>(static_cast<s32>(bottom) - static_cast<s32>(top));
         s.viewport_count = 1;
+        const float x_scale = static_cast<float>(static_cast<s32>(right - left)) * 0.5f;
+        s.transform = {
+            .x_offset = static_cast<float>(left) + x_scale,
+            .x_scale = x_scale,
+            .y_offset = static_cast<float>(top) + height * 0.5f,
+            .y_scale = height * -0.5f,
+        };
         s.viewports[0] = vk::Viewport{
             .x = static_cast<float>(left),
             .y = static_cast<float>(top) + height,
@@ -2931,7 +2941,8 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.has_extents = slot.kind != 3;
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
-    out.fixed = slot.fixed;
+    // a fast clear eliminate is not an ordinary draw: it keeps the register based classification
+    out.fixed = slot.kind == 4 ? nullptr : slot.fixed;
     out.fixed_stale = slot.fixed_stale;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }

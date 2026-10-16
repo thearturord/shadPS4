@@ -374,7 +374,7 @@ static bool IsFixedStateRegister(u32 index) {
     }
     const u32 reg = index - Regs::ContextRegWordOffset;
     return (reg >= 0x1e0 && reg <= 0x1e7) || (reg >= 0x105 && reg <= 0x108) || (reg >= 0x10b && reg <= 0x10d) ||
-           reg == 0xb4 || reg == 0xb5 || reg == 0xc || reg == 0xd || reg == 0x8f;
+           reg == 0xb4 || reg == 0xb5 || reg == 0xc || reg == 0xd || reg == 0x8f || reg == 0x8e;
 }
 
 void Liverpool::OverlaySet(u32 index, u32 value) {
@@ -982,7 +982,7 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                     op.call.kind == RasterCall::Kind::DrawIndirect) {
                     sp.ns_draws += op_ns;
                     ++sp.n_draws;
-                    if (sp.state.color_target_mask.raw == 0) {
+                    if (op.draw_plan ? op.draw_plan->fixed.NoColorTargets() : sp.state.color_target_mask.raw == 0) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
                     }

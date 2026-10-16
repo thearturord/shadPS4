@@ -176,7 +176,7 @@ public:
 #endif
 
 private:
-    void PrepareRenderState(const GraphicsPipeline* pipeline);
+    void PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
@@ -193,7 +193,7 @@ private:
     void UpdateRasterizationState(const FixedState& fixed) const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline, const FixedState& fixed) const;
 
-    bool FilterDraw();
+    bool FilterDraw(const DrawPlan* plan = nullptr);
     const GraphicsPipeline* ResolveDrawPipeline(const DrawPlan* plan,
                                                 DrawIndirectParams params = {});
     const ComputePipeline* ResolveDispatchPipeline(const DispatchPlan* plan);
@@ -214,15 +214,18 @@ private:
         bool depth_copy{};
         bool stencil_copy{};
     };
-    /// What FilterDraw does with a draw, decided from the registers only.
-    static DrawClassification ClassifyDraw(const AmdGpu::DrawRegs& regs);
+    /// What FilterDraw does with a draw, decided from the registers only. `executed` is the fixed-function state of a draw
+    /// the native path executed from its record: such a draw is a normal draw by construction, only the shadow skip
+    /// switch looks at it.
+    static DrawClassification ClassifyDraw(const AmdGpu::DrawRegs& regs,
+                                           const FixedState* executed = nullptr);
 
     void ProcessReadbacksSync();
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
-    bool BindResources(const Pipeline* pipeline);
+    bool BindResources(const Pipeline* pipeline, const FixedState* fixed = nullptr);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0, bool is_indirect = false);
@@ -290,6 +293,7 @@ private:
     const u32 flush_commands;
     std::mutex plan_pool_mutex;
     std::vector<std::unique_ptr<DrawPlan>> draw_plan_pool;
+    u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;
     /// True if the inputs match the cached lookup; otherwise stores them for the next draw.
     template <typename... Ts>

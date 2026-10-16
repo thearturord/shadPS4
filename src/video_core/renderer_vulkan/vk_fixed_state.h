@@ -29,8 +29,18 @@ struct BlendTarget {
 /// only this. Values that depend on the device (depth range limits, primitive restart support) are applied where the
 /// state is committed.
 struct FixedState {
+    /// The viewport transform the shaders receive as push constants (screen space to normalized coordinates).
+    struct ViewportTransform {
+        float x_offset{};
+        float x_scale{1.f};
+        float y_offset{};
+        float y_scale{1.f};
+    };
+
     u32 viewport_count{};
-    bool clip_disabled{}; ///< the viewport covers the whole render space (the shader works in screen coordinates)
+    bool viewport_empty{}; ///< no viewport was described: the single placeholder viewport is bound
+    bool clip_disabled{};  ///< the viewport covers the whole render space (the shader works in screen coordinates)
+    ViewportTransform transform{};
     std::array<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports{};
     std::array<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors{};
 
@@ -58,6 +68,7 @@ struct FixedState {
 
     bool primitive_restart{};
     u32 primitive_restart_index{};
+    AmdGpu::PrimitiveType primitive_type{};
     bool list_topology{};       ///< point, line or triangle list: restart needs the list restart feature
     bool patch_list_topology{}; ///< patch, quad or rect list (tessellation): restart needs the patch list feature
     bool rasterizer_discard{};
@@ -78,6 +89,18 @@ struct FixedState {
     bool depth_clip{};
     bool negative_one_to_one{}; ///< clip space -w..w (otherwise 0..w)
     bool provoking_first{};
+    u8 user_clip_plane_mask{}; ///< user clip planes the vertex stage lowers
+    bool degamma{};            ///< the colour targets want gamma correction on write
+
+    /// True when no colour target is written (every write mask is empty).
+    bool NoColorTargets() const {
+        for (const u8 mask : target_write_mask) {
+            if (mask != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     /// True when the first target's blend state reads the second pixel shader output.
     bool DualSourceBlending() const {

@@ -145,7 +145,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 }
             }();
         } else {
-            info.hw.gs.in_primitive = regs.primitive_type;
+            info.hw.gs.in_primitive = lookup_fixed->primitive_type;
         }
         for (u32 stream_id = 0; stream_id < Shader::GsMaxOutputStreams; ++stream_id) {
             info.hw.gs.out_primitive[stream_id] =
@@ -163,12 +163,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     }
     case HwStage::Vertex: {
         BuildCommon(regs.vs_program);
-        info.hw.vs.user_clip_plane_mask = regs.clipper_control.user_clip_plane_enable;
+        info.hw.vs.user_clip_plane_mask = lookup_fixed->user_clip_plane_mask;
         info.hw.vs.num_outputs = MapOutputs(info.hw.vs.outputs, regs.vs_output_control);
         info.hw.vs.emulate_depth_negative_one_to_one =
             !instance.IsDepthClipControlSupported() &&
-            regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
-        info.hw.vs.clip_disable = regs.IsClipDisabled();
+            lookup_fixed->negative_one_to_one;
+        info.hw.vs.clip_disable = lookup_fixed->clip_disabled;
         break;
     }
     case HwStage::Fragment: {
@@ -206,7 +206,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
         // locations in sync with the shifted vertex outputs.
         const bool lowers_user_clip_planes =
-            regs.clipper_control.user_clip_plane_enable &&
+            lookup_fixed->user_clip_plane_mask != 0 &&
             !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Geometry));
         info.hw.fs.clip_distance_emulation =
             ((regs.vs_output_control.clip_distance_enable &&
@@ -242,8 +242,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
         info.sw.vs.is_indirect = draw_indirect_params.is_indirect;
         info.sw.vs.tess_emulated_primitive =
-            regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
-            regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+            lookup_fixed->primitive_type == AmdGpu::PrimitiveType::RectList ||
+            lookup_fixed->primitive_type == AmdGpu::PrimitiveType::QuadList;
         break;
     case SwStage::TessellationControl: {
         info.sw.tcs.num_input_control_points = regs.ls_hs_config.hs_input_control_points;
@@ -544,7 +544,7 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.depth_clip_enable = fixed.depth_clip;
     key.negative_one_to_one = fixed.negative_one_to_one;
     key.provoking_first = fixed.provoking_first;
-    key.prim_type = regs.primitive_type;
+    key.prim_type = fixed.primitive_type;
     key.polygon_mode = fixed.polygon_mode;
     key.patch_control_points =
         regs.stage_enable.hs_en ? regs.ls_hs_config.hs_input_control_points : 0;

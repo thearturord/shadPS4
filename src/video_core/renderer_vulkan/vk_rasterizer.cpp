@@ -33,14 +33,16 @@
 
 namespace Vulkan {
 
-static Shader::PushData MakeUserData(const AmdGpu::DrawRegs& regs) {
+static Shader::PushData MakeUserData(const FixedState* fixed) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
     Shader::PushData push_data{};
-    push_data.xoffset = regs.viewport_control.xoffset_enable ? regs.viewports[0].xoffset : 0.f;
-    push_data.xscale = regs.viewport_control.xscale_enable ? regs.viewports[0].xscale : 1.f;
-    push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
-    push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
+    if (fixed) {
+        push_data.xoffset = fixed->transform.x_offset;
+        push_data.xscale = fixed->transform.x_scale;
+        push_data.yoffset = fixed->transform.y_offset;
+        push_data.yscale = fixed->transform.y_scale;
+    }
     return push_data;
 }
 
@@ -112,7 +114,9 @@ bool Rasterizer::CommandStreamBarrier(u64 producer_tick) {
     return true;
 }
 
-Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& regs) {
+Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& regs,
+                                                        const FixedState* executed) {
+    if (executed == nullptr) {
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         return {DrawClass::EliminateFastClear};
     }
@@ -155,9 +159,13 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& 
     if (cb_disabled && (depth_copy || stencil_copy)) {
         return {DrawClass::DepthStencilCopy, depth_copy, stencil_copy};
     }
+    }
+    const bool cb_disabled = executed ? !executed->color_enabled
+                                      : regs.color_control.mode ==
+                                            AmdGpu::ColorControl::OperationMode::Disable;
+    const bool no_targets = executed ? executed->NoColorTargets() : regs.color_target_mask.raw == 0;
     const u32 skip = VideoCore::ReadbackPolicy::Get().skip_shadows.load(std::memory_order_relaxed);
-    if (skip != 0 && (cb_disabled || regs.color_target_mask.raw == 0) &&
-        regs.depth_buffer.DepthValid()) {
+    if (skip != 0 && (cb_disabled || no_targets) && regs.depth_buffer.DepthValid()) {
         const u32 pitch = regs.depth_buffer.Pitch();
         const u32 height = regs.depth_buffer.Height();
         if (skip == 1 ? pitch == height : pitch == skip || height == skip) {
@@ -167,8 +175,9 @@ Rasterizer::DrawClassification Rasterizer::ClassifyDraw(const AmdGpu::DrawRegs& 
     return {DrawClass::Normal};
 }
 
-bool Rasterizer::FilterDraw() {
-    const auto classified = ClassifyDraw(liverpool->RasterRegs());
+bool Rasterizer::FilterDraw(const DrawPlan* plan) {
+    const auto classified =
+        ClassifyDraw(liverpool->RasterRegs(), plan && plan->executed ? &plan->fixed : nullptr);
     {
         // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
         static std::array<u64, 12> class_counts{};
@@ -236,9 +245,12 @@ bool Rasterizer::FilterDraw() {
     {
         // Which depth targets do the depth-only draws go to? (debug server /policy)
         const auto& regs = liverpool->RasterRegs();
-        if ((regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable ||
-             regs.color_target_mask.raw == 0) &&
-            regs.depth_buffer.DepthValid()) {
+        const bool no_color =
+            plan && plan->executed
+                ? (!plan->fixed.color_enabled || plan->fixed.NoColorTargets())
+                : (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable ||
+                   regs.color_target_mask.raw == 0);
+        if (no_color && regs.depth_buffer.DepthValid()) {
             VideoCore::ReadbackPolicy::Get().NoteDepthOnly(regs.depth_buffer.Pitch(),
                                                            regs.depth_buffer.Height());
         }
@@ -252,9 +264,18 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
                                                bool verify) {
     // SkipShadow draws are still planned: the switch can change between the front and the raster
     // thread, and the raster thread must find a plan for every draw it does not drop.
-    if (const auto kind = ClassifyDraw(regs).kind;
-        kind != DrawClass::Normal && kind != DrawClass::SkipShadow) {
-        return nullptr;
+    // An executed draw is a normal draw by construction (only the shadow skip switch looks at it, when the draw is
+    // recorded); the first draws and every 256th are classified from the registers as well.
+    bool executed = native && !verify;
+    if (!executed) {
+        const auto kind = ClassifyDraw(regs).kind;
+        if (kind != DrawClass::Normal && kind != DrawClass::SkipShadow) {
+            if (native) {
+                LOG_INFO(Render_Vulkan, "executed draw is classified {} by the registers", static_cast<u32>(kind));
+            }
+            return nullptr;
+        }
+        executed = native && kind == DrawClass::Normal;
     }
     std::unique_ptr<DrawPlan> plan;
     {
@@ -267,6 +288,7 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     if (!plan) {
         plan = std::make_unique<DrawPlan>();
     }
+    plan->executed = executed;
     if (native) {
         // The state built from the engine's objects replaces the one built from the registers. The first draws (and
         // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
@@ -316,6 +338,7 @@ void Rasterizer::RecyclePlan(std::unique_ptr<DrawPlan>&& plan) {
         return;
     }
     plan->pipeline = nullptr;
+    plan->executed = false;
     for (auto& stage : plan->stages) {
         ResetStage(stage);
     }
@@ -398,20 +421,19 @@ bool Rasterizer::TargetInputsMatch(CachedTarget& cache, const Ts&... parts) {
     return match;
 }
 
-void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->RasterRegs();
-    if (regs.color_control.degamma_enable) {
+    if (fixed.degamma) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
 
-    const bool skip_cb_binding =
-        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    const bool skip_cb_binding = !fixed.color_enabled;
     for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         const auto& col_buf = regs.color_buffers[cb];
-        const u32 target_mask = regs.color_target_mask.GetMask(cb);
+        const u32 target_mask = fixed.target_write_mask[cb];
         if (skip_cb_binding || !col_buf || !target_mask || (key.mrt_mask & (1 << cb)) == 0) {
             image_id = {};
             rt_cache[cb].valid = false;
@@ -545,7 +567,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         ++native_stats.untagged;
     }
 
-    if (!FilterDraw()) {
+    if (!FilterDraw(plan)) {
         return;
     }
 
@@ -560,8 +582,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
+    PrepareRenderState(pipeline, fixed);
+    if (!BindResources(pipeline, &fixed)) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -618,7 +640,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     scheduler.PopPendingOperations();
 
-    if (!FilterDraw()) {
+    if (!FilterDraw(plan)) {
         return;
     }
 
@@ -634,8 +656,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
+    PrepareRenderState(pipeline, fixed);
+    if (!BindResources(pipeline, &fixed)) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -882,7 +904,7 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
     }
 }
 
-bool Rasterizer::BindResources(const Pipeline* pipeline) {
+bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed) {
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -897,7 +919,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(liverpool->RasterRegs());
+    push_data = MakeUserData(fixed);
+    clip_plane_mask = fixed ? fixed->user_clip_plane_mask : 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1263,7 +1286,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
-                if (liverpool->RasterRegs().clipper_control.user_clip_plane_enable == 0) {
+                if (clip_plane_mask == 0) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
@@ -1866,7 +1889,7 @@ void Rasterizer::UpdateViewportScissorState(const FixedState& fixed) const {
             viewport.minDepth = std::max(viewport.minDepth, 0.f);
             viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
         }
-        if (fixed.clip_disabled) {
+        if (fixed.clip_disabled && !fixed.viewport_empty) {
             // In case if clipping is disabled we patch the shader to convert vertex position
             // from screen space coordinates to NDC by defining a render space as full hardware
             // window range [0..16383, 0..16383] and setting the viewport to its size.

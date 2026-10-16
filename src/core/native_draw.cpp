@@ -2537,6 +2537,9 @@ bool ParseStateSequence(const u32* packets, u32 dwords, StateTemplate& out, bool
         case 0x2f:
             out.writes.push_back({StateWrite::NumInstances, 0, packets[at + 1]});
             break;
+        case 0x2a:
+            out.writes.push_back({StateWrite::IndexType, 0, packets[at + 1]});
+            break;
         case 0x69:
         case 0x76:
         case 0x79: {
@@ -3605,6 +3608,70 @@ u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3
     return 1;
 }
 
+/// FUN_024826c0(draw context): the reset at the start of a frame. It sets the engine fields, has the driver write the hardware
+/// default state (a template tag with padding) and then writes a few context registers and the index type itself. Those
+/// register packets after the padding become one state template tag.
+u64 PS4_SYSV_ABI TagDeviceBegin(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (ctx == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 16384) == 0) {
+        return 0;
+    }
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("DeviceBegin");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
+    const u64 begin = Rd<u64>(ctx, 0x47c0);
+    const u64 end = Rd<u64>(ctx, 0x47d0);
+    if (end <= begin || end - begin > 0x4000 || (begin & 3) != 0) {
+        return 1;
+    }
+    // the driver's block: a template tag followed by one large padding packet; everything after it is the reset's own
+    u64 tail = 0;
+    for (u64 at = begin; at < end;) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            return 1;
+        }
+        const u32 size = (((header >> 16) & 0x3fff) + 2) * 4;
+        at += size;
+        if (((header >> 8) & 0xff) == 0x10 && size >= 128 * 4 && Rd<u32>(at - size, 4) != VideoCore::NativeTagMagic) {
+            tail = at;
+            break;
+        }
+    }
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    if (tail == 0 || tail >= end || (end - tail) / 4 < TagDwords + 2) {
+        return 1;
+    }
+    const u32 tail_dwords = static_cast<u32>((end - tail) / 4);
+    const StateTemplate* state = IndirectStateTemplate(reinterpret_cast<const u32*>(tail), tail_dwords);
+    if (state == nullptr) {
+        return 1;
+    }
+    u32 words[TagDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = (12u << 8) | ExecFlag;
+    std::memset(&words[3], 0, (TagDwords - 3) * sizeof(u32));
+    const u64 pointer = reinterpret_cast<u64>(state);
+    std::memcpy(&words[3], &pointer, sizeof(pointer));
+    for (u32 k = 0; k < TagDwords; ++k) {
+        Wr<u32>(tail, k * 4, words[k]);
+    }
+    const u32 rest = tail_dwords - TagDwords;
+    Wr<u32>(tail + TagDwords * 4, 0, 0xC0000000u | ((rest - 2) << 16) | (0x10u << 8));
+    Wr<u32>(tail + TagDwords * 4, 4, 0);
+    Live().device_begin_stripped.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 /// JsComputeContext / JsDeviceContext::SetComputeResourceLimits (FUN_024720f0, FUN_02480ed0): one COMPUTE_RESOURCE_LIMITS
 /// register write; nothing of the host reads it.
 u64 PS4_SYSV_ABI SkipResourceLimits(u64 context, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
@@ -4050,6 +4117,20 @@ u64 PS4_SYSV_ABI TagModeSwitch(u64 ctx, u64 mode, u64 a2, u64 a3, u64 a4, u64 a5
         return 1; // the game's function returns at once
     }
     if ((current != 0 && current != 0x8000) || (wanted != 0 && wanted != 0x8000)) {
+        static std::mutex mutex;
+        static std::map<std::tuple<u32, u32, u64>, u32> refused; ///< current, wanted, caller -> calls
+        static u64 last_ms = 0;
+        std::lock_guard lock{mutex};
+        ++refused[{current, wanted, a5 == 0 ? ret - ImageBase() + 0x1000000 : 0}];
+        const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_ms >= 5000) {
+            last_ms = now;
+            for (const auto& [key, calls] : refused) {
+                LOG_INFO(Core, "mode switch left to the game per 5 s: from {:#x} to {:#x} caller {:#x}: {} calls", std::get<0>(key), std::get<1>(key),
+                         std::get<2>(key), calls);
+            }
+            refused.clear();
+        }
         return 0;
     }
     if (Rd<u8>(ctx, 0x47a4) != 0 || Rd<u32>(ctx, 0x130dc) != Rd<u32>(ctx, 0x130d8)) {
@@ -4298,7 +4379,8 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
         last_two[1] + 12 != end || last_two[0] < start + TagDwords * 4) {
         return false;
     }
-    const u64 middle = (last_two[0] - start) / 4 - TagDwords;
+    // the two tail writes (color target mask, depth render control) are applied by the record itself
+    const u64 middle = (end - start) / 4 - TagDwords;
     if (middle == 1) {
         return false;
     }
@@ -4512,6 +4594,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_counter_readback") {
         return reinterpret_cast<u64>(&TagAscCounterReadback);
+    }
+    if (name == "tag_device_begin") {
+        return reinterpret_cast<u64>(&TagDeviceBegin);
     }
     if (name == "skip_resource_limits") {
         return reinterpret_cast<u64>(&SkipResourceLimits);

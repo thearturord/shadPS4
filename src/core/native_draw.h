@@ -31,7 +31,7 @@ constexpr u32 UnknownDrawCount = 0xfffffffe;
 struct LiveCounters {
     std::atomic<u64> gfx_tags{}, gfx_exec{};
     std::atomic<u64> compute_tags{}, compute_exec{};
-    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{};
+    std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{}, device_begin_stripped{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
     /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
@@ -94,7 +94,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out);
 /// sends at the start of every command buffer): the writes in order, parsed once. A tag record names the template; the
 /// command processor applies the writes in place of the packets.
 struct StateWrite {
-    enum Kind : u8 { Context, Sh, Uconfig, NumInstances, ClearState };
+    enum Kind : u8 { Context, Sh, Uconfig, NumInstances, ClearState, IndexType };
     u8 kind;
     u32 reg;   ///< register offset within its range
     u32 value;

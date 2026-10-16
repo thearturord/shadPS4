@@ -115,6 +115,7 @@ nlohmann::json Native(const Params&) {
     j["asc_begin_stripped"] = live.asc_begin_stripped.load();
     j["counter_readback"] = live.counter_readback.load();
     j["async_copy_exec"] = live.async_copy_exec.load();
+    j["device_begin_stripped"] = live.device_begin_stripped.load();
     j["track_native"] = live.track_native.load();
     j["track_fce"] = live.track_fce.load();
     j["track_game"] = live.track_game_second.load() + live.track_game_depth.load();

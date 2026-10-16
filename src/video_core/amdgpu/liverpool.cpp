@@ -358,6 +358,10 @@ void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state)
             regs.num_instances.num_instances = write.value;
             MirrorObject(&regs.num_instances, sizeof(regs.num_instances));
             break;
+        case StateWrite::IndexType:
+            regs.index_buffer_type.raw = write.value;
+            MirrorObject(&regs.index_buffer_type, sizeof(regs.index_buffer_type));
+            break;
         }
     }
 }
@@ -693,6 +697,11 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             },
             false, false);
         OverlayRestore();
+        // what the SDK's clear leaves behind: all colour targets writable again, no clear bits in the depth render control
+        regs.reg_array[Regs::ContextRegWordOffset + 0x8e] = 0xf;
+        MirrorRegs(Regs::ContextRegWordOffset + 0x8e, 1);
+        regs.reg_array[Regs::ContextRegWordOffset + 0x0] = 0;
+        MirrorRegs(Regs::ContextRegWordOffset + 0x0, 1);
         return;
     }
     if (draw.kind == 3 || draw.kind == 11) {

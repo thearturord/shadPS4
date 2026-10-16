@@ -466,6 +466,11 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+void Rasterizer::ClearDepthStencilTarget() {
+    scheduler.PopPendingOperations();
+    ClearDepthTarget();
+}
+
 void Rasterizer::ClearDepthTarget() {
     auto& regs = liverpool->RasterRegs();
     const auto htile_address = regs.depth_htile_data_base.GetAddress();

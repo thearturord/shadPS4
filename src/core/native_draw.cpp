@@ -3471,9 +3471,104 @@ u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4,
 u64 PS4_SYSV_ABI MeasureTargetEliminate(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return ctx ? RunAndMeasure(emit_stats[1], "Fn247c680", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5, 1) : 0;
 }
-u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return dcb ? RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, a1, a2, a3, a4, a5) : 0;
+/// The SDK's depth / stencil clear quad (FUN_024879c0(command buffer, depth target)). The game's function runs; its
+/// packets (state, embedded vertex shader, the quad) are replaced by one depth clear record carrying the target's
+/// registers, except for the two register writes that end the function (color target mask, depth render control).
+bool ConvertClearQuad(u64 target, u64 begin, u64 end, u64 caller) {
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    const u64 total = (end - begin) / 4;
+    if (total < TagDwords + 6 || (Rd<u32>(target, 0) & 3) == 0) {
+        return false;
+    }
+    u64 tag_end_is_boundary = 0;
+    u64 last_two[2] = {0, 0};
+    bool target_registers = false;
+    u64 at = begin;
+    while (at < end) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            return false;
+        }
+        if (at == begin + TagDwords * 4) {
+            tag_end_is_boundary = 1;
+        }
+        if (header == 0xc0086900u && Rd<u32>(at, 4) == 0x10) {
+            target_registers = true;
+        }
+        last_two[0] = last_two[1];
+        last_two[1] = at;
+        at += (((header >> 16) & 0x3fff) + 2) * 4ull;
+    }
+    if (at != end || !target_registers || tag_end_is_boundary == 0 || last_two[0] == 0 ||
+        Rd<u32>(last_two[0], 0) != 0xc0016900u || Rd<u32>(last_two[0], 4) != 0x8e || Rd<u32>(last_two[0], 8) != 0xf ||
+        Rd<u32>(last_two[1], 0) != 0xc0016900u || Rd<u32>(last_two[1], 4) != 0 || last_two[0] + 12 != last_two[1] ||
+        last_two[1] + 12 != end || last_two[0] < begin + TagDwords * 4) {
+        return false;
+    }
+    const u64 middle = (last_two[0] - begin) / 4 - TagDwords;
+    if (middle == 1) {
+        return false;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+        return false;
+    }
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.kind = 7;
+    slot.flags = 0;
+    slot.a1 = 3;
+    slot.caller = caller;
+    u32 n = 0;
+    for (u32 k = 0; k < 8; ++k) {
+        slot.regs[n++] = {ContextBase + 0x10 + k, Rd<u32>(target, k * 4)};
+    }
+    slot.regs[n++] = {ContextBase + 0xf, Rd<u32>(target, 0x2c)};
+    slot.regs[n++] = {ContextBase + 0x2, Rd<u32>(target, 0x20)};
+    slot.regs[n++] = {ContextBase + 0x5, Rd<u32>(target, 0x24)};
+    slot.regs[n++] = {ContextBase + 0x2af, Rd<u32>(target, 0x28)};
+    slot.count = n;
+    slot.cb_extent = {};
+    slot.cb_extent_mask = 0;
+    slot.db_extent = Rd<u32>(target, 0x30);
+    slot.seq.store(seq, std::memory_order_release);
+    u32 words[TagDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (7u << 8) | ExecFlag;
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    for (u32 k = 0; k < TagDwords; ++k) {
+        Wr<u32>(begin, k * 4, words[k]);
+    }
+    if (middle >= 2) {
+        const u64 run = begin + TagDwords * 4;
+        Wr<u32>(run, 0, 0xC0000000u | (static_cast<u32>(middle - 2) << 16) | (0x10u << 8));
+        Wr<u32>(run, 4, 0);
+    }
+    return true;
 }
+
+u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 target, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (dcb == 0) {
+        return 0;
+    }
+    const u64 begin = Rd<u64>(dcb, 0x10);
+    const u64 end_marker = Rd<u64>(dcb, 8);
+    const u64 result = RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, target, a2, a3, a4, a5);
+    const u64 end = Rd<u64>(dcb, 0x10);
+    if (result != 0 && Rd<u64>(dcb, 8) == end_marker && end > begin && target >= 0x200000000ull && target < 0x400000000ull &&
+        (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32) != 0 &&
+        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && ConvertClearQuad(target, begin, end, ret)) {
+        emit_stats[2].stripped.fetch_add(1, std::memory_order_relaxed);
+        Live().clear_exec.fetch_add(1, std::memory_order_relaxed);
+    }
+    return result;
+}
+
 /// FUN_02487e40(command buffer, depth target, value): the clear of a depth target's HTILE surface. The fill itself is a native
 /// record (FUN_02485c00); the event and the scratch label fence around it are of no use to the command processor.
 u64 PS4_SYSV_ABI MeasureHtileClear(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {

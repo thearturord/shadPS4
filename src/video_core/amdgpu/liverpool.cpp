@@ -609,6 +609,24 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         return;
     }
+    if (draw.kind == 7) {
+        // depth / stencil clear: the registers of the depth target go into the draw state for the clear only
+        native_tag_pending.valid = false;
+        for (u32 i = 0; i < draw.count; ++i) {
+            OverlaySet(draw.regs[i].index, draw.regs[i].value);
+        }
+        if (!split_active) {
+            direct_state = front_state;
+        }
+        RasterRun(
+            [this, extent = draw.db_extent] {
+                RasterDbExtent().raw = extent;
+                rasterizer->ClearDepthStencilTarget();
+            },
+            false, false);
+        OverlayRestore();
+        return;
+    }
     if (draw.kind == 3) {
         // dispatch: the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
         ComputeProgram& program = GetCsRegs();

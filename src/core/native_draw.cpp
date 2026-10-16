@@ -563,6 +563,7 @@ struct NativeRecord {
         u64 address;
         u32 entry_dwords; ///< size of one table entry (0 = compare the table as a whole)
         std::array<u64, 2> slot_mask; ///< entries the shader reads (bit per slot); the others hold stale data
+        u32 hi_flags{};               ///< bits the register after the address carries besides it (buffer descriptor flags)
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
@@ -1755,6 +1756,148 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
     return seq;
 }
 
+/// Guest thread: the record of a JsDeviceContext::CopyResource of a two dimensional texture (a compute dispatch of the
+/// device's copy shader for the destination's format: shader resource = the source subresource, constant buffer = the
+/// source size at the subresource's mip, RW resource = the destination subresource). Returns 0 when the arguments are not
+/// the plain case.
+u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 source, u32 source_sub, u64 caller) {
+    const VAddr image = image_base.load(std::memory_order_relaxed);
+    if (image == 0) {
+        return 0;
+    }
+    const auto texture_descriptor = [&](u64 resource, u32 subresource, bool writable, std::array<u32, 8>& t) {
+        for (u32 k = 0; k < 8; ++k) {
+            t[k] = Rd<u32>(resource, 0x70 + k * 4);
+        }
+        const u32 mips = t[3] > 0xdfffffffu ? 1u : ((t[3] >> 16) & 0xf) + 1;
+        if (((t[3] >> 28) | 1) != 0xf) {
+            const u32 mip = (subresource % mips) & 0xf;
+            t[3] = (mip << 16) | (mip << 12) | (t[3] & 0xfff00fffu);
+        }
+        const u32 slice = subresource / mips;
+        t[5] = ((slice & 0x1fff) << 13) | (slice & 0x1fff) | (t[5] & 0xfc000000u);
+        if (writable) {
+            t[3] &= ~(1u << 26);
+            t[1] = (t[1] & 0x3fffff3fu) | 0xc0000040u;
+        }
+    };
+    std::array<u32, 8> srv{}, uav{};
+    texture_descriptor(destination, destination_sub, true, uav);
+    texture_descriptor(source, source_sub, false, srv);
+    const u32 source_mips = Rd<u32>(source, 0x188);
+    if (source_mips == 0) {
+        return 0;
+    }
+    const u32 mip_shift = (source_sub % source_mips) & 0x1f;
+    const u32 width = Rd<u32>(source, 0x180) >> mip_shift;
+    const u32 height = Rd<u32>(source, 0x184) >> mip_shift;
+    const u32 format_bits = (uav[1] >> 20) & 0x3f;
+    const u32 class_entry = format_bits < 0x3d ? Rd<u32>(image + 0x25e0520 - 0x1000000, format_bits * 4) : 0;
+    const u64 shader_index = format_bits < 0x3d ? static_cast<u64>(static_cast<s64>(static_cast<s32>(class_entry) + 3)) : 3;
+    if (shader_index > 12) {
+        return 0;
+    }
+    const u64 device = Rd<u64>(image + 0x6b034e0 - 0x1000000, shader_index * 8);
+    const u64 gnm = device ? Rd<u64>(device, 0x120) : 0;
+    if (gnm == 0 || width == 0 || height == 0) {
+        return 0;
+    }
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    BeginTables(seq);
+    auto& slot = Slot(seq);
+    slot.seq.store(0, std::memory_order_release);
+    slot.check_count = 0;
+    slot.unsupported_inputs = 0;
+    slot.unsupported_mask = 0;
+    synth_flags = 0;
+    slot.kind = 3;
+    slot.caller = caller;
+    slot.a1 = (width + 7) >> 3;
+    slot.a2 = (height + 7) >> 3;
+    slot.rt_info = 0;
+    slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
+    slot.ps_gnm = 0;
+    slot.vs_gnm = gnm;
+    u32 n = 0;
+    const auto cs_reg = [&](u32 dword, u32 value) { slot.regs[n++] = {Core::NativeDraw::ComputeRegisterBase + dword, value}; };
+    const u64 program = gnm + 8;
+    cs_reg(0x00, (u32(Rd<u8>(ctx, 0x13015)) * 8 & 0x18) + 1);
+    cs_reg(0x01, slot.a1);
+    cs_reg(0x02, slot.a2);
+    cs_reg(0x03, 1);
+    cs_reg(0x07, Rd<u32>(program, 16));
+    cs_reg(0x08, Rd<u32>(program, 20));
+    cs_reg(0x09, Rd<u32>(program, 24));
+    cs_reg(0x0c, Rd<u32>(program, 0));
+    cs_reg(0x0d, 0);
+    cs_reg(0x12, Rd<u32>(program, 8));
+    cs_reg(0x13, Rd<u32>(program, 12));
+    u32* constants = AllocTable(8);
+    constants[0] = width;
+    constants[4] = height;
+    constants[1] = constants[2] = constants[3] = constants[5] = constants[6] = constants[7] = 0;
+    const u64 constants_address = reinterpret_cast<u64>(constants);
+    const std::array<u32, 2> constant_descriptor_tail{2u, 0x20077facu};
+    std::array<u32, 16> eud{};
+    u32 eud_dwords = 0;
+    bool have_eud_pointer = false;
+    u32 eud_pointer_sgpr = 0;
+    u32 checks = 0;
+    const auto put = [&](u32 start, const u32* words, u32 size) {
+        for (u32 k = 0; k < size; ++k) {
+            const u32 reg = start + k;
+            if (reg < 16) {
+                cs_reg(0x40 + reg, words[k]);
+            } else if (reg - 16 < eud.size()) {
+                eud[reg - 16] = words[k];
+                eud_dwords = std::max(eud_dwords, reg - 16 + 1);
+            } else {
+                ++slot.unsupported_inputs;
+            }
+        }
+    };
+    for (u32 i = 0; i < Rd<u8>(gnm, 3) && i < 40; ++i) {
+        const u64 e = gnm + 0x28 + i * 4;
+        const u32 type = Rd<u8>(e, 0);
+        const u32 slot_index = Rd<u8>(e, 1);
+        const u32 start = Rd<u8>(e, 2);
+        const u32 size = (Rd<u8>(e, 3) & 1) ? 8 : 4;
+        if (type == 27) {
+            have_eud_pointer = true;
+            eud_pointer_sgpr = start;
+        } else if (slot_index != 0 || (type != 0 && type != 2 && type != 4) || (type != 2 && size != 8)) {
+            ++slot.unsupported_inputs;
+        } else if (type == 0) {
+            put(start, srv.data(), 8);
+        } else if (type == 4) {
+            put(start, uav.data(), 8);
+        } else if (start + 4 > 16 || checks >= slot.checks.size()) {
+            ++slot.unsupported_inputs;
+        } else {
+            // the constant buffer descriptor holds the address of the constants: compared by content
+            slot.checks[checks++] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 30, 8, constants_address, 0, {~0ull, ~0ull}, 0x100000};
+            put(start + 2, constant_descriptor_tail.data(), 2);
+        }
+    }
+    if (have_eud_pointer) {
+        if (eud_pointer_sgpr + 2 > 16 || checks >= slot.checks.size() || eud_dwords == 0) {
+            ++slot.unsupported_inputs;
+        } else {
+            u32* table = AllocTable(eud_dwords);
+            std::memcpy(table, eud.data(), eud_dwords * sizeof(u32));
+            slot.checks[checks++] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + eud_pointer_sgpr, 27, eud_dwords,
+                                     reinterpret_cast<u64>(table), 0, {~0ull, ~0ull}};
+        }
+    } else if (eud_dwords != 0) {
+        ++slot.unsupported_inputs;
+    }
+    slot.check_count = checks;
+    slot.count = n;
+    slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
+    slot.seq.store(seq, std::memory_order_release);
+    return seq;
+}
+
 struct VerifyStats {
     std::mutex mutex;
     u64 draws_checked{};
@@ -2184,7 +2327,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     for (u32 c = 0; c < slot.check_count; ++c) {
         const auto& check = slot.checks[c];
         out.regs[n++] = {check.reg, static_cast<u32>(check.address)};
-        out.regs[n++] = {check.reg + 1, static_cast<u32>(check.address >> 32)};
+        out.regs[n++] = {check.reg + 1, static_cast<u32>(check.address >> 32) | check.hi_flags};
     }
     out.count = n;
     out.kind = slot.kind;
@@ -2878,6 +3021,77 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
     return 1;
 }
 
+/// JsDeviceContext::CopyResource(context, destination, destination subresource, source, source subresource) for two
+/// dimensional textures: the tracking of both resources, the switch to compute mode and one dispatch of the copy shader.
+/// While the record of the call site is not yet verified the tag is written in front of the game's own packets (they are
+/// compared with it); then the whole function is replaced by the tag.
+u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, u64 source, u64 source_sub, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 4) & 1) == 0 || ctx == 0 || !valid(destination) ||
+        !valid(source) || destination == source) {
+        return 0;
+    }
+    const u32 format = Rd<u32>(destination, 0x190);
+    if (Rd<u32>(destination, 0x124) != 3 || Rd<u32>(source, 0x124) != 3 || Rd<u32>(destination, 0x19c) == 1 ||
+        (Rd<u8>(destination, 0x1a0) & 0x40) != 0 || format != Rd<u32>(source, 0x190) || format > 0x65 ||
+        ((Rd<u32>(destination, 0x194) | Rd<u32>(source, 0x194)) > 1) || Rd<u32>(source, 0x188) == 0) {
+        return 0; // the game's function reports the error or handles another resource kind
+    }
+    const u32 current_mode = Rd<u32>(ctx, 0x278);
+    if ((current_mode != 0 && current_mode != 0x8000) || (Rd<u8>(ctx, 0x13009) & 1) != 0) {
+        return 0;
+    }
+    const u64 seq = Guarded([&] {
+        return MakeCopyResourceRecord(ctx, destination, static_cast<u32>(destination_sub), source, static_cast<u32>(source_sub), ret);
+    });
+    if (seq == 0) {
+        return 0;
+    }
+    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleCompute(ctx, seq, ret);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (3u << 8) | (exec ? ExecFlag : 0u);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!exec) {
+        if (!WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+            tags_failed.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+        tags_written.fetch_add(1, std::memory_order_relaxed);
+        Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const auto game_track = GameTrackFunction();
+    TrackResource(ctx, destination, true, game_track);
+    TrackResource(ctx, source, true, game_track);
+    if (Rd<u32>(ctx, 0x278) != 0x8000) {
+        Wr<u32>(ctx, 0x4acc, 0x8000);
+        Wr<u8>(ctx, 0x47b4, 1);
+        if (Rd<u8>(ctx, 0x47a4) != 0 || Rd<u32>(ctx, 0x130dc) != Rd<u32>(ctx, 0x130d8)) {
+            Wr<u32>(ctx, 0x130dc, Rd<u32>(ctx, 0x130d8));
+            Wr<u8>(ctx, 0x47a4, 0);
+        }
+        Wr<u32>(ctx, 0x278, 0x8000);
+    }
+    if (!WriteDwords(ctx, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        Wr<u64>(ctx, 0x20f8, 0);
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    Live().compute_tags.fetch_add(1, std::memory_order_relaxed);
+    Live().compute_exec.fetch_add(1, std::memory_order_relaxed);
+    compute_drawn.fetch_add(1, std::memory_order_relaxed);
+    Wr<u64>(ctx, 0x20f8, 0);
+    return 1;
+}
+
 /// JsDeviceContext::ExCsDepthCopy(context, destination, source): the depth surface and its HTILE surface copied as raw
 /// dwords with the device's copy shader, two dispatches (the buffer copy of CsCopyBufferDwords), with event and scratch
 /// label fences in between. With execution: two copy records, the fields the function sets at its end, nothing else.
@@ -3266,7 +3480,28 @@ u64 PS4_SYSV_ABI MeasureHtileClear(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 
     return dcb ? RunAndMeasure(emit_stats[5], "HtileClear", dcb, dcb, a1, a2, a3, a4, a5, 4) : 0;
 }
 u64 PS4_SYSV_ABI MeasureCopyResource(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return ctx ? RunAndMeasure(emit_stats[3], "CopyResource", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5) : 0;
+    if (ctx == 0) {
+        return 0;
+    }
+    static std::mutex mutex;
+    static std::map<std::tuple<u32, u32, u64>, u32> shapes; ///< dimension, format, caller -> calls
+    static std::atomic<u64> last_report{0};
+    if (a1 >= 0x200000000ull && a1 < 0x400000000ull) {
+        std::lock_guard lock{mutex};
+        const u32 dimension = Rd<u32>(a1, 0x124);
+        ++shapes[{dimension, dimension == 2 ? Rd<u32>(a1, 0x18c) : (dimension == 3 || dimension == 4) ? Rd<u32>(a1, 0x190) : 0,
+                  ret - ImageBase() + 0x1000000}];
+        const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_report.load() >= 5000) {
+            last_report.store(now);
+            for (const auto& [key, calls] : shapes) {
+                LOG_INFO(Core, "CopyResource per 5 s: dimension {} format {} caller {:#x}: {} calls", std::get<0>(key), std::get<1>(key),
+                         std::get<2>(key), calls);
+            }
+            shapes.clear();
+        }
+    }
+    return RunAndMeasure(emit_stats[3], "CopyResource", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5);
 }
 u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     return ctx ? RunAndMeasure(emit_stats[4], "ExCsDepthCopy", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5) : 0;
@@ -3366,6 +3601,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "measure_excs_depth_copy") {
         return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
+    }
+    if (name == "tag_copy_resource") {
+        return reinterpret_cast<u64>(&TagCopyResource);
     }
     if (name == "tag_excs_depth_copy") {
         return reinterpret_cast<u64>(&TagExCsDepthCopy);

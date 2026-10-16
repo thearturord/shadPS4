@@ -9,6 +9,7 @@
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_resources.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -1346,7 +1347,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    if (size >= (8u << 20)) {
+                        static std::atomic<u32> logged{0};
+                        if (logged.fetch_add(1) < 6) {
+                            LOG_INFO(Render_Vulkan, "stage {:#x} (user data {}) writes {} bytes at {:#x} through a storage buffer", stage.pgm_hash,
+                                     stage.user_data.size(), size, vsharp.base_address);
+                        }
+                    }
+                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size, "a written storage buffer view");
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -1766,7 +1774,46 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ++recorded_work;
 }
 
+bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
+    const auto src_id = texture_cache.FindImageFromRange(src, num_bytes);
+    if (!src_id) {
+        Core::NativeResources::NoteImageCopy(false, 0);
+        return false;
+    }
+    const auto dst_id = texture_cache.FindImageFromRange(dst, num_bytes, false);
+    if (!dst_id || dst_id == src_id) {
+        Core::NativeResources::NoteImageCopy(false, 1);
+        return false;
+    }
+    auto& source = texture_cache.GetImage(src_id);
+    auto& destination = texture_cache.GetImage(dst_id);
+    const auto& a = source.info;
+    const auto& b = destination.info;
+    const bool same_layout =
+        a.guest_address == src && b.guest_address == dst && a.guest_size == num_bytes && b.guest_size == num_bytes &&
+        a.pixel_format == b.pixel_format && a.type == b.type && a.size.width == b.size.width &&
+        a.size.height == b.size.height && a.size.depth == b.size.depth && a.resources.levels == b.resources.levels &&
+        a.resources.layers == b.resources.layers && a.num_samples == 1 && b.num_samples == 1 && a.tile_mode == b.tile_mode &&
+        a.array_mode == b.array_mode && a.num_bits == b.num_bits && a.pitch == b.pitch;
+    if (!same_layout) {
+        Core::NativeResources::NoteImageCopy(false, 2);
+        return false;
+    }
+    // images at the destination's address in other formats are stale afterwards
+    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, "an image copy");
+    texture_cache.UpdateImage(src_id);
+    runtime.CopyImage(&source, &destination);
+    destination.flags |= VideoCore::ImageFlagBits::GpuModified;
+    destination.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    ++recorded_work;
+    Core::NativeResources::NoteImageCopy(true, 0);
+    return true;
+}
+
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (!dst_gds && !src_gds && Core::NativeResources::ImageCopyEnabled() && TryCopyImages(dst, src, num_bytes)) {
+        return;
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -1776,7 +1823,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, "a memory copy");
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {
@@ -1811,6 +1858,7 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
 
 bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     Core::DebugServer::NoteWriteFault(addr);
+    Core::NativeResources::NoteCpuWrite(addr, size);
 #ifdef ARCH_X86_64
     Core::GuestHooks::NoteWriteFault(addr, size);
 #endif

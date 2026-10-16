@@ -24,6 +24,7 @@
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_resources.h"
 #include "video_core/native_draw_tag.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
@@ -571,6 +572,9 @@ struct NativeRecord {
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
+    u64 copy_destination{}; ///< a dispatch of the device's buffer copy shader (CsCopyBufferDwords): what it copies
+    u64 copy_source{};
+    u32 copy_bytes{};
     u32 fixed_stale{}; ///< FixedStateStale groups the draw does not write (the hardware keeps what it holds)
     const Vulkan::FixedState* fixed{}; ///< draw records: the fixed-function state built from the engine's objects (null: from the registers)
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
@@ -670,7 +674,10 @@ thread_local u64 table_seq;
 thread_local u32 table_used;
 thread_local bool table_overflow;
 
+NativeRecord& Slot(u64 seq);
+
 void BeginTables(u64 seq) {
+    Slot(seq).copy_bytes = 0;
     table_seq = seq;
     table_used = 0;
     table_overflow = false;
@@ -2029,6 +2036,11 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller, 
     slot.caller = caller;
     slot.a1 = (static_cast<u32>(bytes) + 3) >> 2;
     slot.a2 = 1;
+    if (!async_context) {
+        slot.copy_destination = destination;
+        slot.copy_source = source;
+        slot.copy_bytes = static_cast<u32>(bytes);
+    }
     slot.rt_info = 0;
     slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
     slot.ps_gnm = 0;
@@ -2942,6 +2954,11 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
     // a fast clear eliminate is not an ordinary draw: it keeps the register based classification
+    if (slot.kind == 3 && slot.copy_bytes != 0) {
+        out.copy_destination = slot.copy_destination;
+        out.copy_source = slot.copy_source;
+        out.copy_bytes = slot.copy_bytes;
+    }
     out.fixed = slot.kind == 4 ? nullptr : slot.fixed;
     out.fixed_stale = slot.fixed_stale;
     return slot.seq.load(std::memory_order_acquire) == seq;
@@ -4843,7 +4860,45 @@ u64 PS4_SYSV_ABI ProbeIndirect(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
 
 } // namespace
 
+/// JsDevice::CreateBuffer(device, description, initial data, out): the buffer is complete when the original returns.
+u64 PS4_SYSV_ABI ResourceBufferCreated(u64 device, u64 description, u64 initial, u64 out, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("ResourceBufferCreate");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    reinterpret_cast<GuestFunction6>(original)(device, description, initial, out, a4, a5);
+    if (out != 0) {
+        NativeResources::NoteBufferObject(Guarded([&] { return Rd<u64>(out, 0); }));
+    }
+    return 1;
+}
+
+/// JsTexture initialization (this, description, initial data): the object is read later.
+u64 PS4_SYSV_ABI ResourceTextureInit(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeResources::NoteTextureObject(object);
+    return 0;
+}
+
+u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    NativeResources::NoteBufferDestroyed(object);
+    return 0;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "resource_buffer_created") {
+        return reinterpret_cast<u64>(&ResourceBufferCreated);
+    }
+    if (name == "resource_texture_init") {
+        return reinterpret_cast<u64>(&ResourceTextureInit);
+    }
+    if (name == "resource_buffer_destroyed") {
+        return reinterpret_cast<u64>(&ResourceBufferDestroyed);
+    }
     if (name == "draw_probe_indexed") {
         return reinterpret_cast<u64>(&ProbeIndexed);
     }
@@ -4952,6 +5007,10 @@ u64 FindHandler(const std::string& name) {
 LiveCounters& Live() {
     static LiveCounters counters;
     return counters;
+}
+
+u64 EngineDevice() {
+    return ResolveDevice().device;
 }
 
 bool IsGuarded() {

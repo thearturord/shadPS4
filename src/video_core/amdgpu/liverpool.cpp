@@ -17,6 +17,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/native_draw.h"
+#include "core/native_resources.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -714,6 +715,17 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         MirrorRegs(Regs::ContextRegWordOffset + 0x8e, 1);
         regs.reg_array[Regs::ContextRegWordOffset + 0x0] = 0;
         MirrorRegs(Regs::ContextRegWordOffset + 0x0, 1);
+        return;
+    }
+    if (draw.kind == 3 && draw.copy_bytes != 0 && asc_vqid == ~0u && Core::NativeResources::ImageCopyEnabled()) {
+        // the device's buffer copy shader: a memory copy (two images of the same layout are copied as images)
+        native_tag_pending.valid = false;
+        if (rasterizer) {
+            RasterRun(
+                [this, destination = static_cast<VAddr>(draw.copy_destination), source = static_cast<VAddr>(draw.copy_source),
+                 bytes = draw.copy_bytes] { rasterizer->CopyBuffer(destination, source, bytes, false, false); },
+                false, true);
+        }
         return;
     }
     if (draw.kind == 3 || draw.kind == 11) {

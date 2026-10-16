@@ -117,6 +117,8 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    /// The memory copy of two images that live on the GPU with the same layout is an image copy.
+    bool TryCopyImages(VAddr dst, VAddr src, u32 num_bytes);
     /// Clears the depth / stencil target the registers describe (native depth clear record).
     void ClearDepthStencilTarget();
     u32 ReadDataFromGds(u32 gsd_offset);

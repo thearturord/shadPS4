@@ -227,6 +227,13 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// Bytes the last SynchronizeMemory of this thread copied from guest memory (resource census).
+    static inline thread_local u64 last_upload_bytes{};
+public:
+    /// True when the last ObtainBufferForImage of this thread read GPU written memory (the data came from the arena, not from guest memory).
+    static inline thread_local bool last_image_source_gpu{};
+private:
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;

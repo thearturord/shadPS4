@@ -46,6 +46,9 @@ struct LiveCounters {
 };
 LiveCounters& Live();
 
+/// The engine's JsDevice (0 until known).
+u64 EngineDevice();
+
 void SetImageBase(VAddr base);
 /// Load address of the game's main module (0 until known).
 VAddr ImageBase();
@@ -88,6 +91,9 @@ struct ExecDraw {
     bool has_extents{};
     u32 a1{}; ///< kind 6 (buffer fill): number of dwords; start_index holds the value, args_addr the destination
     bool cb_extents_only{}; ///< fast clear eliminate: only the render target extents change
+    u64 copy_destination{}; ///< dispatches of the device's buffer copy shader: the memory copy it performs (null: not one)
+    u64 copy_source{};
+    u32 copy_bytes{};
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
 };

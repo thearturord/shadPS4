@@ -1013,6 +1013,8 @@ if (ARCHITECTURE STREQUAL "x86_64")
              src/core/guest_hooks.cpp
              src/core/guest_hooks.h
              src/core/native_draw.cpp
+             src/core/native_resources.cpp
+             src/core/native_resources.h
              src/core/native_draw.h
              src/core/debug_server.cpp
              src/core/debug_server.h

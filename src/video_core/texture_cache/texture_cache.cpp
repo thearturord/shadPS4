@@ -10,6 +10,7 @@
 #include "common/hash.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/native_resources.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/readback_batch.h"
 #include "video_core/page_manager.h"
@@ -232,12 +233,19 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     }
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, const char* by) {
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // TODO: Maybe also consider subresources
         if (image.info.guest_address != address) {
             return;
+        }
+        if (image.info.guest_size > (8u << 20)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 12) {
+                LOG_INFO(Render_Vulkan, "large image {:#x} + {:#x} ({}x{}) made GPU dirty by {} ({} bytes written)", address,
+                         image.info.guest_size, image.info.size.width, image.info.size.height, by, max_size);
+            }
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
@@ -903,6 +911,8 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    Core::NativeResources::NoteImageUpload(image.info.guest_address, image.info.guest_size,
+                                           BufferCache::last_image_source_gpu);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

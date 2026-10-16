@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/native_resources.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -605,6 +606,25 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size) {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    // An immutable engine buffer (see NativeResources::ImmutableBuffer): after one synchronization of the whole buffer it is
+    // read straight from the arena.
+    if (!is_written && !is_texel_buffer && Core::NativeResources::ImmutableResidencyEnabled()) {
+        if (auto* immutable = Core::NativeResources::FindImmutable(device_addr, size)) {
+            if (immutable->synced.load(std::memory_order_acquire) && !Core::NativeResources::ImmutableCheck(*immutable)) {
+                const auto* arena = GetArena(device_addr >> block_shift, (device_addr + size - 1) >> block_shift);
+                Core::NativeResources::NoteImmutableHit();
+                return {arena, arena->Offset(device_addr)};
+            }
+            const u32 generation = immutable->generation.load(std::memory_order_acquire);
+            const u32 whole = static_cast<u32>(immutable->end - immutable->begin);
+            const auto* arena = GetArena(immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
+            EnsureResident(arena, immutable->begin >> block_shift, (immutable->end - 1) >> block_shift);
+            SynchronizeMemory(arena, immutable->begin, whole, false, false);
+            Core::NativeResources::ImmutableSynced(*immutable, generation);
+            Core::NativeResources::NoteImmutableSync();
+            return {arena, arena->Offset(device_addr)};
+        }
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
@@ -621,12 +641,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                 stream_reuse_min = ~0ULL;
                 stream_reuse_max = 0;
             } else if (const auto it = stream_reuse.find(reuse_key); it != stream_reuse.end()) {
+                Core::NativeResources::NoteBufferRequest(device_addr, size, false,
+                                                         Core::NativeResources::BufferPath::StreamReuse, 0);
                 return {&stream_buffer, it->second};
             }
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        Core::NativeResources::NoteBufferRequest(device_addr, size, false,
+                                                 Core::NativeResources::BufferPath::StreamCopy, size);
         if (stream_reuse_enabled && stream_buffer.WrapCount() == stream_reuse_wraps) {
             stream_reuse.emplace(reuse_key, offset);
             stream_reuse_min = std::min<VAddr>(stream_reuse_min, device_addr);
@@ -647,6 +671,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         epoch_before = memory_tracker->Epoch() + range_epoch.load(std::memory_order_acquire);
         if (memo->addr == device_addr && memo->size == size && memo->flags == (is_written ? 1u : 0u) &&
             memo->epoch == epoch_before && memo->tick == scheduler.CurrentTick()) {
+            Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
+                                                     Core::NativeResources::BufferPath::Memo, 0);
             return {memo->arena, memo->offset};
         }
 
@@ -655,7 +681,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
+    last_upload_bytes = 0;
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    Core::NativeResources::NoteBufferRequest(device_addr, size, is_written,
+                                             Core::NativeResources::BufferPath::Arena, last_upload_bytes);
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
@@ -670,8 +699,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
+        last_image_source_gpu = true;
         return ObtainBuffer(device_addr, size, false);
     }
+    last_image_source_gpu = false;
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
@@ -874,6 +905,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     } else {
         memory_tracker->ForEachUploadRange(device_addr, size, is_written, add_copy);
     }
+    last_upload_bytes += total_size_bytes;
     if (!copies.empty()) {
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {

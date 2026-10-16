@@ -17,6 +17,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "core/debug_server.h"
+#include "core/native_resources.h"
 #include "core/memory.h"
 #include "core/native_draw.h"
 #include "video_core/readback_policy.h"
@@ -335,6 +336,13 @@ void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
     Register("/native", "native renderer counters (cumulative)", Native);
+    Register("/resources", "?start=1 turns the resource census on; the engine's GPU memory blocks and who uses, uploads and writes them",
+             [](const Params& params) {
+                 if (ParseNumber(params, "start", 0) != 0) {
+                     Core::NativeResources::Start();
+                 }
+                 return Core::NativeResources::Report();
+             });
     Register("/threads", "CPU use of the busiest threads since the previous call", Threads);
     Register("/memory", "?addr=0x..&size=N (max 65536): guest memory as hex", Memory);
     Register("/log", "?lines=N&filter=text&file=shad_log.txt: tail of a log file", Log);

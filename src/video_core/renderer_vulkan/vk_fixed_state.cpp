@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <string_view>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
@@ -113,8 +114,8 @@ void FillViewports(FixedState& out, const AmdGpu::DrawRegs& regs) {
 void FillDepthStencil(FixedState& out, const AmdGpu::DrawRegs& regs) {
     out.depth_target = regs.depth_buffer.DepthValid();
     out.depth_test = regs.depth_control.depth_enable;
-    out.depth_write =
-        regs.depth_control.depth_write_enable && !regs.depth_render_control.depth_clear_enable;
+    out.depth_write = regs.depth_control.depth_write_enable;
+    out.depth_clear = regs.depth_render_control.depth_clear_enable;
     out.depth_compare = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
     out.depth_bounds_test = regs.depth_control.depth_bounds_enable;
     out.depth_bounds_min = regs.depth_bounds_min;
@@ -145,7 +146,7 @@ void FillDepthStencil(FixedState& out, const AmdGpu::DrawRegs& regs) {
                                  }
                                : out.stencil_front_ops;
 
-    const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
+    out.stencil_clear = regs.depth_render_control.stencil_clear_enable;
     const auto front = regs.stencil_ref_front;
     const auto back =
         regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
@@ -176,29 +177,15 @@ void FillDepthStencil(FixedState& out, const AmdGpu::DrawRegs& regs) {
     }
     out.stencil_reference = {front_op ? front.stencil_op_val : front.stencil_test_val,
                              back_op ? back.stencil_op_val : back.stencil_test_val};
-    out.stencil_write_mask = {!stencil_clear ? front.stencil_write_mask : 0U,
-                              !stencil_clear ? back.stencil_write_mask : 0U};
+    out.stencil_write_mask = {front.stencil_write_mask, back.stencil_write_mask};
     out.stencil_compare_mask = {front.stencil_mask, back.stencil_mask};
 }
 
 void FillPrimitive(FixedState& out, const AmdGpu::DrawRegs& regs) {
-    const auto topology = regs.primitive_type != AmdGpu::PrimitiveType::None
-                              ? LiverpoolToVK::PrimitiveType(regs.primitive_type)
-                              : vk::PrimitiveTopology::ePatchList;
-    out.list_topology = topology == vk::PrimitiveTopology::ePointList ||
-                        topology == vk::PrimitiveTopology::eLineList ||
-                        topology == vk::PrimitiveTopology::eTriangleList ||
-                        topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
-                        topology == vk::PrimitiveTopology::eTriangleListWithAdjacency;
-    // Quad and rect lists are emulated using tessellation.
-    out.patch_list_topology = regs.primitive_type == AmdGpu::PrimitiveType::PatchPrimitive ||
-                              regs.primitive_type == AmdGpu::PrimitiveType::QuadList ||
-                              regs.primitive_type == AmdGpu::PrimitiveType::RectList;
+    SetFixedStateTopology(out, regs.primitive_type,
+                          LiverpoolToVK::CullMode(regs.polygon_control.CullingMode()));
     out.primitive_restart = (regs.enable_primitive_restart & 1) != 0;
     out.primitive_restart_index = regs.primitive_restart_index;
-    out.cull_mode = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type)
-                        ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
-                        : vk::CullModeFlagBits::eNone;
     out.front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
     out.rasterizer_discard = regs.clipper_control.dx_rasterization_kill;
     out.line_width = regs.line_control.Width();
@@ -241,6 +228,132 @@ void FillPipelineState(FixedState& out, const AmdGpu::DrawRegs& regs) {
 }
 
 } // namespace
+
+void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode) {
+    const auto topology = type != AmdGpu::PrimitiveType::None
+                              ? LiverpoolToVK::PrimitiveType(type)
+                              : vk::PrimitiveTopology::ePatchList;
+    out.list_topology = topology == vk::PrimitiveTopology::ePointList ||
+                        topology == vk::PrimitiveTopology::eLineList ||
+                        topology == vk::PrimitiveTopology::eTriangleList ||
+                        topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
+                        topology == vk::PrimitiveTopology::eTriangleListWithAdjacency;
+    // Quad and rect lists are emulated using tessellation.
+    out.patch_list_topology = type == AmdGpu::PrimitiveType::PatchPrimitive ||
+                              type == AmdGpu::PrimitiveType::QuadList ||
+                              type == AmdGpu::PrimitiveType::RectList;
+    out.cull_mode = LiverpoolToVK::IsPrimitiveCulled(type) ? cull_mode : vk::CullModeFlagBits::eNone;
+}
+
+void TakeFromRegisters(FixedState& out, const AmdGpu::DrawRegs& regs, u32 groups) {
+    if ((groups & StaleSurface) != 0) {
+        SetFixedStateTopology(out, regs.primitive_type,
+                              LiverpoolToVK::CullMode(regs.polygon_control.CullingMode()));
+        out.front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
+        out.polygon_mode = LiverpoolToVK::PolygonMode(regs.polygon_control.PolyMode());
+        out.provoking_first =
+            regs.polygon_control.provoking_vtx_last == AmdGpu::ProvokingVtxLast::First;
+    }
+    if ((groups & StaleClear) != 0) {
+        out.depth_clear = regs.depth_render_control.depth_clear_enable;
+        out.stencil_clear = regs.depth_render_control.stencil_clear_enable;
+    }
+    if ((groups & StaleClip) != 0) {
+        out.depth_clip = regs.clipper_control.ZclipEnable();
+        out.negative_one_to_one = regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
+        out.rasterizer_discard = regs.clipper_control.dx_rasterization_kill;
+        out.clip_disabled = regs.IsClipDisabled();
+    }
+}
+
+const FixedState& DefaultFixedState() {
+    static const FixedState state = [] {
+        AmdGpu::DrawRegs regs{};
+        regs.SetDefaults();
+        regs.primitive_type = AmdGpu::PrimitiveType::TriangleList;
+        return MakeFixedState(regs);
+    }();
+    return state;
+}
+
+std::string DiffFixedState(const FixedState& a, const FixedState& b) {
+    std::string out;
+    const auto note = [&](bool differs, std::string_view name) {
+        if (differs) {
+            out += name;
+            out += ' ';
+        }
+    };
+    const auto same_rects = [&] {
+        for (u32 i = 0; i < a.viewport_count && i < b.viewport_count; ++i) {
+            if (a.scissors[i] != b.scissors[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto same_viewports = [&] {
+        for (u32 i = 0; i < a.viewport_count && i < b.viewport_count; ++i) {
+            if (a.viewports[i] != b.viewports[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    note(a.viewport_count != b.viewport_count, "viewport_count");
+    note(!same_viewports(), "viewports");
+    note(!same_rects(), "scissors");
+    note(a.clip_disabled != b.clip_disabled, "clip_disabled");
+    note(a.depth_target != b.depth_target, "depth_target");
+    note(a.depth_test != b.depth_test, "depth_test");
+    note(a.depth_write != b.depth_write, "depth_write");
+    note(a.depth_clear != b.depth_clear, "depth_clear");
+    note(a.depth_compare != b.depth_compare, "depth_compare");
+    note(a.depth_bounds_test != b.depth_bounds_test, "depth_bounds_test");
+    note(a.depth_bounds_test && (a.depth_bounds_min != b.depth_bounds_min ||
+                                 a.depth_bounds_max != b.depth_bounds_max),
+         "depth_bounds");
+    note(a.depth_bias != b.depth_bias, "depth_bias");
+    note(a.depth_bias && (a.depth_bias_constant != b.depth_bias_constant ||
+                          a.depth_bias_clamp != b.depth_bias_clamp ||
+                          a.depth_bias_slope != b.depth_bias_slope),
+         "depth_bias_values");
+    note(a.stencil_target != b.stencil_target, "stencil_target");
+    note(a.stencil_test != b.stencil_test, "stencil_test");
+    note(a.stencil_clear != b.stencil_clear, "stencil_clear");
+    note(a.stencil_front_ops != b.stencil_front_ops, "stencil_front_ops");
+    note(a.stencil_back_ops != b.stencil_back_ops, "stencil_back_ops");
+    note(a.stencil_reference != b.stencil_reference, "stencil_reference");
+    note(a.stencil_write_mask != b.stencil_write_mask, "stencil_write_mask");
+    note(a.stencil_compare_mask != b.stencil_compare_mask, "stencil_compare_mask");
+    note(a.primitive_restart != b.primitive_restart, "primitive_restart");
+    note(a.primitive_restart_index != b.primitive_restart_index, "primitive_restart_index");
+    note(a.list_topology != b.list_topology, "list_topology");
+    note(a.patch_list_topology != b.patch_list_topology, "patch_list_topology");
+    note(a.rasterizer_discard != b.rasterizer_discard, "rasterizer_discard");
+    note(a.cull_mode != b.cull_mode,
+         "cull_mode(" + vk::to_string(a.cull_mode) + " vs " + vk::to_string(b.cull_mode) + ")");
+    note(a.front_face != b.front_face,
+         "front_face(" + vk::to_string(a.front_face) + " vs " + vk::to_string(b.front_face) + ")");
+    note(a.list_topology != b.list_topology || a.patch_list_topology != b.patch_list_topology,
+         "topology_class");
+    note(a.line_width != b.line_width, "line_width");
+    note(a.blend_constants != b.blend_constants, "blend_constants");
+    note(a.color_enabled != b.color_enabled, "color_enabled");
+    note(a.target_write_mask != b.target_write_mask, "target_write_mask");
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        note(!(a.blend[i] == b.blend[i]), "blend" + std::to_string(i));
+    }
+    note(a.alpha_not_exported != b.alpha_not_exported, "alpha_not_exported");
+    note(a.logic_op_enabled != b.logic_op_enabled, "logic_op_enabled");
+    note(a.logic_op_enabled && a.logic_op != b.logic_op, "logic_op");
+    note(a.polygon_mode != b.polygon_mode, "polygon_mode");
+    note(a.depth_clamp != b.depth_clamp, "depth_clamp");
+    note(a.depth_clip != b.depth_clip, "depth_clip");
+    note(a.negative_one_to_one != b.negative_one_to_one, "negative_one_to_one");
+    note(a.provoking_first != b.provoking_first, "provoking_first");
+    return out;
+}
 
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs) {
     FixedState out;

@@ -366,6 +366,17 @@ void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state)
     }
 }
 
+/// Registers whose only reader is the translation to the fixed-function state (blend, stencil, depth range of the viewport,
+/// screen scissor, pixel shader colour mask).
+static bool IsFixedStateRegister(u32 index) {
+    if (index < Regs::ContextRegWordOffset) {
+        return false;
+    }
+    const u32 reg = index - Regs::ContextRegWordOffset;
+    return (reg >= 0x1e0 && reg <= 0x1e7) || (reg >= 0x105 && reg <= 0x108) || (reg >= 0x10b && reg <= 0x10d) ||
+           reg == 0xb4 || reg == 0xb5 || reg == 0xc || reg == 0xd || reg == 0x8f;
+}
+
 void Liverpool::OverlaySet(u32 index, u32 value) {
     u32* const word = front_state.Word(index);
     if (word == nullptr || *word == value) {
@@ -614,7 +625,8 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                              .instance_sgpr_offset = call.instance_sgpr_offset,
                                              .is_indirect = true}
                 : Vulkan::DrawIndirectParams{};
-        op.draw_plan = rasterizer->PlanDraw(front_state, params);
+        op.draw_plan = rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale,
+                                                  native_fixed_verify);
     }
     RasterPush(std::move(op), false);
     if (sp.verify && sp.verify_reports < 20 && std::memcmp(&sp.state, &front_state, sizeof(DrawRegs)) != 0) {
@@ -755,8 +767,18 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     // The record goes straight into the draw state (and the raster thread's deltas), not through the register file: the
     // next draw writes only what differs, and a draw of the packet path first gets back what its own packets wrote.
-    // Registers no member of the draw state covers are not needed by anything and are skipped.
+    // Registers no member of the draw state covers are not needed by anything and are skipped. The registers of the
+    // fixed-function state the draw carries in Vulkan terms are only needed to compare the two descriptions (the first
+    // draws, then every 256th).
+    native_fixed_verify = true;
+    if (draw.fixed) {
+        const u64 n = native_fixed_draws++;
+        native_fixed_verify = n < 200000 || (n & 255) == 0;
+    }
     for (u32 i = 0; i < draw.count; ++i) {
+        if (!native_fixed_verify && IsFixedStateRegister(draw.regs[i].index)) {
+            continue;
+        }
         OverlaySet(draw.regs[i].index, draw.regs[i].value);
     }
     OverlaySet(static_cast<u32>(&regs.draw_initiator - regs.reg_array.data()), 0);
@@ -781,7 +803,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         call.index_offset = draw.start_index;
     }
     native_exec_scope = true;
+    native_fixed = draw.fixed;
+    native_fixed_stale = draw.fixed_stale;
     RasterDispatch(call);
+    native_fixed = nullptr;
     native_exec_scope = false;
     if (draw.cb_extents_only) {
         // the fast clear eliminate registers (color control in eliminate mode) must not reach the next draw

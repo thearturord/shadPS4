@@ -16,6 +16,10 @@
 // PrepareDraw. These handlers read the context's object pointers at the draw entry points. The first
 // handlers only measure (how much of the draw state changes from one draw to the next); the native path
 // builds on the same reading code. Layout of the context and the objects: documents/tlg/spike/js_ctx_state.h.
+namespace Vulkan {
+struct FixedState;
+}
+
 namespace Core::NativeDraw {
 
 /// Address of the host function registered under `name` (a PS4_SYSV_ABI function taking
@@ -33,6 +37,8 @@ struct LiveCounters {
     std::atomic<u64> compute_tags{}, compute_exec{};
     std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{}, device_begin_stripped{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
+    /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
+    std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};
     /// command packets by the group of the last native tag: 0 none, 1 executed draw, 2 packet-path draw, 3 executed
     /// dispatch, 4 packet-path dispatch, 5 fast clear eliminate
     std::array<std::atomic<u64>, 6> packets{};
@@ -82,6 +88,8 @@ struct ExecDraw {
     bool has_extents{};
     u32 a1{}; ///< kind 6 (buffer fill): number of dwords; start_index holds the value, args_addr the destination
     bool cb_extents_only{}; ///< fast clear eliminate: only the render target extents change
+    const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
+    u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
 };
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).

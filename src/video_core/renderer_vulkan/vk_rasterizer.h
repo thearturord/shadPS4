@@ -67,8 +67,11 @@ public:
 
     /// Command processor thread: looks the pipeline up for `regs`. Returns null for draws that
     /// FilterDraw handles without a pipeline (the raster thread repeats that decision).
+    /// `native` is the fixed-function state the native path built from the engine's objects (null: built from `regs`).
     [[nodiscard]] std::unique_ptr<DrawPlan> PlanDraw(const AmdGpu::DrawRegs& regs,
-                                                     DrawIndirectParams params);
+                                                     DrawIndirectParams params,
+                                                     const FixedState* native = nullptr,
+                                                     u32 native_stale = 0, bool verify = true);
     [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on

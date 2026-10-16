@@ -25,6 +25,8 @@
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "video_core/native_draw_tag.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/readback_policy.h"
 #include "video_core/untracked_ring.h"
 #include "core/memory.h"
@@ -569,6 +571,8 @@ struct NativeRecord {
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
+    u32 fixed_stale{}; ///< FixedStateStale groups the draw does not write (the hardware keeps what it holds)
+    const Vulkan::FixedState* fixed{}; ///< draw records: the fixed-function state built from the engine's objects (null: from the registers)
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
     u32 unsupported_mask{};   ///< those types, bit per type
     std::array<SynthReg, MaxSynthRegs> regs{};
@@ -1368,6 +1372,273 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
     return n;
 }
 
+// ---- native fixed-function state --------------------------------------------------------------------------------------
+// The engine's blend, rasterizer and depth-stencil state objects keep the D3D11-style description they were created
+// from (JsBlendState / JsRasterizerState / JsDepthStencilState, description at object + 0x30). The fixed-function state
+// of a draw is built from those descriptions in Vulkan terms; nothing of it passes through register bits. States are
+// interned by the inputs they were built from: a draw whose objects did not change gets the same pointer.
+namespace Fixed {
+
+constexpr std::array<vk::BlendFactor, 19> BlendFactors{
+    vk::BlendFactor::eZero,
+    vk::BlendFactor::eOne,
+    vk::BlendFactor::eSrcColor,
+    vk::BlendFactor::eOneMinusSrcColor,
+    vk::BlendFactor::eSrcAlpha,
+    vk::BlendFactor::eOneMinusSrcAlpha,
+    vk::BlendFactor::eDstAlpha,
+    vk::BlendFactor::eOneMinusDstAlpha,
+    vk::BlendFactor::eDstColor,
+    vk::BlendFactor::eOneMinusDstColor,
+    vk::BlendFactor::eSrcAlphaSaturate,
+    vk::BlendFactor::eConstantColor,
+    vk::BlendFactor::eOneMinusConstantColor,
+    vk::BlendFactor::eConstantAlpha,
+    vk::BlendFactor::eOneMinusConstantAlpha,
+    vk::BlendFactor::eSrc1Color,
+    vk::BlendFactor::eOneMinusSrc1Color,
+    vk::BlendFactor::eSrc1Alpha,
+    vk::BlendFactor::eOneMinusSrc1Alpha,
+};
+constexpr std::array<vk::BlendOp, 5> BlendOps{vk::BlendOp::eAdd, vk::BlendOp::eSubtract, vk::BlendOp::eReverseSubtract,
+                                              vk::BlendOp::eMin, vk::BlendOp::eMax};
+constexpr std::array<vk::StencilOp, 8> StencilOps{
+    vk::StencilOp::eKeep,
+    vk::StencilOp::eZero,
+    vk::StencilOp::eReplace,
+    vk::StencilOp::eIncrementAndClamp,
+    vk::StencilOp::eDecrementAndClamp,
+    vk::StencilOp::eInvert,
+    vk::StencilOp::eIncrementAndWrap,
+    vk::StencilOp::eDecrementAndWrap,
+};
+/// The engine's comparison functions are 1 based (never .. always).
+constexpr std::array<vk::CompareOp, 9> CompareOps{
+    vk::CompareOp::eNever,        vk::CompareOp::eNever,   vk::CompareOp::eLess,
+    vk::CompareOp::eEqual,        vk::CompareOp::eLessOrEqual, vk::CompareOp::eGreater,
+    vk::CompareOp::eNotEqual,     vk::CompareOp::eGreaterOrEqual, vk::CompareOp::eAlways,
+};
+
+template <typename T, size_t N>
+bool Pick(const std::array<T, N>& table, u32 index, T& out, u32 first = 0) {
+    if (index < first || index >= N) {
+        return false;
+    }
+    out = table[index];
+    return true;
+}
+
+constexpr u32 KeyWords = 24;
+struct Entry {
+    std::array<u64, KeyWords> key{};
+    std::unique_ptr<Vulkan::FixedState> state;
+};
+std::mutex mutex;
+std::unordered_multimap<u64, std::unique_ptr<Entry>> states;
+
+/// True when the fixed-function state is built from the objects (bit 15 of native_sdk_strip).
+bool Enabled() {
+    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 32768) != 0;
+}
+
+/// The fixed-function state of the draw the context describes, or null when an object is not what the builder knows.
+/// `stale` receives the groups the draw's own state writes leave to the hardware: the engine writes the rasterizer
+/// registers only while its state is dirty and PA_SU_SC_MODE_CNTL only when its cached copy differs.
+const Vulkan::FixedState* Build(u64 ctx, const DeviceAddresses& dev, u32& stale) {
+    stale = 0;
+    u64 blend = Rd<u64>(ctx, Ctx::BlendState);
+    u64 raster = Rd<u64>(ctx, Ctx::RasterizerState);
+    u64 ds = Rd<u64>(ctx, Ctx::DepthStencilState);
+    if (blend == 0) {
+        blend = Rd<u64>(dev.device, 0x30280);
+    }
+    if (raster == 0) {
+        raster = Rd<u64>(dev.device, 0x30278);
+    }
+    if (ds == 0) {
+        ds = Rd<u64>(dev.device, 0x30288);
+    }
+    if (blend == 0 || raster == 0 || ds == 0 || dev.topology_table == 0) {
+        return nullptr;
+    }
+    if (Rd<u8>(ctx, 0x46d8) == 0) {
+        stale = Vulkan::StaleSurface | Vulkan::StaleClip;
+    } else if (Rd<u32>(ctx, 0x46d0) == Rd<u32>(raster, 0x4c)) {
+        stale = Vulkan::StaleSurface;
+    }
+    const u64 dsv = Rd<u64>(ctx, Ctx::DepthStencilView);
+    const u32 dsv_flags = dsv ? Rd<u32>(dsv, 0x48) : 0;
+    const u64 dsv_block = dsv ? dsv + 0x58 : 0;
+    const u32 topology = Rd<u32>(ctx, Ctx::Topology);
+    const u64 ps = Rd<u64>(ctx, Ctx::PixelShader);
+    const u64 ps_gnm = ps ? Rd<u64>(ps, 0x120) : 0;
+    const u32 ps_mask = ps_gnm ? Rd<u32>(ps_gnm + 8, 44) : 0xfu;
+    const bool target7 = Rd<u64>(ctx, 0x130e0) != 0;
+    const u32 stencil_ref = Rd<u8>(ctx, Ctx::StencilRef);
+
+    std::array<u64, KeyWords> key{};
+    key[0] = blend;
+    key[1] = Rd<u64>(blend, 0x10);
+    key[2] = raster;
+    key[3] = Rd<u64>(raster, 0x10);
+    key[4] = ds;
+    key[5] = Rd<u64>(ds, 0x10);
+    key[6] = stencil_ref | u64(topology) << 8 | u64(target7) << 40 | u64(dsv != 0) << 41;
+    key[7] = dsv_flags | u64(ps_mask) << 32;
+    key[8] = dsv_block ? Rd<u64>(dsv_block, 0) : 0;
+    key[9] = dsv_block ? Rd<u64>(dsv_block, 8) : 0;
+    key[10] = dsv_block ? Rd<u32>(dsv_block, 8 * 4) | u64(Rd<u32>(dsv_block, 12 * 4)) << 32 : 0;
+    for (u32 i = 0; i < 4; ++i) {
+        key[11 + i] = Rd<u32>(ctx, Ctx::BlendFactor + i * 4);
+    }
+    for (u32 i = 0; i < 6; ++i) {
+        key[15 + i] = Rd<u32>(ctx, Ctx::Viewport + i * 4);
+    }
+    u64 hash = 0xcbf29ce484222325ull;
+    for (const u64 word : key) {
+        hash = (hash ^ word) * 0x100000001b3ull;
+    }
+    std::lock_guard lock{mutex};
+    for (auto [it, end] = states.equal_range(hash); it != end; ++it) {
+        if (it->second->key == key) {
+            return it->second->state.get();
+        }
+    }
+    if (states.size() >= 16384) {
+        return nullptr;
+    }
+
+    Vulkan::FixedState s = Vulkan::DefaultFixedState();
+    // what the driver's default state block sets once and the engine never changes: colour writes on, no logic op,
+    // lines one pixel wide
+    s.color_enabled = true;
+    s.logic_op_enabled = false;
+    s.logic_op = vk::LogicOp::eCopy;
+    s.line_width = 1.0f;
+    // blend: D3D11_BLEND_DESC (alpha to coverage byte at +0x30, independent blend byte at +0x31, then a render target
+    // description of 32 bytes per target from +0x34)
+    const bool independent = Rd<u8>(blend, 0x31) != 0;
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        const u64 rt = blend + 0x34 + u64(independent ? i : 0) * 0x20;
+        auto& out = s.blend[i];
+        out = {};
+        if (Rd<u8>(rt, 0) != 0) {
+            out.enable = 1;
+            if (!Pick(BlendFactors, Rd<u32>(rt, 4), out.src_color) || !Pick(BlendFactors, Rd<u32>(rt, 8), out.dst_color) ||
+                !Pick(BlendOps, Rd<u32>(rt, 12), out.color_op) || !Pick(BlendFactors, Rd<u32>(rt, 16), out.src_alpha) ||
+                !Pick(BlendFactors, Rd<u32>(rt, 20), out.dst_alpha) || !Pick(BlendOps, Rd<u32>(rt, 24), out.alpha_op)) {
+                return nullptr;
+            }
+        }
+        s.target_write_mask[i] = target7 && i == 7 ? 0xf : static_cast<u8>(Rd<u8>(rt, 0x1c) & 0xf);
+        if ((ps_mask >> (i * 4) & 8) == 0) {
+            s.alpha_not_exported |= 1u << i;
+        } else {
+            s.alpha_not_exported &= ~(1u << i);
+        }
+    }
+    for (u32 i = 0; i < 4; ++i) {
+        s.blend_constants[i] = Rd<float>(ctx, Ctx::BlendFactor + i * 4);
+    }
+    // rasterizer: D3D11_RASTERIZER_DESC (fill, cull, front counter clockwise, bias values, depth clip)
+    {
+        const u32 fill = Rd<u32>(raster, 0x30);
+        const u32 cull = Rd<u32>(raster, 0x34);
+        const bool counter_clockwise = Rd<u8>(raster, 0x38) != 0;
+        s.polygon_mode = fill == 2 ? vk::PolygonMode::eLine : vk::PolygonMode::eFill;
+        s.front_face = counter_clockwise ? vk::FrontFace::eCounterClockwise : vk::FrontFace::eClockwise;
+        s.depth_clip = Rd<u8>(raster, 0x48) != 0;
+        const vk::CullModeFlags cull_mode = cull == 2   ? vk::CullModeFlagBits::eFront
+                                            : cull == 3 ? vk::CullModeFlagBits::eBack
+                                                        : vk::CullModeFlagBits::eNone;
+        const u32 prim_code = topology < 10 ? (Rd<u32>(dev.topology_table, topology * 4) & 0x3f) : 9u;
+        const auto prim = static_cast<AmdGpu::PrimitiveType>(prim_code);
+        if (prim == AmdGpu::PrimitiveType::None) {
+            return nullptr;
+        }
+        Vulkan::SetFixedStateTopology(s, prim, cull_mode);
+        s.clip_disabled = prim == AmdGpu::PrimitiveType::RectList;
+    }
+    // depth-stencil: D3D11_DEPTH_STENCIL_DESC as dwords (depth enable, write mask, function; stencil enable / read mask /
+    // write mask packed in dword 3; front operations and function at 4..7, back at 8..11)
+    {
+        const u64 d = ds + 0x30;
+        s.depth_test = Rd<u32>(d, 0) != 0;
+        s.depth_write = (Rd<u32>(d, 4) & 1) != 0;
+        if ((dsv_flags & 1) != 0) {
+            // a depth view bound for read-only use writes no depth and replaces the comparison with the one the engine
+            // keeps for it
+            s.depth_write = false;
+            const u32 index = Rd<u32>(d, 8);
+            if (dev.depth_stencil_table == 0) {
+                return nullptr;
+            }
+            s.depth_compare = Vulkan::LiverpoolToVK::CompareOp(
+                static_cast<AmdGpu::CompareFunc>(Rd<u32>(dev.depth_stencil_table, index * 4) & 7));
+        } else if (!Pick(CompareOps, Rd<u32>(d, 8), s.depth_compare, 1)) {
+            return nullptr;
+        }
+        const u32 stencil = Rd<u32>(d, 12);
+        s.stencil_test = (stencil & 1) != 0;
+        auto& front = s.stencil_front_ops;
+        auto& back = s.stencil_back_ops;
+        if (!Pick(StencilOps, Rd<u32>(d, 16), front.fail_op) || !Pick(StencilOps, Rd<u32>(d, 20), front.depth_fail_op) ||
+            !Pick(StencilOps, Rd<u32>(d, 24), front.pass_op) || !Pick(CompareOps, Rd<u32>(d, 28), front.compare_op, 1) ||
+            !Pick(StencilOps, Rd<u32>(d, 32), back.fail_op) || !Pick(StencilOps, Rd<u32>(d, 36), back.depth_fail_op) ||
+            !Pick(StencilOps, Rd<u32>(d, 40), back.pass_op) || !Pick(CompareOps, Rd<u32>(d, 44), back.compare_op, 1)) {
+            return nullptr;
+        }
+        s.stencil_reference = {stencil_ref, stencil_ref};
+        const u32 write_mask = (dsv_flags & 2) != 0 ? 0u : ((stencil >> 16) & 0xff);
+        s.stencil_write_mask = {write_mask, write_mask};
+        s.stencil_compare_mask = {(stencil >> 8) & 0xff, (stencil >> 8) & 0xff};
+        // the targets of the depth view: format bits of its depth / stencil info words and a non-zero base address
+        const bool block = dsv_block != 0 && (Rd<u32>(dsv_block, 8 * 4) != 0 || Rd<u32>(dsv_block, 12 * 4) != 0);
+        s.depth_target = block && Rd<u32>(dsv_block, 2 * 4) != 0 && (Rd<u32>(dsv_block, 0) & 3) != 0;
+        s.stencil_target = block && Rd<u32>(dsv_block, 3 * 4) != 0 && (Rd<u32>(dsv_block, 4) & 1) != 0;
+    }
+    // viewport (the context's rectangle and depth range) and the scissor the pipeline derives from it
+    {
+        const float x = Rd<float>(ctx, Ctx::Viewport + 0);
+        const float y = Rd<float>(ctx, Ctx::Viewport + 4);
+        const float w = Rd<float>(ctx, Ctx::Viewport + 8);
+        const float h = Rd<float>(ctx, Ctx::Viewport + 12);
+        const float z_near = Rd<float>(ctx, Ctx::Viewport + 16);
+        const float z_far = Rd<float>(ctx, Ctx::Viewport + 20);
+        const auto to_u32 = [](float f) { return static_cast<u32>(static_cast<s64>(f)); };
+        const u32 left = to_u32(x);
+        const u32 top = to_u32(y);
+        const u32 right = to_u32(x + w);
+        const u32 bottom = to_u32(y + h);
+        const float height = static_cast<float>(static_cast<s32>(bottom) - static_cast<s32>(top));
+        s.viewport_count = 1;
+        s.viewports[0] = vk::Viewport{
+            .x = static_cast<float>(left),
+            .y = static_cast<float>(top) + height,
+            .width = static_cast<float>(static_cast<s32>(right - left)),
+            .height = -height,
+            .minDepth = z_near,
+            .maxDepth = z_near + (z_far - z_near),
+        };
+        AmdGpu::Scissor scissor{};
+        scissor.top_left_x = static_cast<s16>(left);
+        scissor.top_left_y = static_cast<s16>(top);
+        scissor.bottom_right_x = static_cast<s16>(right);
+        scissor.bottom_right_y = static_cast<s16>(bottom);
+        s.scissors[0] = vk::Rect2D{.offset = {scissor.top_left_x, scissor.top_left_y},
+                                   .extent = {scissor.GetWidth(), scissor.GetHeight()}};
+    }
+
+    auto entry = std::make_unique<Entry>();
+    entry->key = key;
+    entry->state = std::make_unique<Vulkan::FixedState>(s);
+    const Vulkan::FixedState* result = entry->state.get();
+    states.emplace(hash, std::move(entry));
+    return result;
+}
+
+} // namespace Fixed
+
 NativeRecord& Slot(u64 seq) {
     std::call_once(records_once, [] { records = std::make_unique<NativeRecord[]>(RecordSlots); });
     return records[seq % RecordSlots];
@@ -1386,6 +1657,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     synth_reason = 0;
     synth_cb_extent_mask = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
+    slot.fixed = nullptr;
+    if (kind <= 2 && Fixed::Enabled()) {
+        slot.fixed = Fixed::Build(ctx, ResolveDevice(), slot.fixed_stale);
+    }
     slot.cb_extent = synth_cb_extent;
     slot.cb_extent_mask = synth_cb_extent_mask;
     slot.db_extent = synth_db_extent;
@@ -2656,6 +2931,8 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.has_extents = slot.kind != 3;
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
+    out.fixed = slot.fixed;
+    out.fixed_stale = slot.fixed_stale;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
 

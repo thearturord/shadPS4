@@ -247,7 +247,9 @@ bool Rasterizer::FilterDraw() {
 }
 
 std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
-                                               DrawIndirectParams params) {
+                                               DrawIndirectParams params,
+                                               const FixedState* native, u32 native_stale,
+                                               bool verify) {
     // SkipShadow draws are still planned: the switch can change between the front and the raster
     // thread, and the raster thread must find a plan for every draw it does not drop.
     if (const auto kind = ClassifyDraw(regs).kind;
@@ -265,7 +267,29 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     if (!plan) {
         plan = std::make_unique<DrawPlan>();
     }
-    plan->fixed = MakeFixedState(regs);
+    if (native) {
+        // The state built from the engine's objects replaces the one built from the registers. The first draws (and
+        // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
+        auto& live = Core::NativeDraw::Live();
+        live.fixed_native.fetch_add(1, std::memory_order_relaxed);
+        // the clear flags of the render pass are register state the native path does not describe
+        native_stale |= StaleClear;
+        FixedState merged = *native;
+        TakeFromRegisters(merged, regs, native_stale);
+        const FixedState* use = &merged;
+        if (verify) {
+            plan->fixed = MakeFixedState(regs);
+            live.fixed_checked.fetch_add(1, std::memory_order_relaxed);
+            const std::string diff = DiffFixedState(*use, plan->fixed);
+            if (!diff.empty() && live.fixed_diff.fetch_add(1, std::memory_order_relaxed) < 60) {
+                LOG_INFO(Render_Vulkan, "native fixed-function state differs from the registers in: {}", diff);
+            }
+        } else {
+            plan->fixed = merged;
+        }
+    } else {
+        plan->fixed = MakeFixedState(regs);
+    }
     pipeline_cache.PlanGraphics(regs, plan->fixed, params, *plan);
     return plan;
 }
@@ -1866,7 +1890,7 @@ void Rasterizer::UpdateDepthStencilState(const FixedState& fixed) const {
     const auto depth_test_enabled = fixed.depth_test && fixed.depth_target;
     dynamic_state.SetDepthTestEnabled(depth_test_enabled);
     if (depth_test_enabled) {
-        dynamic_state.SetDepthWriteEnabled(fixed.depth_write);
+        dynamic_state.SetDepthWriteEnabled(fixed.depth_write && !fixed.depth_clear);
         dynamic_state.SetDepthCompareOp(fixed.depth_compare);
     }
 
@@ -1886,7 +1910,8 @@ void Rasterizer::UpdateDepthStencilState(const FixedState& fixed) const {
     if (stencil_test_enabled) {
         dynamic_state.SetStencilOps(fixed.stencil_front_ops, fixed.stencil_back_ops);
         dynamic_state.SetStencilReferences(fixed.stencil_reference[0], fixed.stencil_reference[1]);
-        dynamic_state.SetStencilWriteMasks(fixed.stencil_write_mask[0], fixed.stencil_write_mask[1]);
+        dynamic_state.SetStencilWriteMasks(fixed.stencil_clear ? 0U : fixed.stencil_write_mask[0],
+                                           fixed.stencil_clear ? 0U : fixed.stencil_write_mask[1]);
         dynamic_state.SetStencilCompareMasks(fixed.stencil_compare_mask[0],
                                              fixed.stencil_compare_mask[1]);
     }

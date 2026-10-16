@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <string>
 #include "video_core/amdgpu/draw_state.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -36,6 +37,7 @@ struct FixedState {
     bool depth_target{}; ///< a depth target is bound
     bool depth_test{};
     bool depth_write{};
+    bool depth_clear{}; ///< the draw clears the depth target (the render pass state; no depth write then)
     vk::CompareOp depth_compare{};
     bool depth_bounds_test{};
     float depth_bounds_min{};
@@ -47,10 +49,11 @@ struct FixedState {
 
     bool stencil_target{}; ///< a stencil target is bound
     bool stencil_test{};
+    bool stencil_clear{}; ///< the draw clears the stencil target (the write masks are zero then)
     StencilOps stencil_front_ops{};
     StencilOps stencil_back_ops{};
     std::array<u32, 2> stencil_reference{};    ///< front, back
-    std::array<u32, 2> stencil_write_mask{};   ///< front, back (already zero while the stencil is being cleared)
+    std::array<u32, 2> stencil_write_mask{};   ///< front, back
     std::array<u32, 2> stencil_compare_mask{}; ///< front, back
 
     bool primitive_restart{};
@@ -90,5 +93,26 @@ struct FixedState {
 
 /// The packet path: the fixed-function state of the draw described by `regs`.
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs);
+
+/// Hardware state the engine only rewrites when its own cache says it changed: a draw that does not write the group runs
+/// with what the hardware holds, which is not necessarily what the engine's objects say (the register file models that).
+enum FixedStateStale : u32 {
+    StaleSurface = 1, ///< PA_SU_SC_MODE_CNTL: culling, front face, polygon mode
+    StaleClip = 2,    ///< PA_CL_CLIP_CNTL: depth clip, clip space, rasterizer discard
+    StaleClear = 4,   ///< DB_RENDER_CONTROL: the depth / stencil clear flags of the render pass
+};
+
+/// Replaces the fields of the given groups with what the register state `regs` holds.
+void TakeFromRegisters(FixedState& out, const AmdGpu::DrawRegs& regs, u32 groups);
+
+/// The state of a draw whose registers hold their defaults (the base the native path starts from).
+const FixedState& DefaultFixedState();
+
+/// Sets the topology dependent fields: list / patch classification and culling (only primitives that have faces are
+/// culled; `cull_mode` is what the rasterizer state asks for).
+void SetFixedStateTopology(FixedState& out, AmdGpu::PrimitiveType type, vk::CullModeFlags cull_mode);
+
+/// Names of the fields in which two states differ, separated by spaces (empty when they are equal).
+std::string DiffFixedState(const FixedState& a, const FixedState& b);
 
 } // namespace Vulkan

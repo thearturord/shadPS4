@@ -34,6 +34,7 @@ namespace Vulkan {
 class Rasterizer;
 struct DrawPlan;
 struct DispatchPlan;
+struct FixedState;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
@@ -284,6 +285,10 @@ private:
     };
     NativeOverlay overlay;
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
+    u32 native_fixed_stale{};
+    bool native_fixed_verify{};
+    u64 native_fixed_draws{};
+    const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
     void OverlaySet(u32 index, u32 value);
     void PushDelta(u32 index, u32 value);
     void OverlayRestore();

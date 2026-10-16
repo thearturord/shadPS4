@@ -21,6 +21,7 @@
 #include "video_core/readback_policy.h"
 #include "video_core/readback_stats.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -265,7 +266,16 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         plan = std::make_unique<DrawPlan>();
     }
     pipeline_cache.PlanGraphics(regs, params, *plan);
+    plan->fixed = MakeFixedState(regs);
     return plan;
+}
+
+const FixedState& Rasterizer::FixedFor(const DrawPlan* plan, FixedState& storage) const {
+    if (plan) {
+        return plan->fixed;
+    }
+    storage = MakeFixedState(liverpool->RasterRegs());
+    return storage;
 }
 
 namespace {
@@ -520,6 +530,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (!pipeline) {
         return;
     }
+    FixedState fixed_storage;
+    const FixedState& fixed = FixedFor(plan, fixed_storage);
     const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
@@ -543,7 +555,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
     if (same_dynamic_state) {
         ++native_stats.dynamic_skipped;
     } else {
-        UpdateDynamicState(pipeline, is_indexed);
+        UpdateDynamicState(pipeline, is_indexed, fixed);
     }
     scheduler.BeginRendering(state);
 
@@ -595,6 +607,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+    FixedState fixed_storage;
+    const FixedState& fixed = FixedFor(plan, fixed_storage);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -626,7 +640,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     pipeline->BindResources(set_writes, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, fixed);
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1806,87 +1820,29 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const FixedState& fixed) const {
+    UpdateViewportScissorState(fixed);
+    UpdateDepthStencilState(fixed);
+    UpdatePrimitiveState(is_indexed, fixed);
+    UpdateRasterizationState(fixed);
+    UpdateColorBlendingState(pipeline, fixed);
 
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 
-void Rasterizer::UpdateViewportScissorState() const {
-    const auto& regs = liverpool->RasterRegs();
-
-    const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const auto combined_scissor_value_br = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
-        return std::min({scr, s16(win + win_offset), s16(gen + win_offset)});
-    };
-    const bool enable_offset = !regs.window_scissor.window_offset_disable;
-
-    AmdGpu::Scissor scsr{};
-    scsr.top_left_x = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_x, s16(regs.window_scissor.top_left_x),
-        s16(regs.generic_scissor.top_left_x),
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.top_left_y = combined_scissor_value_tl(
-        regs.screen_scissor.top_left_y, s16(regs.window_scissor.top_left_y),
-        s16(regs.generic_scissor.top_left_y),
-        enable_offset ? regs.window_offset.window_y_offset : 0);
-    scsr.bottom_right_x = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_x, regs.window_scissor.bottom_right_x,
-        regs.generic_scissor.bottom_right_x,
-        enable_offset ? regs.window_offset.window_x_offset : 0);
-    scsr.bottom_right_y = combined_scissor_value_br(
-        regs.screen_scissor.bottom_right_y, regs.window_scissor.bottom_right_y,
-        regs.generic_scissor.bottom_right_y,
-        enable_offset ? regs.window_offset.window_y_offset : 0);
-
-    boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
-    boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
-
-    if (regs.polygon_control.enable_window_offset &&
-        (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
-        LOG_ERROR(Render_Vulkan,
-                  "PA_SU_SC_MODE_CNTL.VTX_WINDOW_OFFSET_ENABLE support is not yet implemented.");
-    }
-
-    const auto& vp_ctl = regs.viewport_control;
-    for (u32 i = 0; i < AmdGpu::NUM_VIEWPORTS; i++) {
-        const auto& vp = regs.viewports[i];
-        const auto& vp_d = regs.viewport_depths[i];
-        if (vp.xscale == 0) {
-            continue;
-        }
-
-        const auto zoffset = vp_ctl.zoffset_enable ? vp.zoffset : 0.f;
-        const auto zscale = vp_ctl.zscale_enable ? vp.zscale : 1.f;
-
-        vk::Viewport viewport{};
-
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_pipeline_graphics.c#L688-689
-        // https://gitlab.freedesktop.org/mesa/mesa/-/blob/209a0ed/src/amd/vulkan/radv_cmd_buffer.c#L3103-3109
-        // When the clip space is ranged [-1...1], the zoffset is centered.
-        // By reversing the above viewport calculations, we get the following:
-        if (regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW) {
-            viewport.minDepth = zoffset - zscale;
-            viewport.maxDepth = zoffset + zscale;
-        } else {
-            viewport.minDepth = zoffset;
-            viewport.maxDepth = zoffset + zscale;
-        }
-
+void Rasterizer::UpdateViewportScissorState(const FixedState& fixed) const {
+    Viewports viewports;
+    Scissors scissors;
+    for (u32 i = 0; i < fixed.viewport_count; i++) {
+        vk::Viewport viewport = fixed.viewports[i];
         if (!instance.IsDepthRangeUnrestrictedSupported()) {
             // Unrestricted depth range not supported by device. Restrict to valid range.
             viewport.minDepth = std::max(viewport.minDepth, 0.f);
             viewport.maxDepth = std::min(viewport.maxDepth, 1.f);
         }
-
-        if (regs.IsClipDisabled()) {
+        if (fixed.clip_disabled) {
             // In case if clipping is disabled we patch the shader to convert vertex position
             // from screen space coordinates to NDC by defining a render space as full hardware
             // window range [0..16383, 0..16383] and setting the viewport to its size.
@@ -1894,53 +1850,9 @@ void Rasterizer::UpdateViewportScissorState() const {
             viewport.y = 0.f;
             viewport.width = float(std::min<u32>(instance.GetMaxViewportWidth(), 16_KB));
             viewport.height = float(std::min<u32>(instance.GetMaxViewportHeight(), 16_KB));
-        } else {
-            const auto xoffset = vp_ctl.xoffset_enable ? vp.xoffset : 0.f;
-            const auto xscale = vp_ctl.xscale_enable ? vp.xscale : 1.f;
-            const auto yoffset = vp_ctl.yoffset_enable ? vp.yoffset : 0.f;
-            const auto yscale = vp_ctl.yscale_enable ? vp.yscale : 1.f;
-
-            viewport.x = xoffset - xscale;
-            viewport.y = yoffset - yscale;
-            viewport.width = xscale * 2.0f;
-            viewport.height = yscale * 2.0f;
         }
-
         viewports.push_back(viewport);
-
-        auto vp_scsr = scsr;
-        if (regs.mode_control.vport_scissor_enable) {
-            vp_scsr.top_left_x =
-                std::max(vp_scsr.top_left_x, s16(regs.viewport_scissors[i].top_left_x));
-            vp_scsr.top_left_y =
-                std::max(vp_scsr.top_left_y, s16(regs.viewport_scissors[i].top_left_y));
-            vp_scsr.bottom_right_x = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_x),
-                                              regs.viewport_scissors[i].bottom_right_x);
-            vp_scsr.bottom_right_y = std::min(AmdGpu::Scissor::Clamp(vp_scsr.bottom_right_y),
-                                              regs.viewport_scissors[i].bottom_right_y);
-        }
-        scissors.push_back({
-            .offset = {vp_scsr.top_left_x, vp_scsr.top_left_y},
-            .extent = {vp_scsr.GetWidth(), vp_scsr.GetHeight()},
-        });
-    }
-
-    if (viewports.empty()) {
-        // Vulkan requires providing at least one viewport.
-        constexpr vk::Viewport empty_viewport = {
-            .x = -1.0f,
-            .y = -1.0f,
-            .width = 1.0f,
-            .height = 1.0f,
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f,
-        };
-        constexpr vk::Rect2D empty_scissor = {
-            .offset = {0, 0},
-            .extent = {1, 1},
-        };
-        viewports.push_back(empty_viewport);
-        scissors.push_back(empty_scissor);
+        scissors.push_back(fixed.scissors[i]);
     }
 
     auto& dynamic_state = scheduler.GetDynamicState();
@@ -1948,137 +1860,63 @@ void Rasterizer::UpdateViewportScissorState() const {
     dynamic_state.SetScissors(scissors);
 }
 
-void Rasterizer::UpdateDepthStencilState() const {
-    const auto& regs = liverpool->RasterRegs();
+void Rasterizer::UpdateDepthStencilState(const FixedState& fixed) const {
     auto& dynamic_state = scheduler.GetDynamicState();
 
-    const auto depth_test_enabled =
-        regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
+    const auto depth_test_enabled = fixed.depth_test && fixed.depth_target;
     dynamic_state.SetDepthTestEnabled(depth_test_enabled);
     if (depth_test_enabled) {
-        dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
-                                           !regs.depth_render_control.depth_clear_enable);
-        dynamic_state.SetDepthCompareOp(LiverpoolToVK::CompareOp(regs.depth_control.depth_func));
+        dynamic_state.SetDepthWriteEnabled(fixed.depth_write);
+        dynamic_state.SetDepthCompareOp(fixed.depth_compare);
     }
 
-    const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
-    dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
-    if (depth_bounds_test_enabled) {
-        dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
+    dynamic_state.SetDepthBoundsTestEnabled(fixed.depth_bounds_test);
+    if (fixed.depth_bounds_test) {
+        dynamic_state.SetDepthBounds(fixed.depth_bounds_min, fixed.depth_bounds_max);
     }
 
-    const auto depth_bias_enabled = regs.polygon_control.NeedsBias();
-    dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
-    if (depth_bias_enabled) {
-        const bool front = regs.polygon_control.enable_polygon_offset_front;
-        dynamic_state.SetDepthBias(
-            front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset,
-            regs.poly_offset.depth_bias,
-            (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
+    dynamic_state.SetDepthBiasEnabled(fixed.depth_bias);
+    if (fixed.depth_bias) {
+        dynamic_state.SetDepthBias(fixed.depth_bias_constant, fixed.depth_bias_clamp,
+                                   fixed.depth_bias_slope);
     }
 
-    const auto stencil_test_enabled =
-        regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
+    const auto stencil_test_enabled = fixed.stencil_test && fixed.stencil_target;
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
-        const StencilOps front_ops{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_front),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_front),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_ref_func),
-        };
-        const StencilOps back_ops = regs.depth_control.backface_enable ? StencilOps{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_back),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_back),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
-        } : front_ops;
-        dynamic_state.SetStencilOps(front_ops, back_ops);
-
-        const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        const auto front = regs.stencil_ref_front;
-        const auto back =
-            regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
-        const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
-        };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
-            regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
-            return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
-                   ref.stencil_test_val != ref.stencil_op_val;
-        };
-        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
-            (back_op && regs.depth_control.backface_enable &&
-             ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
-        }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
-        dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
+        dynamic_state.SetStencilOps(fixed.stencil_front_ops, fixed.stencil_back_ops);
+        dynamic_state.SetStencilReferences(fixed.stencil_reference[0], fixed.stencil_reference[1]);
+        dynamic_state.SetStencilWriteMasks(fixed.stencil_write_mask[0], fixed.stencil_write_mask[1]);
+        dynamic_state.SetStencilCompareMasks(fixed.stencil_compare_mask[0],
+                                             fixed.stencil_compare_mask[1]);
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
-    const auto& regs = liverpool->RasterRegs();
+void Rasterizer::UpdatePrimitiveState(const bool is_indexed, const FixedState& fixed) const {
     auto& dynamic_state = scheduler.GetDynamicState();
-
-    const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
-        const auto topology = LiverpoolToVK::PrimitiveType(type);
-        return topology == vk::PrimitiveTopology::ePointList ||
-               topology == vk::PrimitiveTopology::eLineList ||
-               topology == vk::PrimitiveTopology::eTriangleList ||
-               topology == vk::PrimitiveTopology::eLineListWithAdjacency ||
-               topology == vk::PrimitiveTopology::eTriangleListWithAdjacency;
-    };
-    const auto is_patch_list_topology = [](const AmdGpu::PrimitiveType type) {
-        // Quad and rect lists are emulated using tessellation.
-        return type == AmdGpu::PrimitiveType::PatchPrimitive ||
-               type == AmdGpu::PrimitiveType::QuadList || type == AmdGpu::PrimitiveType::RectList;
-    };
 
     const auto prim_restart =
-        (regs.enable_primitive_restart & 1) != 0 &&
-        (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
-        (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
-    ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||
-                   regs.primitive_restart_index == 0xFFFFFFFF,
+        fixed.primitive_restart && (instance.IsListRestartSupported() || !fixed.list_topology) &&
+        (instance.IsPatchListRestartSupported() || !fixed.patch_list_topology);
+    ASSERT_MSG(!is_indexed || !prim_restart || fixed.primitive_restart_index == 0xFFFF ||
+                   fixed.primitive_restart_index == 0xFFFFFFFF,
                "Primitive restart index other than -1 is not supported yet");
 
-    const auto cull_mode = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type)
-                               ? LiverpoolToVK::CullMode(regs.polygon_control.CullingMode())
-                               : vk::CullModeFlagBits::eNone;
-    const auto front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
-
     dynamic_state.SetPrimitiveRestartEnabled(prim_restart);
-    dynamic_state.SetRasterizerDiscardEnabled(regs.clipper_control.dx_rasterization_kill);
-    dynamic_state.SetCullMode(cull_mode);
-    dynamic_state.SetFrontFace(front_face);
+    dynamic_state.SetRasterizerDiscardEnabled(fixed.rasterizer_discard);
+    dynamic_state.SetCullMode(fixed.cull_mode);
+    dynamic_state.SetFrontFace(fixed.front_face);
 }
 
-void Rasterizer::UpdateRasterizationState() const {
-    const auto& regs = liverpool->RasterRegs();
+void Rasterizer::UpdateRasterizationState(const FixedState& fixed) const {
     auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetLineWidth(regs.line_control.Width());
+    dynamic_state.SetLineWidth(fixed.line_width);
 }
 
-void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
-    const auto& regs = liverpool->RasterRegs();
+void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline,
+                                          const FixedState& fixed) const {
     auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetBlendConstants(regs.blend_constants);
+    dynamic_state.SetBlendConstants(fixed.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
     dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
 }

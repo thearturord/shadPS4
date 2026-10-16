@@ -15,6 +15,7 @@
 #include "shader_recompiler/specialization.h"
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/texture_cache/image_info.h"
@@ -103,6 +104,7 @@ struct StagePlan {
 
 struct DrawPlan {
     const GraphicsPipeline* pipeline{}; ///< Null if the pipeline lookup failed.
+    FixedState fixed{};
     std::array<StagePlan, MaxShaderStages> stages{};
 };
 

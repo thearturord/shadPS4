@@ -30,6 +30,7 @@ namespace Vulkan {
 
 class GraphicsPipeline;
 class Runtime;
+struct FixedState;
 
 class Rasterizer {
 public:
@@ -180,12 +181,14 @@ private:
     /// Clears the bound depth / stencil target to the clear values of the registers (native replacement of the SDK's clear quad).
     void ClearDepthTarget();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
-    void UpdateViewportScissorState() const;
-    void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
-    void UpdateRasterizationState() const;
-    void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
+    const FixedState& FixedFor(const DrawPlan* plan, FixedState& storage) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            const FixedState& fixed) const;
+    void UpdateViewportScissorState(const FixedState& fixed) const;
+    void UpdateDepthStencilState(const FixedState& fixed) const;
+    void UpdatePrimitiveState(bool is_indexed, const FixedState& fixed) const;
+    void UpdateRasterizationState(const FixedState& fixed) const;
+    void UpdateColorBlendingState(const GraphicsPipeline* pipeline, const FixedState& fixed) const;
 
     bool FilterDraw();
     const GraphicsPipeline* ResolveDrawPipeline(const DrawPlan* plan,

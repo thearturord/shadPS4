@@ -554,6 +554,7 @@ struct NativeRecord {
     u32 instance_sgpr{};
     u32 rt_info{};
     u32 flags{}; ///< RecordFlag bits: why this draw cannot run natively
+    u32 reason{}; ///< Reason bits of the special pipeline flag (diagnostics, see Reason)
     /// Tables the user data points to (extended user data, descriptor tables): built in `address`, compared by
     /// content with what the register `reg` points to in the packet path's state.
     struct TableCheck {
@@ -570,6 +571,20 @@ struct NativeRecord {
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
     u32 unsupported_mask{};   ///< those types, bit per type
     std::array<SynthReg, MaxSynthRegs> regs{};
+};
+
+/// Why a record is flagged as a special pipeline (diagnostics only).
+enum Reason : u32 {
+    ReasonVsVariant = 1,        ///< vertex shader has a variant object at +0x420
+    ReasonCtx4680 = 2,
+    ReasonCtx4688 = 4,
+    ReasonDispatchDraw = 8,     ///< ctx + 0x130c8 == 0x200
+    ReasonIndirectView = 16,    ///< indirect draw without index buffer view / arguments
+    ReasonIndexType = 32,       ///< index type of the context is not the usual one
+    ReasonUnsupportedInput = 64,
+    ReasonTableOverflow = 128,
+    ReasonBadObject = 256,
+    ReasonNoFetchObject = 512,
 };
 
 enum RecordFlag : u32 {
@@ -825,6 +840,7 @@ std::array<u64, 2> UsedSlots(const ShaderLoads& loads, u32 sgpr, u32 entry_dword
 }
 
 thread_local u32 synth_flags;
+thread_local u32 synth_reason;
 thread_local u32 inline_instances; ///< instance count the game set before an inlined draw (0 = the draw functions' reset to 1)
 thread_local std::array<u32, 8> synth_cb_extent;
 thread_local u32 synth_cb_extent_mask;
@@ -1257,6 +1273,8 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             if (Rd<u64>(vs, 0x420) != 0 || Rd<u64>(ctx, 0x4680) != 0 || Rd<u64>(ctx, 0x4688) != 0 ||
                 Rd<u32>(ctx, 0x130c8) == 0x200) {
                 synth_flags |= SpecialPipeline;
+                synth_reason |= (Rd<u64>(vs, 0x420) != 0 ? ReasonVsVariant : 0u) | (Rd<u64>(ctx, 0x4680) != 0 ? ReasonCtx4680 : 0u) |
+                                (Rd<u64>(ctx, 0x4688) != 0 ? ReasonCtx4688 : 0u) | (Rd<u32>(ctx, 0x130c8) == 0x200 ? ReasonDispatchDraw : 0u);
             }
             dbg_vs = vs;
             dbg_fetch = fetch_obj;
@@ -1272,6 +1290,7 @@ u32 Synthesize(u64 ctx, SynthReg* out, u64* vs_gnm_out, u64* ps_gnm_out) {
             // their first draw).
             if (takes_fetch_shader && fetch_obj == 0) {
                 synth_flags |= NoFetchObject;
+                synth_reason |= ReasonNoFetchObject;
             }
             // PrepareDraw binds the vertex shader only when (shader, modifier, fetch address) differ from the cached
             // ones, and a bind merges the modifier into the first resource word when it is not zero. A register file
@@ -1363,6 +1382,7 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
     slot.unsupported_inputs = 0;
     slot.unsupported_mask = 0;
     synth_flags = 0;
+    synth_reason = 0;
     synth_cb_extent_mask = 0;
     slot.count = Synthesize(ctx, slot.regs.data(), &slot.vs_gnm, &slot.ps_gnm);
     slot.cb_extent = synth_cb_extent;
@@ -1396,8 +1416,10 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
         if (kind == 2) {
             // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
             // base vertex / start instance (nibbles of a byte in the vertex shader)
-            if (const u64 view = Rd<u64>(ctx, 0x58); view != 0 && a1 != 0 && slot.vs_gnm != 0 &&
-                                                       Rd<u32>(ctx, 0x4acc) == 0) {
+            // ctx + 0x4acc (the stage configuration) is what PrepareDraw sets next: 0 for a vertex / pixel pipeline,
+            // which is the case when no tessellation or geometry stage is bound
+            if (const u64 view = Rd<u64>(ctx, 0x58); view != 0 && a1 != 0 && slot.vs_gnm != 0 && Rd<u64>(ctx, 0x4680) == 0 &&
+                                                       Rd<u64>(ctx, 0x4688) == 0) {
                 slot.regs[n++] = {ContextBase + 0x1fa, Rd<u32>(view, 0x60) & 0xfffffffeu};
                 slot.regs[n++] = {ContextBase + 0x1f9, Rd<u32>(view, 0x64) & 0xff};
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
@@ -1410,9 +1432,12 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 slot.instance_sgpr = (locations >> 4) == 0 ? 0 : (locations >> 4) + VertexStageSgprBase;
                 if (Rd<u32>(ctx, 0x60) != 0x39) {
                     slot.flags |= SpecialPipeline;
+                    synth_reason |= ReasonIndexType;
                 }
             } else {
                 slot.flags |= SpecialPipeline;
+                synth_reason |= ReasonIndirectView | (Rd<u64>(ctx, 0x58) == 0 ? 0x1000u : 0u) | (a1 == 0 ? 0x2000u : 0u) |
+                                (slot.vs_gnm == 0 ? 0x4000u : 0u) | (Rd<u64>(ctx, 0x4680) != 0 || Rd<u64>(ctx, 0x4688) != 0 ? 0x8000u : 0u);
             }
         }
         if (kind == 0) {
@@ -1422,14 +1447,17 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 slot.regs[n++] = {ContextBase + 0x102, Rd<u32>(ctx, 0x64)};
                 if (Rd<u32>(ctx, 0x60) != 0x39) {
                     slot.flags |= SpecialPipeline;
+                    synth_reason |= ReasonIndexType;
                 }
             }
             slot.regs[n++] = {ContextBase + 0x29e, static_cast<u32>(a1)};
         }
         if (slot.unsupported_inputs != 0) {
             slot.flags |= SpecialPipeline;
+            synth_reason |= ReasonUnsupportedInput;
         }
         slot.count = n;
+        slot.reason = synth_reason | (table_overflow ? ReasonTableOverflow : 0u) | (bad_object_seen ? ReasonBadObject : 0u);
     }
     slot.seq.store(seq, std::memory_order_release);
     return seq;
@@ -1913,6 +1941,7 @@ struct VerifyStats {
     std::array<u64, 4> flag_counts{};
     std::unordered_map<u64, u64> index_type_pairs;
     std::unordered_map<u32, u64> rt_odd_info;
+    std::map<std::tuple<u64, u32, u32, u32>, u64> flagged_causes; ///< caller, flags, reason bits, unsupported input types -> draws
     std::map<std::pair<u64, bool>, u64> callers; ///< draw call return address, differs
     struct PerReg {
         u64 count{};
@@ -1957,6 +1986,8 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
     const u64 vs_gnm = slot.vs_gnm;
     const u64 ps_gnm = slot.ps_gnm;
     const u32 flags = slot.flags;
+    const u32 reason = slot.reason;
+    const u32 unsupported_types = slot.unsupported_mask;
     const u32 record_kind = slot.kind;
     const u64 caller = slot.caller;
     const u32 rt_info = slot.rt_info;
@@ -2190,6 +2221,9 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
     if (flags & OddRenderTarget) {
         ++s.rt_odd_info[rt_info];
     }
+    if (flags != 0 && record_kind != 3) {
+        ++s.flagged_causes[{caller, flags, reason, unsupported_types}];
+    }
     for (u32 bit = 0; bit < 4; ++bit) {
         s.flag_counts[bit] += (flags >> bit) & 1;
     }
@@ -2257,6 +2291,20 @@ void VerifyRecordImpl(u64 seq, const u32* reg_array, const AmdGpu::DrawRegs* map
             for (const auto& [pair, count] : s.index_type_pairs) {
                 LOG_INFO(Core, "native front end check: index type built {:#x} actual {:#x}: {} draws", pair >> 32,
                          pair & 0xffffffff, count);
+            }
+            {
+                std::vector<std::pair<u64, std::tuple<u64, u32, u32, u32>>> causes;
+                for (const auto& [key, count] : s.flagged_causes) {
+                    causes.emplace_back(count, key);
+                }
+                std::ranges::sort(causes, [](const auto& x, const auto& y) { return x.first > y.first; });
+                const VAddr image = image_base.load(std::memory_order_relaxed);
+                for (size_t k = 0; k < causes.size() && k < 14; ++k) {
+                    const auto& [caller_address, cause_flags, cause_reason, cause_types] = causes[k].second;
+                    LOG_INFO(Core, "native front end check: cannot run natively: caller {:#x} flags {:#x} reason {:#x} unsupported types {:#x}: {} draws",
+                             image ? caller_address - image + 0x1000000 : caller_address, cause_flags, cause_reason, cause_types, causes[k].first);
+                }
+                s.flagged_causes.clear();
             }
             for (const auto& [info, count] : s.rt_odd_info) {
                 LOG_INFO(Core, "native front end check: odd render targets: count {} views {:#x} empty blocks {:#x}: {} draws",

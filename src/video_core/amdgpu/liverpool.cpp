@@ -597,14 +597,13 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         LOG_ERROR(Render, "native draw: the record {} is gone, a draw is lost", native_tag_pending.seq);
         return;
     }
-    if (draw.kind == 6) {
-        // buffer fill: destination, value and the number of dwords travel in the record
+    if (draw.kind == 6 || draw.kind == 8) {
+        // buffer fill (kind 8: GDS, an append / consume counter): destination, value and the number of dwords travel in the record
         native_tag_pending.valid = false;
         if (rasterizer) {
             RasterRun(
-                [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u] {
-                    rasterizer->FillBuffer(destination, bytes, value, false);
-                },
+                [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u,
+                 gds = draw.kind == 8] { rasterizer->FillBuffer(destination, bytes, value, gds); },
                 false, true);
         }
         return;
@@ -1610,12 +1609,20 @@ void CountGameCommand(const PM4Header* header, PM4ItOpcode opcode, u32 count) {
 
 namespace {
 /// Packets the game writes to its async compute queues (per 5 s, logged).
-void CountComputeQueueCommand(PM4ItOpcode opcode) {
+void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
     static std::array<u64, 256> opcodes{};
+    static std::map<u32, u64> sh_registers; ///< SET_SH_REG writes by register offset
+    static std::map<u64, u64> set_sh_sizes;
     static u64 total = 0;
     static u64 last_log_ns = 0;
     ++opcodes[static_cast<u32>(opcode) & 255];
     ++total;
+    if (opcode == PM4ItOpcode::SetShReg) {
+        const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+        for (u32 i = 0; i + 1 < header->type3.NumWords(); ++i) {
+            ++sh_registers[set_data->reg_offset + i];
+        }
+    }
     Core::NativeDraw::Live().asc_packets.fetch_add(1, std::memory_order_relaxed);
     const u64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -1636,7 +1643,18 @@ void CountComputeQueueCommand(PM4ItOpcode opcode) {
             text += fmt::format(" {:#x}:{}", top[i].second, top[i].first);
         }
         LOG_INFO(Render, "async compute queue packets per 5 s: {} (opcode:count{})", total, text);
+        std::vector<std::pair<u64, u32>> registers;
+        for (const auto& [reg, count] : sh_registers) {
+            registers.emplace_back(count, reg);
+        }
+        std::sort(registers.rbegin(), registers.rend());
+        std::string reg_text;
+        for (size_t i = 0; i < registers.size() && i < 16; ++i) {
+            reg_text += fmt::format(" {:#x}:{}", registers[i].second, registers[i].first);
+        }
+        LOG_INFO(Render, "async compute queue set-SH registers per 5 s (offset:count):{}", reg_text);
     }
+    sh_registers.clear();
     opcodes = {};
     total = 0;
     last_log_ns = now;
@@ -2561,7 +2579,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
-        CountComputeQueueCommand(opcode);
+        CountComputeQueueCommand(header, opcode);
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {

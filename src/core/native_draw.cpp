@@ -1517,16 +1517,31 @@ u64 MakeComputeRecord(u64 ctx, u64 x, u64 y, u64 z, u64 caller) {
 /// +0x21f8, shader resource views +0x1d18, unordered access views +0x2118) are described to the shader through user
 /// data: small descriptors go straight into the user data registers, the others into a table (the engine's staging
 /// copy at +0x138 holds its content) that a register points to. Returns 0 when this dispatch needs the game's own path.
+thread_local u32 asc_fail; ///< source line of the check that made MakeAscRecord give up (diagnostics)
+
+/// Append / consume counters the dispatch initializes before it runs: the game writes the value into the GDS counter with a
+/// DMA packet; with execution a GDS fill record does.
+struct CounterInit {
+    u32 index;
+    u32 value;
+};
+thread_local std::array<CounterInit, 8> asc_counter_inits;
+thread_local u32 asc_counter_init_count;
+
 u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    asc_fail = 0;
+    asc_counter_init_count = 0;
     const u64 cs_obj = Rd<u64>(jcc, 0x1d10);
     const u64 gnm = valid(cs_obj) ? Rd<u64>(cs_obj, 0x120) : 0;
     if (!valid(cs_obj) || !valid(gnm) || Rd<u8>(jcc, 0x1c7c) == 0) {
+        asc_fail = __LINE__;
         return 0;
     }
     const u64 offs = cs_obj + 0x130;
     const u32 table_dwords = Rd<u16>(offs, 0);
     if (table_dwords > 0x600) {
+        asc_fail = __LINE__;
         return 0;
     }
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
@@ -1569,7 +1584,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         const u32 index = offset & 0x3fff;
         if ((offset & 0x8000) != 0) {
             if (index + dwords > 16) { // only 16 user data registers exist
-                ok = false;
+                ok = false; asc_fail = __LINE__;
                 return;
             }
             for (u32 k = 0; k < dwords; ++k) {
@@ -1578,7 +1593,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         } else if (index + dwords <= table_dwords) {
             std::memcpy(table + index, source, dwords * sizeof(u32));
         } else {
-            ok = false;
+            ok = false; asc_fail = __LINE__;
         }
     };
     std::array<u32, 8> descriptor;
@@ -1591,7 +1606,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         if ((mask & 1) != 0) {
             const u64 sampler = Rd<u64>(jcc, 0x2178 + index * 8);
             if (!valid(sampler)) {
-                ok = false;
+                ok = false; asc_fail = __LINE__;
                 break;
             }
             read_descriptor(sampler + 0x64, 4);
@@ -1602,7 +1617,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         if ((mask & 1) != 0) {
             const u64 buffer = Rd<u64>(jcc, 0x21f8 + index * 8);
             if (!valid(buffer)) {
-                ok = false;
+                ok = false; asc_fail = __LINE__;
                 break;
             }
             read_descriptor(buffer + 0x60, 4);
@@ -1613,7 +1628,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         if ((mask & 1) != 0) {
             const u64 view = Rd<u64>(jcc, 0x1d18 + index * 8);
             if (!valid(view)) {
-                ok = false;
+                ok = false; asc_fail = __LINE__;
                 break;
             }
             const u32 kind = Rd<u32>(view, 0x44);
@@ -1634,16 +1649,19 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         if ((mask & 1) != 0) {
             const u64 view = Rd<u64>(jcc, 0x2118 + index * 8);
             if (!valid(view)) {
-                ok = false;
+                ok = false; asc_fail = __LINE__;
                 break;
             }
             if (Rd<u32>(view, 0x44) == 1) {
                 read_descriptor(view + 0x74, 4);
                 place(Rd<u16>(offs, 0x122 + index * 2), descriptor.data(), 4);
                 if ((Rd<u8>(view, 0x50) & 2) != 0) {
-                    if (Rd<u32>(jcc, 0x2158 + index * 4) != 0xffffffffu) {
-                        ok = false; // the game initializes the append / consume counter with a packet
-                        break;
+                    if (const u32 init = Rd<u32>(jcc, 0x2158 + index * 4); init != 0xffffffffu) {
+                        if (asc_counter_init_count >= asc_counter_inits.size()) {
+                            ok = false; asc_fail = __LINE__;
+                            break;
+                        }
+                        asc_counter_inits[asc_counter_init_count++] = {index, init};
                     }
                     if (Rd<u8>(offs, 0xd) != 0xff) {
                         counter_range = Rd<u32>(jcc, 0x22f8) << 16 | 0x10;
@@ -1656,6 +1674,9 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
         }
     }
     if (!ok || table_overflow) {
+        if (asc_fail == 0) {
+            asc_fail = __LINE__;
+        }
         return 0;
     }
     // what the flush of the constant update engine puts into user data: pointers into the table and two immediates
@@ -1666,7 +1687,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
             return;
         }
         if (start + 2 > 16 || checks >= slot.checks.size()) { // outside the 16 user data registers: not a layout we know
-            ok = false;
+            ok = false; asc_fail = __LINE__;
             return;
         }
         slot.checks[checks] = {Core::NativeDraw::ComputeRegisterBase + 0x40 + start, 20 + checks, dwords, address, 0, {~0ull, ~0ull}};
@@ -1680,10 +1701,11 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
     }
     for (const u32 start : {Rd<u8>(offs, 0xc), Rd<u8>(offs, 0xd), Rd<u8>(offs, 0xe)}) {
         if (start != 0xff && start + 2 > 16) {
-            ok = false;
+            ok = false; asc_fail = __LINE__;
         }
     }
     if (!ok) {
+        asc_fail = __LINE__;
         return 0;
     }
     if (const u32 start = Rd<u8>(offs, 0xc); start != 0xff) {
@@ -1708,7 +1730,7 @@ u64 MakeAscRecord(u64 jcc, u64 x, u64 y, u64 z, u64 caller) {
 /// copy shader: the source buffer is the shader resource of slot 0, the destination the RW resource of slot 0, both
 /// described by V# words built from the addresses. No program packets are written by the game's path for this one
 /// beyond the shader bind, so the record carries the program registers too.
-u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) {
+u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller, bool async_context = false) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     BeginTables(seq);
     auto& slot = Slot(seq);
@@ -1737,7 +1759,7 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
         const auto cs_reg = [&](u32 dword, u32 value) {
             slot.regs[n++] = {Core::NativeDraw::ComputeRegisterBase + dword, value};
         };
-        cs_reg(0x00, (u32(Rd<u8>(ctx, 0x13015)) * 8 & 0x18) + 1);
+        cs_reg(0x00, async_context ? ((Rd<u8>(gnm, 0x24) & 3u) << 3) + 1 : (u32(Rd<u8>(ctx, 0x13015)) * 8 & 0x18) + 1);
         cs_reg(0x01, (words + 0x3f) >> 6);
         cs_reg(0x02, 1);
         cs_reg(0x03, 1);
@@ -1748,8 +1770,10 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
         cs_reg(0x0d, 0);
         cs_reg(0x12, Rd<u32>(regs, 8));
         cs_reg(0x13, Rd<u32>(regs, 12));
-        const std::array<u32, 4> source_descriptor{static_cast<u32>(source), static_cast<u32>(source >> 32) & 0xfff | 0x40000, words,
-                                                   0x20024004};
+        // the async context describes the source like the destination (read-write flags)
+        const std::array<u32, 4> source_descriptor{static_cast<u32>(source),
+                                                   static_cast<u32>(source >> 32) & 0xfff | (async_context ? 0x47000u : 0x40000u), words,
+                                                   async_context ? 0x18024004u : 0x20024004u};
         const std::array<u32, 4> destination_descriptor{static_cast<u32>(destination),
                                                         static_cast<u32>(destination >> 32) & 0xfff | 0x47000, words,
                                                         0x18024004};
@@ -1770,7 +1794,7 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller) 
                     cs_reg(0x40 + start + k, descriptor[k]);
                 }
             } else if (type == 26) {
-                const u64 table = Rd<u64>(ctx, 0x12f30);
+                const u64 table = Rd<u64>(ctx, async_context ? 0x118 : 0x12f30);
                 cs_reg(0x40 + start, static_cast<u32>(table));
                 cs_reg(0x40 + start + 1, static_cast<u32>(table >> 32));
             } else {
@@ -3069,6 +3093,87 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
     return 1;
 }
 
+bool ExecEligibleAsc(u64 seq, u64 caller);
+
+/// FUN_02473340(async compute context, destination, source, bytes): the async context's buffer copy, the device's copy shader
+/// with both buffers described as read-write buffers. While the record of the call site is not verified the tag precedes the
+/// game's packets; then the function is replaced by the tag.
+u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_arg, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const u64 bytes = bytes_arg & 0xffffffff;
+    if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || jcc == 0 || Rd<u8>(jcc, 0x1c7c) == 0 || bytes == 0 ||
+        bytes > (1ull << 30) || destination == 0 || source == 0 ||
+        policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 6) & 1) == 0) {
+        return 0;
+    }
+    const u64 seq = Guarded([&] { return MakeCopyRecord(jcc, destination, source, bytes, ret, true); });
+    if (seq == 0 || Slot(seq).flags != 0) {
+        return 0;
+    }
+    const bool exec = policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (3u << 8) | (exec ? ExecFlag : 0u);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    if (!exec) {
+        asc_packet_path.fetch_add(1, std::memory_order_relaxed);
+        Live().asc_packet.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    asc_drawn.fetch_add(1, std::memory_order_relaxed);
+    Live().asc_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
+using GuestFunction6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
+bool StripPackets(u64 begin, u64 end);
+
+/// JsComputeContext / JsDeviceContext::SetComputeResourceLimits (FUN_024720f0, FUN_02480ed0): one COMPUTE_RESOURCE_LIMITS
+/// register write; nothing of the host reads it.
+u64 PS4_SYSV_ABI SkipResourceLimits(u64 context, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    return context != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+                   (policy.native_sdk_strip.load(std::memory_order_relaxed) & 256) != 0
+               ? 1
+               : 0;
+}
+
+/// FUN_0246e8e0(async compute context): the start of a command buffer. The game's function resets the context and writes the
+/// cache acquire, the hardware state block and the scratch ring size; those packets are replaced by one NOP.
+u64 PS4_SYSV_ABI TagAscBegin(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (jcc == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 256) == 0) {
+        return 0;
+    }
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("AscBegin");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    reinterpret_cast<GuestFunction6>(original)(jcc, a1, a2, a3, a4, a5);
+    const u64 begin = Rd<u64>(jcc, 0x60);
+    const u64 end = Rd<u64>(jcc, 0x70);
+    if (end > begin && end - begin < 0x2000 && (begin & 3) == 0 && StripPackets(begin, end)) {
+        Live().asc_begin_stripped.fetch_add(1, std::memory_order_relaxed);
+    }
+    return 1;
+}
+
 /// JsDeviceContext::CopyResource(context, destination, destination subresource, source, source subresource) for two
 /// dimensional textures: the tracking of both resources, the switch to compute mode and one dispatch of the copy shader.
 /// While the record of the call site is not yet verified the tag is written in front of the game's own packets (they are
@@ -3249,6 +3354,7 @@ void AscSideEffects(u64 jcc, u64 x, u64 y, u64 z) {
         if ((mask & 1) != 0) {
             const u64 view = Rd<u64>(jcc, 0x2118 + index * 8);
             if (Rd<u32>(view, 0x44) == 1 && (Rd<u8>(view, 0x50) & 2) != 0) {
+                Wr<u32>(jcc, 0x2158 + index * 4, 0xffffffffu);
                 Wr<u32>(view, 0x84, index);
                 if (Rd<u8>(offs, 0xd) != 0xff) {
                     Wr<u32>(jcc, 0x1940, Rd<u32>(jcc, 0x22f8) << 16 | 0x10);
@@ -3272,23 +3378,65 @@ u64 TagAsc(u64 jcc, u64 x, u64 y, u64 z, u64 ret, bool allow_exec = true) {
     }
     const u64 seq = Guarded([&] { return MakeAscRecord(jcc, x, y, z, ret); });
     if (seq == 0) {
+        {
+            static std::mutex mutex;
+            static std::map<std::pair<u64, u32>, u64> reasons; ///< caller, source line -> dispatches
+            static u64 last_report_ms = 0;
+            std::lock_guard lock{mutex};
+            ++reasons[{ret - ImageBase() + 0x1000000, asc_fail}];
+            const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (now - last_report_ms >= 5000) {
+                last_report_ms = now;
+                for (const auto& [key, count] : reasons) {
+                    LOG_INFO(Core, "async dispatch without record per 5 s: caller {:#x} check at line {}: {} dispatches", key.first, key.second, count);
+                }
+                reasons.clear();
+            }
+        }
         asc_no_record.fetch_add(1, std::memory_order_relaxed);
         Live().asc_no_record.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
-    u32 words[2 + VideoCore::NativeTagPayloadDwords];
-    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
-    words[1] = VideoCore::NativeTagMagic;
-    words[2] = static_cast<u32>(Other) | (3u << 8);
-    std::memset(&words[3], 0, 3 * sizeof(u64));
-    std::memcpy(&words[9], &seq, sizeof(u64));
-    words[11] = 0;
-    words[12] = 0;
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    std::array<u32, TagDwords * 9> words;
+    const auto write_tag = [&](u32* tag, u32 kind, u64 tag_seq) {
+        tag[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+        tag[1] = VideoCore::NativeTagMagic;
+        tag[2] = static_cast<u32>(Other) | (kind << 8);
+        std::memset(&tag[3], 0, 3 * sizeof(u64));
+        std::memcpy(&tag[9], &tag_seq, sizeof(u64));
+        tag[11] = 0;
+        tag[12] = 0;
+    };
     const bool exec = allow_exec && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && ExecEligibleAsc(seq, ret);
+    u32 word_count = 0;
     if (exec) {
-        words[2] |= ExecFlag;
+        // counters the game initializes with DMA packets: GDS fill records, in front of the dispatch
+        const u32 counter_base = Rd<u32>(jcc, 0x22f8);
+        for (u32 k = 0; k < asc_counter_init_count; ++k) {
+            const u64 fill_seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+            auto& fill = Slot(fill_seq);
+            fill.seq.store(0, std::memory_order_release);
+            fill.check_count = 0;
+            fill.count = 0;
+            fill.kind = 8;
+            fill.flags = 0;
+            fill.caller = ret;
+            fill.a1 = 1;
+            fill.a2 = asc_counter_inits[k].value;
+            fill.args_addr = counter_base + asc_counter_inits[k].index * 4ull;
+            fill.seq.store(fill_seq, std::memory_order_release);
+            write_tag(&words[word_count], 8, fill_seq);
+            words[word_count + 2] |= ExecFlag;
+            word_count += TagDwords;
+        }
     }
-    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+    write_tag(&words[word_count], 3, seq);
+    if (exec) {
+        words[word_count + 2] |= ExecFlag;
+    }
+    word_count += TagDwords;
+    if (!WriteDwordsAt(jcc + 0x60, words.data(), word_count)) {
         tags_failed.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
@@ -3416,7 +3564,6 @@ void ReportEmitStats() {
     }
 }
 
-using GuestFunction6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
 
 /// Replaces the packets a helper wrote by NOP packets, packet by packet merged into runs: the memory stays as it was (tables
 /// and labels the engine still points to are untouched), only the first two dwords of a run change. Our own tag packets stay.
@@ -3744,6 +3891,15 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "measure_excs_depth_copy") {
         return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
+    }
+    if (name == "skip_resource_limits") {
+        return reinterpret_cast<u64>(&SkipResourceLimits);
+    }
+    if (name == "tag_asc_begin") {
+        return reinterpret_cast<u64>(&TagAscBegin);
+    }
+    if (name == "tag_asc_cs_copy") {
+        return reinterpret_cast<u64>(&TagAscCsCopy);
     }
     if (name == "tag_copy_resource") {
         return reinterpret_cast<u64>(&TagCopyResource);

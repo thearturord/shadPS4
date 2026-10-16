@@ -26,6 +26,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/readback_policy.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern Frontend::WindowSDL* g_window;
@@ -467,6 +468,15 @@ u32 PS4_SYSV_ABI sceGnmDispatchInitDefaultHardwareState(u32* cmdbuf, u32 size) {
 
     if (size < HwInitPacketSize) {
         return 0;
+    }
+
+    if (const auto& policy = VideoCore::ReadbackPolicy::Get();
+        policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 128) != 0) {
+        // the thread management and resource limit registers and the cache acquire have no host effect
+        cmdbuf = WriteHeader<PM4ItOpcode::Nop>(cmdbuf, HwInitPacketSize - 1);
+        *cmdbuf = 0;
+        return HwInitPacketSize;
     }
 
     cmdbuf = PM4CmdSetData::SetShReg<PM4ShaderType::ShaderCompute>(

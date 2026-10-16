@@ -55,6 +55,10 @@ void InstallForEboot(VAddr base, u64 image_size);
 /// Called once per presented frame: writes the call counts and recorded arguments.
 void OnFrame();
 
+/// Entry of a call hook that runs the guest function itself (its handler calls it to run the original and look at the
+/// result); 0 when the hook does not exist.
+u64 OriginalEntry(const char* name);
+
 /// True when at least one hook is installed.
 bool IsActive();
 

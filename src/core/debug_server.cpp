@@ -100,6 +100,7 @@ nlohmann::json Native(const Params&) {
     j["mode"] = policy.native_draw_mode.load();
     j["exec"] = policy.native_draw_exec.load();
     j["audit_every"] = policy.native_audit_every.load();
+    j["sdk_strip"] = policy.native_sdk_strip.load();
     j["gfx_tags"] = live.gfx_tags.load();
     j["gfx_exec"] = live.gfx_exec.load();
     j["compute_tags"] = live.compute_tags.load();

@@ -22,6 +22,7 @@
 #endif
 #include "common/logging/log.h"
 #include "core/debug_server.h"
+#include "core/guest_hooks.h"
 #include "core/native_draw.h"
 #include "video_core/native_draw_tag.h"
 #include "video_core/readback_policy.h"
@@ -2320,6 +2321,15 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
 /// CB_COLOR_CONTROL and the extent hint, which come from the resource's own render target description (+0xb0, hint +0xec).
 std::atomic<u64> track_native{}, track_eliminated{}, track_game_second{}, track_game_depth{};
 
+/// The game's resource tracking function (FUN_02479db0); with the tracking hook installed, its original entry.
+void(PS4_SYSV_ABI* GameTrackFunction())(u64, u64) {
+    u64 entry = Core::GuestHooks::OriginalEntry("ResTransition");
+    if (entry == 0) {
+        entry = image_base.load(std::memory_order_relaxed) + 0x2479db0 - 0x1000000;
+    }
+    return reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(entry);
+}
+
 bool EmitFastClearEliminate(u64 ctx, u64 resource) {
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
     BeginTables(seq);
@@ -2391,7 +2401,7 @@ void TrackResource(u64 ctx, u64 resource, bool native, void(PS4_SYSV_ABI* game_t
 void RunResourceTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
-    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
+    const auto track = GameTrackFunction();
     // engine objects live in the game's heap; anything else is a stale table entry (the game would fault on it too)
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
     const auto run_stage = [&](u64 mask_lo, u64 mask_hi, u64 table, u32 stage) {
@@ -2428,7 +2438,7 @@ void RunResourceTracking(u64 ctx) {
 void RunComputeTracking(u64 ctx) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     const bool native = VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0;
-    const auto track = reinterpret_cast<void(PS4_SYSV_ABI*)(u64, u64)>(base + 0x2479db0 - 0x1000000);
+    const auto track = GameTrackFunction();
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
     const u64 cs = Rd<u64>(ctx, 0x4670);
     const auto track_view = [&](u64 view) {
@@ -3060,6 +3070,112 @@ u64 PS4_SYSV_ABI TagAscBarrier(u64 jcc, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, 
     return 1;
 }
 
+/// SDK helpers that write packets of their own into the draw context's command buffer: the handler runs the game's
+/// function and looks at what it wrote (cursor before and after).
+struct EmitStat {
+    const char* name;
+    std::atomic<u64> calls{0}, dwords{0}, packets{0}, draws{0}, split{0}, stripped{0};
+};
+EmitStat emit_stats[6] = {{"ResTransition"}, {"RenderTargetEliminate"}, {"ClearQuad"}, {"CopyResource"}, {"ExCsDepthCopy"}, {"Other"}};
+
+void ReportEmitStats() {
+    static std::atomic<u64> last{0};
+    const u64 now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    u64 expected = last.load();
+    if (now - expected < 5000 || !last.compare_exchange_strong(expected, now)) {
+        return;
+    }
+    for (auto& stat : emit_stats) {
+        if (const u64 calls = stat.calls.exchange(0)) {
+            LOG_INFO(Core, "sdk helper packets per 5 s: {}: {} calls, {} dwords, {} packets, {} draws, {} left a buffer, {} stripped",
+                     stat.name, calls, stat.dwords.exchange(0), stat.packets.exchange(0), stat.draws.exchange(0),
+                     stat.split.exchange(0), stat.stripped.exchange(0));
+        }
+    }
+}
+
+using GuestFunction6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
+
+/// `dcb` is the address of the command buffer structure (end at +8, cursor at +0x10) the function writes to.
+u64 RunAndMeasure(EmitStat& stat, const char* hook_name, u64 dcb, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                  u32 strip_bit = 0) {
+    static std::atomic<u64> originals[8]{};
+    const u64 index = &stat - emit_stats;
+    u64 original = originals[index].load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry(hook_name);
+        originals[index].store(original, std::memory_order_relaxed);
+    }
+    if (original == 0 || dcb == 0) {
+        return 0;
+    }
+    const u64 end_before = Rd<u64>(dcb, 8);
+    const u64 cursor_before = Rd<u64>(dcb, 0x10);
+    reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
+    stat.calls.fetch_add(1, std::memory_order_relaxed);
+    const u64 end_after = Rd<u64>(dcb, 8);
+    const u64 cursor_after = Rd<u64>(dcb, 0x10);
+    if (end_after != end_before || cursor_after < cursor_before || cursor_after - cursor_before > (1u << 20)) {
+        stat.split.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stat.dwords.fetch_add((cursor_after - cursor_before) / 4, std::memory_order_relaxed);
+        u64 draws = 0, packets = 0, at = cursor_before;
+        while (at < cursor_after) {
+            const u32 header = Rd<u32>(at, 0);
+            if ((header >> 30) != 3) {
+                break;
+            }
+            ++packets;
+            const u32 opcode = (header >> 8) & 0xff;
+            draws += (opcode == 0x2d || opcode == 0x27 || opcode == 0x2c || opcode == 0x15);
+            at += ((header >> 16) & 0x3fff) * 4 + 8;
+        }
+        stat.packets.fetch_add(packets, std::memory_order_relaxed);
+        stat.draws.fetch_add(draws, std::memory_order_relaxed);
+        const u64 total = (cursor_after - cursor_before) / 4;
+        if (strip_bit != 0 && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & strip_bit) != 0 &&
+            VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 && total >= 3 && total < 0x4000 &&
+            packets != 0 && at == cursor_after) {
+            // one NOP over everything the helper wrote; the memory stays as it was, so tables and labels the engine still
+            // points to are untouched
+            Wr<u32>(cursor_before, 0, 0xC0000000u | (static_cast<u32>(total - 2) << 16) | (0x10u << 8));
+            Wr<u32>(cursor_before, 4, 0);
+            stat.stripped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    ReportEmitStats();
+    return 1;
+}
+
+/// FUN_02479db0(context, resource): the game's per-resource tracking before a resource is read or written (called from
+/// draws, dispatches and copies). With execution it is the native tracking; resources with a depth transition or a second
+/// resource keep the game's function (whose depth quads are stripped, see MeasureTargetEliminate).
+u64 PS4_SYSV_ABI TagTrackResource(u64 ctx, u64 resource, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx == 0 || resource < 0x200000000ull || resource >= 0x400000000ull || (resource & 7) != 0 ||
+        VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 2) == 0) {
+        return 0;
+    }
+    const auto game = GameTrackFunction();
+    if (reinterpret_cast<u64>(game) == image_base.load(std::memory_order_relaxed) + 0x2479db0 - 0x1000000) {
+        return 0; // the original entry is not available
+    }
+    TrackResource(ctx, resource, true, game);
+    return 1;
+}
+u64 PS4_SYSV_ABI MeasureTargetEliminate(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return ctx ? RunAndMeasure(emit_stats[1], "Fn247c680", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5, 1) : 0;
+}
+u64 PS4_SYSV_ABI MeasureClearQuad(u64 dcb, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return dcb ? RunAndMeasure(emit_stats[2], "ClearQuad", dcb, dcb, a1, a2, a3, a4, a5) : 0;
+}
+u64 PS4_SYSV_ABI MeasureCopyResource(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return ctx ? RunAndMeasure(emit_stats[3], "CopyResource", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5) : 0;
+}
+u64 PS4_SYSV_ABI MeasureExCsDepthCopy(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    return ctx ? RunAndMeasure(emit_stats[4], "ExCsDepthCopy", ctx + 0x47c0, ctx, a1, a2, a3, a4, a5) : 0;
+}
+
 u64 PS4_SYSV_ABI TagAscDispatch(u64 jcc, u64 x, u64 y, u64 z, u64 a4, u64 a5, u64 ret) {
     return TagAsc(jcc, x & 0xffffffff, y & 0xffffffff, z & 0xffffffff, ret);
 }
@@ -3139,6 +3255,21 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_barrier") {
         return reinterpret_cast<u64>(&TagAscBarrier);
+    }
+    if (name == "tag_track_resource") {
+        return reinterpret_cast<u64>(&TagTrackResource);
+    }
+    if (name == "measure_target_eliminate") {
+        return reinterpret_cast<u64>(&MeasureTargetEliminate);
+    }
+    if (name == "measure_clear_quad") {
+        return reinterpret_cast<u64>(&MeasureClearQuad);
+    }
+    if (name == "measure_copy_resource") {
+        return reinterpret_cast<u64>(&MeasureCopyResource);
+    }
+    if (name == "measure_excs_depth_copy") {
+        return reinterpret_cast<u64>(&MeasureExCsDepthCopy);
     }
     if (name == "tag_fill") {
         return reinterpret_cast<u64>(&TagFill);

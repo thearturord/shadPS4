@@ -67,6 +67,7 @@ struct State {
     std::atomic<u32> native_draw_classes{3};
     std::atomic<u32> native_synth_verify{0};
     std::atomic<u32> native_audit_every{64}; ///< see emulator_settings.h
+    std::atomic<u32> native_sdk_strip{0};    ///< see emulator_settings.h
     std::atomic<u32> native_draw_exec{0};
 };
 

@@ -52,6 +52,7 @@ struct Hook {
     std::vector<Deref> snaps; ///< Mode Snap: values read at call time from [reg + offset].
     u64 entry_size{RingEntrySize};
     u64 handler{}; ///< Mode Call: address of the host function (PS4_SYSV_ABI).
+    u64 original_call{}; ///< Mode Call: entry that runs the guest function itself (displaced instructions, then the body).
     u64 offset{};
     Mode mode{Mode::Count};
     u8* entry{};
@@ -202,7 +203,7 @@ void EmitArgsStub(Xbyak::CodeGenerator& c, const Hook& hook) {
 /// Stub for a hook that calls a host function: saves the caller-saved registers and the argument registers, calls
 /// handler(rdi, rsi, rdx, rcx, r8, r9, return address, rsp of the caller). A non-zero result skips the hooked function (the stub
 /// returns to its caller; with bit 63 set the rest of the result is returned as its value); zero runs the displaced instructions and continues in the function.
-void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original, size_t displaced,
+void EmitCallStub(Xbyak::CodeGenerator& c, Hook& hook, const u8* original, size_t displaced,
                   const u8* resume) {
     Xbyak::Label handled;
     const auto save = [&] {
@@ -262,6 +263,9 @@ void EmitCallStub(Xbyak::CodeGenerator& c, const Hook& hook, const u8* original,
     c.L(plain);
     restore();
     c.ret();
+    hook.original_call = c.getCurr<u64>();
+    c.db(original, displaced);
+    c.jmp(resume, Xbyak::CodeGenerator::T_NEAR);
 }
 
 bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
@@ -497,6 +501,15 @@ void NoteWriteFault(VAddr address, u64 size) {
     }
     fault_ring[slot].frame.store(frame_index.load(std::memory_order_relaxed),
                                  std::memory_order_release);
+}
+
+u64 OriginalEntry(const char* name) {
+    for (const auto& hook : hooks) {
+        if (hook->name == name) {
+            return hook->original_call;
+        }
+    }
+    return 0;
 }
 
 bool IsActive() {

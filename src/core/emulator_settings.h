@@ -504,6 +504,9 @@ struct GPUSettings {
     // With native execution: every Nth draw / dispatch of a call site still takes the game's packet path and is compared
     // with its record (the safety net that notices a state the builder does not know). 0 = never.
     Setting<u32> native_audit_every{64};
+    // With native execution: the packets of SDK helper calls the command processor has no use for are replaced by one NOP
+    // (bit 0: depth transition quads of the render target tracking, bit 1: resource tracking, bit 2: copies).
+    Setting<u32> native_sdk_strip{0};
     Setting<bool> dump_shaders{false};
     Setting<bool> patch_shaders{false};
     Setting<u32> vblank_frequency{60};
@@ -566,6 +569,7 @@ struct GPUSettings {
             make_override<GPUSettings>("native_synth_verify", &GPUSettings::native_synth_verify),
             make_override<GPUSettings>("native_draw_exec", &GPUSettings::native_draw_exec),
             make_override<GPUSettings>("native_audit_every", &GPUSettings::native_audit_every),
+            make_override<GPUSettings>("native_sdk_strip", &GPUSettings::native_sdk_strip),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
@@ -891,6 +895,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, NativeSynthVerify, native_synth_verify)
     SETTING_FORWARD_BOOL(m_gpu, NativeDrawExec, native_draw_exec)
     SETTING_FORWARD(m_gpu, NativeAuditEvery, native_audit_every)
+    SETTING_FORWARD(m_gpu, NativeSdkStrip, native_sdk_strip)
     SETTING_FORWARD(m_gpu, CpEncoderQueueDepth, cp_encoder_queue_depth)
     SETTING_FORWARD(m_gpu, CpFullFenceKinds, cp_full_fence_kinds)
     SETTING_FORWARD(m_gpu, CpSplitMode, cp_split_mode)

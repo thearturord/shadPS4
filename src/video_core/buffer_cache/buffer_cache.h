@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <mutex>
+#include <vector>
+
 #include <atomic>
 #include <deque>
 #include <map>
@@ -150,7 +154,10 @@ public:
 
     /// readback_dma_async: copies [dst, dst + size) of the arena into a private staging buffer; the
     /// priority thread puts the bytes into guest memory once the GPU executed the copy.
-    void RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size);
+    void RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bool tracked = false);
+
+    /// Waits until the explicit downloads (RecordDmaDownload with `tracked`) over the range have landed; 0 nothing in flight, 1 waited, 2 timed out.
+    u32 WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeout_ms);
 
     /// Unprotects ranges whose asynchronous readback has landed. Must run on the GPU thread.
     void ApplyPendingUnmarks();
@@ -254,6 +261,16 @@ private:
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+
+    struct ExplicitDownload {
+        VAddr addr;
+        u64 size;
+        u64 id;
+    };
+    std::mutex explicit_mutex;
+    std::condition_variable explicit_landed;
+    std::vector<ExplicitDownload> explicit_inflight;
+    u64 explicit_next_id{1};
 
     /// Answers of ObtainBuffer for large read-only and for written ranges: the same request in the same command
     /// buffer with the tracker and the range bookkeeping unchanged has nothing to upload and nothing to mark.

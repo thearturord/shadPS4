@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -124,9 +125,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
     LoadHotFile();
+    Core::NativeReadbacks::SetLandingGate(
+        [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    Core::NativeReadbacks::SetLandingGate({});
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -576,7 +581,7 @@ void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {
     stream_reuse_max = 0;
 }
 
-void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size) {
+void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size, bool tracked) {
     // The game's own readbacks are small lists and counters; a bigger copy is not one of them.
     if (size == 0 || size > MaxDmaDownload) {
         return;
@@ -594,11 +599,28 @@ void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size) {
     async_recorded.store(1, std::memory_order_release);
     // The priority thread runs its operations in the order they were deferred, so a fence deferred
     // after this one is signaled only once the bytes are in guest memory.
+    u64 id = 0;
+    if (tracked) {
+        std::scoped_lock lock{explicit_mutex};
+        id = explicit_next_id++;
+        explicit_inflight.push_back({dst, size, id});
+    }
     scheduler.DeferPriorityOperation(
-        [this, staging, dst, size] {
+        [this, staging, dst, size, tracked, id] {
+            if (tracked) {
+                Core::NativeReadbacks::LandingBegin(dst, size);
+            }
             staging.buffer->Invalidate(staging.offset, size);
             memory->TryWriteBacking(std::bit_cast<u8*>(dst), staging.mapped, size);
             staging_pool.FreeDeferred(staging);
+            if (tracked) {
+                Core::NativeReadbacks::LandingEnd(dst, size);
+                {
+                    std::scoped_lock lock{explicit_mutex};
+                    std::erase_if(explicit_inflight, [id](const ExplicitDownload& download) { return download.id == id; });
+                }
+                explicit_landed.notify_all();
+            }
         },
         scheduler.CurrentTick());
 }
@@ -694,6 +716,19 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.CurrentTick()};
     }
     return {arena, offset};
+}
+
+u32 BufferCache::WaitForExplicitDownloads(VAddr device_addr, u64 size, u32 timeout_ms) {
+    std::unique_lock lock{explicit_mutex};
+    const auto overlaps = [&] {
+        return std::ranges::any_of(explicit_inflight, [&](const ExplicitDownload& download) {
+            return download.addr < device_addr + size && device_addr < download.addr + download.size;
+        });
+    };
+    if (!overlaps()) {
+        return 0;
+    }
+    return explicit_landed.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return !overlaps(); }) ? 1 : 2;
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {

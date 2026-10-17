@@ -2026,7 +2026,7 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     };
     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
     if (!dst_gds && VideoCore::ReadbackPolicy::Get().dma_async.load(std::memory_order_relaxed)) {
-        buffer_cache.RecordDmaDownload(dst_buffer, dst, num_bytes);
+        buffer_cache.RecordDmaDownload(dst_buffer, dst, num_bytes, explicit_readback);
     }
     ++recorded_work;
 }

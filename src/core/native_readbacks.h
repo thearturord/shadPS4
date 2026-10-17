@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
@@ -27,6 +28,22 @@ bool ExplicitEnabled();
 /// An explicit readback was done (a copy into a STAGING resource: downloaded in order, destination not marked GPU modified), or refused
 /// (`reason`: 0 the copy took another path first, 1 larger than the download limit).
 void NoteExplicit(bool done, u64 bytes, u32 reason);
+
+/// The buffer cache registers how to wait for the explicit downloads in flight over a range: returns 0 nothing in flight, 1 waited, 2 timed out.
+using LandingGate = std::function<u32(VAddr address, u64 size, u32 timeout_ms)>;
+void SetLandingGate(LandingGate gate);
+
+/// The `AsyncMap` gate: if [address, address + size) is a staging destination of an explicit readback and a download of it is still in flight,
+/// waits for it to land (at most 20 ms), so the engine never gets a pointer to bytes that are not there yet.
+void GateMap(VAddr address, u64 size);
+
+/// A landing (the priority thread writing downloaded bytes to guest memory) begins / ends.
+void LandingBegin(VAddr address, u64 size);
+void LandingEnd(VAddr address, u64 size);
+
+/// The worker function that reads the staging ranges (FUN_01c4c570) is entered / left: the window in which the CPU reads them.
+void ReaderEnter();
+void ReaderExit();
 
 nlohmann::json Report();
 

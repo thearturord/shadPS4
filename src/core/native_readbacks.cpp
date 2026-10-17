@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -47,6 +48,18 @@ std::map<std::pair<u64, u32>, std::pair<u64, u64>> per_caller; ///< (caller, rec
 
 std::atomic<u64> explicit_copies{}, explicit_bytes{};
 std::array<std::atomic<u64>, 2> explicit_refused{};
+
+LandingGate landing_gate;
+std::atomic<u64> gate_checks{}, gate_waits{}, gate_timeouts{}, gate_wait_ns{};
+std::atomic<u64> landing_begins{}, landing_ends{}, landings_active{};
+std::atomic<u64> readers_active{}, reader_windows{}, reader_ns_total{}, reader_ns_max{};
+std::atomic<u64> landing_started_during_read{}, read_started_during_landing{}, windows_with_landing{}, landings_in_windows{};
+thread_local u64 reader_start_ns;
+thread_local u64 reader_landings_at_start;
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 constexpr u64 PageSize = 4096;
 
@@ -146,6 +159,69 @@ void NoteExplicit(bool done, u64 bytes, u32 reason) {
     }
 }
 
+void SetLandingGate(LandingGate gate) {
+    std::scoped_lock lock{mutex};
+    landing_gate = std::move(gate);
+}
+
+void GateMap(VAddr address, u64 size) {
+    LandingGate gate;
+    {
+        std::scoped_lock lock{mutex};
+        const Range* range = Find(address, size ? size : 1);
+        if (range == nullptr || range->usage != 3 || !landing_gate) {
+            return;
+        }
+        gate = landing_gate;
+    }
+    gate_checks.fetch_add(1, std::memory_order_relaxed);
+    const u64 start = NowNs();
+    const u32 result = gate(address, size, 20);
+    if (result != 0) {
+        gate_waits.fetch_add(1, std::memory_order_relaxed);
+        gate_wait_ns.fetch_add(NowNs() - start, std::memory_order_relaxed);
+        if (result == 2) {
+            gate_timeouts.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void LandingBegin(VAddr, u64) {
+    landing_begins.fetch_add(1, std::memory_order_relaxed);
+    landings_active.fetch_add(1, std::memory_order_relaxed);
+    if (readers_active.load(std::memory_order_relaxed) != 0) {
+        landing_started_during_read.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void LandingEnd(VAddr, u64) {
+    landing_ends.fetch_add(1, std::memory_order_relaxed);
+    landings_active.fetch_sub(1, std::memory_order_relaxed);
+}
+
+void ReaderEnter() {
+    readers_active.fetch_add(1, std::memory_order_relaxed);
+    if (landings_active.load(std::memory_order_relaxed) != 0) {
+        read_started_during_landing.fetch_add(1, std::memory_order_relaxed);
+    }
+    reader_start_ns = NowNs();
+    reader_landings_at_start = landing_begins.load(std::memory_order_relaxed);
+}
+
+void ReaderExit() {
+    const u64 duration = NowNs() - reader_start_ns;
+    readers_active.fetch_sub(1, std::memory_order_relaxed);
+    reader_windows.fetch_add(1, std::memory_order_relaxed);
+    reader_ns_total.fetch_add(duration, std::memory_order_relaxed);
+    u64 previous = reader_ns_max.load(std::memory_order_relaxed);
+    while (duration > previous && !reader_ns_max.compare_exchange_weak(previous, duration, std::memory_order_relaxed)) {
+    }
+    if (const u64 landings = landing_begins.load(std::memory_order_relaxed) - reader_landings_at_start; landings != 0) {
+        windows_with_landing.fetch_add(1, std::memory_order_relaxed);
+        landings_in_windows.fetch_add(landings, std::memory_order_relaxed);
+    }
+}
+
 nlohmann::json Report() {
     using nlohmann::json;
     std::scoped_lock lock{mutex};
@@ -193,6 +269,19 @@ nlohmann::json Report() {
                        {"bytes", explicit_bytes.load()},
                        {"refused_other_path", explicit_refused[0].load()},
                        {"refused_too_large", explicit_refused[1].load()}};
+    out["gate"] = {{"checks", gate_checks.load()}, {"waits", gate_waits.load()}, {"timeouts", gate_timeouts.load()},
+                   {"wait_ms_total", static_cast<double>(gate_wait_ns.load()) / 1e6}};
+    {
+        const u64 windows = reader_windows.load();
+        out["reader"] = {{"windows", windows},
+                         {"mean_us", windows ? static_cast<double>(reader_ns_total.load()) / 1e3 / static_cast<double>(windows) : 0.0},
+                         {"max_us", static_cast<double>(reader_ns_max.load()) / 1e3},
+                         {"landings", landing_ends.load()},
+                         {"landing_started_during_a_read", landing_started_during_read.load()},
+                         {"read_started_during_a_landing", read_started_during_landing.load()},
+                         {"windows_with_a_landing_begin", windows_with_landing.load()},
+                         {"landing_begins_in_windows", landings_in_windows.load()}};
+    }
     out["read_faults_total"] = faults_total.load();
     out["read_faults_elsewhere"] = faults_other.load();
     return out;

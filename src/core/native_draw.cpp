@@ -4207,7 +4207,28 @@ u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64
     reinterpret_cast<GuestFunction6>(original)(resource, out, a2, a3, a4, a5);
     const u64 mapped = Rd<u64>(out, 0);
     const u32 mapped_size = Rd<u32>(out, 8);
+    if (Core::NativeReadbacks::ExplicitEnabled()) {
+        Core::NativeReadbacks::GateMap(mapped, mapped_size);
+    }
     Core::NativeReadbacks::NoteMap(mapped, mapped_size, ret - ImageBase() + 0x1000000, mapped_size == sizeof(u32) ? Rd<u32>(mapped, 0) : 0);
+    return 1;
+}
+
+/// FUN_01c4c570: the worker job that reads the four staging ranges. The window between entering and leaving it is the time the CPU may read
+/// them (explicit readbacks, step 3: landings that begin inside it are counted).
+u64 PS4_SYSV_ABI StagingWorkerWindow(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("StagingWorker");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    Core::NativeReadbacks::ReaderEnter();
+    reinterpret_cast<GuestFunction6>(original)(a0, a1, a2, a3, a4, a5);
+    Core::NativeReadbacks::ReaderExit();
     return 1;
 }
 
@@ -5323,6 +5344,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_auto") {
         return reinterpret_cast<u64>(&TagAuto);
+    }
+    if (name == "staging_worker_window") {
+        return reinterpret_cast<u64>(&StagingWorkerWindow);
     }
     if (name == "asyncmap_note") {
         return reinterpret_cast<u64>(&NoteAsyncMap);

@@ -112,10 +112,22 @@ u64 PlanCaller() {
 
 void NoteStale(u32 groups, bool differs, const std::string& diff, u64 caller, u64 present) {
     stale_draws.fetch_add(1, std::memory_order_relaxed);
+    // which group's fields differ (the field names are the ones of DiffFixedState)
+    const auto has = [&](std::initializer_list<const char*> names) {
+        for (const char* name : names) {
+            if (diff.find(name) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool group_differs[3] = {has({"cull_mode", "front_face", "polygon_mode", "provoking_first"}),
+                                   has({"depth_clip", "negative_one_to_one", "rasterizer_discard", "user_clip_plane_mask", "clip_disabled"}),
+                                   has({"depth_clear", "stencil_clear"})};
     for (u32 bit = 0; bit < 3; ++bit) {
         if ((groups >> bit) & 1) {
             stale_group_draws[bit].fetch_add(1, std::memory_order_relaxed);
-            if (differs) {
+            if (group_differs[bit]) {
                 stale_group_differs[bit].fetch_add(1, std::memory_order_relaxed);
             }
         }

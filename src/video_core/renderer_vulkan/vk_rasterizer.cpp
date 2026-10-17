@@ -297,20 +297,24 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         // then every 256th, `verify`) are compared with the registers' state; a difference is counted and the registers win.
         auto& live = Core::NativeDraw::Live();
         live.fixed_native.fetch_add(1, std::memory_order_relaxed);
-        // the clear flags of the render pass are register state the native path does not describe
-        native_stale |= StaleClear;
-        // The surface group (culling, front face, polygon mode) comes from the engine's rasterizer state object, also where the engine did
-        // not write the register for this draw. The register mirror is not a reliable source for it: its value differs from the object's in
-        // nearly every such draw and changes with the frame (a period of three), which flickers tattoos, leaves and whole meshes
-        // (native-isolation.md). Bit 268435456 of native_sdk_strip restores the old behaviour (bit 536870912 does the same for the clip group,
-        // which is not measured to matter).
+        if ((VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 1073741824) != 0) {
+            native_stale |= StaleClear;
+        }
+        // No group of the fixed-function state comes from the register mirror any more. The surface group (culling, front face, polygon
+        // mode) comes from the engine's rasterizer state object, also where the engine did not write the register for this draw: the mirror's
+        // value differed from the object's in nearly every such draw and changed with the frame (a period of three), which flickered tattoos,
+        // leaves and whole meshes (native-isolation.md). The clip group and the clear flags never differed from the objects' values in 27 million
+        // draws. Bits of native_sdk_strip restore the old behaviour for a comparison: 268435456 surface, 536870912 clip, 1073741824 clear flags.
         const u32 strip = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
         const bool surface_from_mirror = (strip & 268435456) != 0;
         if (!surface_from_mirror) {
             native_stale &= ~StaleSurface;
         }
-        if ((strip & 536870912) != 0) {
+        if ((strip & 536870912) == 0) {
             native_stale &= ~StaleClip;
+        }
+        if ((strip & 1073741824) == 0) {
+            native_stale &= ~StaleClear;
         }
         FixedState merged = *native;
         TakeFromRegisters(merged, regs, native_stale);

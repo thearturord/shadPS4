@@ -36,6 +36,9 @@ struct LiveCounters {
     std::atomic<u64> gfx_tags{}, gfx_exec{};
     std::atomic<u64> compute_tags{}, compute_exec{};
     std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{}, device_begin_stripped{};
+    /// synchronization packets taken out of the stream: scratch barrier units (label, end of shader event, wait on the label,
+    /// cache acquire), stand-alone cache acquires and no-op events
+    std::atomic<u64> sync_units_stripped{}, sync_acquires_stripped{}, sync_events_stripped{}, barrier_calls_skipped{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
     std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};

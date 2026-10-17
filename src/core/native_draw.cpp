@@ -500,7 +500,103 @@ inline void Wr(u64 base, u64 offset, T value) {
     std::memcpy(reinterpret_cast<void*>(base + offset), &value, sizeof(T));
 }
 
+bool StripPackets(u64 begin, u64 end);
+
+/// Synchronization the game writes between its commands that only orders the GPU against itself. The raster thread runs the
+/// operations in order and the rasterizer inserts the barriers its resources need, so:
+///  - a scratch barrier unit (a label inside the command buffer, an end of shader event that writes 1 to it, a wait for it
+///    and a cache acquire; the idiom of FUN_0247e510 and its inlined copies) orders a dispatch against later work and the label
+///    is read by nothing else;
+///  - a cache acquire is ignored by the command processor;
+///  - an event write other than the stream out flush and the Z pass dump is ignored by it.
+/// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
+u32 SweepSyncPackets(u64 begin, u64 end) {
+    u32 removed = 0;
+    for (u64 at = begin; at < end;) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            break;
+        }
+        const u32 opcode = (header >> 8) & 0xff;
+        const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
+        if (at + size > end) {
+            break;
+        }
+        const auto next_at = [&](u64 from) {
+            const u32 h = Rd<u32>(from, 0);
+            return (h >> 30) == 3 ? from + (((h >> 16) & 0x3fff) + 2) * 4ull : 0ull;
+        };
+        const auto opcode_at = [&](u64 from) { return (Rd<u32>(from, 0) >> 8) & 0xff; };
+        if (opcode == 0x10 && Rd<u32>(at, 4) == 0x68753000u) {
+            // label NOP, EOS (0x48), WAIT_REG_MEM (0x3c), ACQUIRE_MEM (0x58)
+            const u64 eos = at + size;
+            const u64 wait = eos < end ? next_at(eos) : 0;
+            const u64 acquire = wait != 0 && wait < end ? next_at(wait) : 0;
+            const u64 after = acquire != 0 && acquire < end ? next_at(acquire) : 0;
+            if (wait != 0 && acquire != 0 && after != 0 && after <= end && opcode_at(eos) == 0x48 && opcode_at(wait) == 0x3c &&
+                opcode_at(acquire) == 0x58) {
+                const u64 eos_address = static_cast<u64>(Rd<u32>(eos, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(eos, 12) & 0xff) << 32;
+                const u64 wait_address = static_cast<u64>(Rd<u32>(wait, 8) & 0xfffffffcu) | static_cast<u64>(Rd<u32>(wait, 12) & 0xffff) << 32;
+                if (eos_address == wait_address && eos_address >= at + 8 && eos_address + 8 <= at + size && Rd<u32>(eos, 16) == 1 &&
+                    StripPackets(at, after)) {
+                    Live().sync_units_stripped.fetch_add(1, std::memory_order_relaxed);
+                    removed += 4;
+                    at = after;
+                    continue;
+                }
+            }
+        } else if (opcode == 0x58) {
+            if (StripPackets(at, at + size)) {
+                Live().sync_acquires_stripped.fetch_add(1, std::memory_order_relaxed);
+                ++removed;
+            }
+        } else if (opcode == 0x46) {
+            const u32 control = Rd<u32>(at, 4);
+            const u32 type = control & 0x3f;
+            const u32 index = (control >> 8) & 0xf;
+            if (type != 31 && index != 1 && StripPackets(at, at + size)) {
+                Live().sync_events_stripped.fetch_add(1, std::memory_order_relaxed);
+                ++removed;
+            }
+        }
+        at += size;
+    }
+    return removed;
+}
+
+bool SweepEnabled() {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 524288) != 0;
+}
+
 bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
+    // the game's own synchronization between the last tag written to this command buffer and this one
+    struct Sweep {
+        u64 writer{};
+        u64 base{};
+        u64 last{};
+    };
+    static thread_local std::array<Sweep, 6> sweeps;
+    if (SweepEnabled()) {
+        const u64 cursor = Rd<u64>(writer, 0x10);
+        const u64 base = Rd<u64>(writer, 0x0);
+        Sweep* entry = nullptr;
+        for (auto& s : sweeps) {
+            if (s.writer == writer) {
+                entry = &s;
+            }
+        }
+        if (entry == nullptr) {
+            entry = &sweeps[(writer >> 4) % sweeps.size()];
+            *entry = {writer, base, 0};
+        }
+        if (entry->base == base && entry->last != 0 && entry->last < cursor && cursor - entry->last < (1u << 16)) {
+            SweepSyncPackets(entry->last, cursor);
+        }
+        entry->base = base;
+        entry->last = cursor + count * sizeof(u32);
+    }
     u64 cur = Rd<u64>(writer, 0x10);
     const u64 end = Rd<u64>(writer, 0x08);
     if (cur == 0 || cur > end) {
@@ -4944,7 +5040,19 @@ u64 PS4_SYSV_ABI ResourceBufferDestroyed(u64 object, u64 a1, u64 a2, u64 a3, u64
     return 0;
 }
 
+/// FUN_0247e510(device context): the scratch barrier unit as a function (see SweepSyncPackets): nothing to write.
+u64 PS4_SYSV_ABI SkipWaitComputeDone(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    if (ctx == 0 || !SweepEnabled()) {
+        return 0;
+    }
+    Live().barrier_calls_skipped.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 u64 FindHandler(const std::string& name) {
+    if (name == "skip_wait_compute_done") {
+        return reinterpret_cast<u64>(&SkipWaitComputeDone);
+    }
     if (name == "resource_buffer_created") {
         return reinterpret_cast<u64>(&ResourceBufferCreated);
     }

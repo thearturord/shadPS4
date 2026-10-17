@@ -487,7 +487,7 @@ struct GPUSettings {
     // Windows: patch every thread-control-block access (mov reg, fs:[0] and similar) of a module when it
     // is loaded, before the guest runs, instead of the first time a thread executes it.
     Setting<bool> cpu_prepatch_tcb{false};
-    // Native draw path (documents/tlg/native-render-plan.md): 0 off, 1 the game writes a tag packet in front of
+    // Native draw path (documents/tlg/Legacy/native-render-plan.md): 0 off, 1 the game writes a tag packet in front of
     // every draw of the enabled classes (no effect on rendering), 2 the rasterizer also uses the tag to skip
     // redundant per-draw work.
     Setting<u32> native_draw_mode{0};

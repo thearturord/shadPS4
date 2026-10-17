@@ -294,7 +294,7 @@ std::array<Counters, NumClasses> counters;
 std::atomic<VAddr> image_base{0};
 std::atomic<u64> last_publish_ns{0};
 
-// Ghidra address ranges of the three passes (documents/tlg/native-phase1-results-2026-10-15.md).
+// Ghidra address ranges of the three passes (documents/tlg/Legacy/native-phase1-results-2026-10-15.md).
 Class Classify(u64 ret) {
     const VAddr base = image_base.load(std::memory_order_relaxed);
     if (base == 0 || ret < base) {

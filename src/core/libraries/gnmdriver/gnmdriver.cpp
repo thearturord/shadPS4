@@ -774,6 +774,7 @@ static bool WriteNativeInitState(u32* cmdbuf, const u32* sequence, u32 sequence_
     const u64 pointer = reinterpret_cast<u64>(state);
     std::memcpy(&cmdbuf[3], &pointer, sizeof(pointer));
     WriteNop(cmdbuf + TagDwords, HwInitPacketSize - TagDwords - 1);
+    Core::NativeDraw::NoteAnchor(reinterpret_cast<u64>(cmdbuf), 0, 12);
     return true;
 }
 

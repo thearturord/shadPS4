@@ -39,6 +39,10 @@ struct LiveCounters {
     /// synchronization packets taken out of the stream: scratch barrier units (label, end of shader event, wait on the label,
     /// cache acquire), stand-alone cache acquires and no-op events
     std::atomic<u64> sync_units_stripped{}, sync_acquires_stripped{}, sync_events_stripped{}, barrier_calls_skipped{};
+    /// direct submission, step 1 (shadow index, `native_sdk_strip` bit 1048576): tags registered at their address, command
+    /// buffer spans walked, spans without any packet besides entries ("pure") and with some ("mixed"), tags the walk found that
+    /// the index has / has not, indexed tags the walk did not find
+    std::atomic<u64> shadow_anchors{}, shadow_spans{}, shadow_pure{}, shadow_mixed{}, shadow_matched{}, shadow_extra{}, shadow_missing{}, shadow_nested{}, shadow_stale{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
     std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};
@@ -107,6 +111,52 @@ struct ExecDraw {
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).
 u32 RecordDrawCount(u64 seq);
+
+/// Direct submission, step 1 (documents/tlg/native-direct-submission.md). The record builders register the address of every tag
+/// they write; the packet walk of a command buffer span compares what it finds with the registered tags of the span and counts
+/// the packets that are not entries (inert padding aside), which tells whether the span could be submitted without the walk.
+bool SubmitShadowEnabled();
+void NoteAnchor(u64 address, u64 seq, u32 kind);
+/// Per opcode: packets in walked spans that are not entries, flips and indirect buffers included (/native).
+u64 ShadowNonEntryCount(u32 opcode);
+
+class SubmitShadow {
+public:
+    SubmitShadow() = default;
+    SubmitShadow(const SubmitShadow&) = delete;
+    SubmitShadow& operator=(const SubmitShadow&) = delete;
+    ~SubmitShadow() {
+        End();
+    }
+    /// `queue`: 0 graphics, 1 + n async compute queue n; the span is the dwords of the command buffer.
+    void Begin(u32 queue, const u32* begin, u32 dwords);
+    /// The walk found a tag at `header`.
+    void Tag(const void* header);
+    /// The walk found another packet: padding / no-ops the walk ignores are `inert`.
+    void Packet(u32 opcode, bool inert);
+    /// The walk follows an indirect buffer: its tags belong to that span, even when it lies inside this one.
+    void Indirect(u64 address, u32 dwords);
+    /// The walk skipped the payload of a no-op: an old tag left in it (the buffers are reused) is not an entry of this span.
+    void Skipped(u64 address, u32 dwords);
+    void End();
+    bool Active() const {
+        return active;
+    }
+
+private:
+    bool active{};
+    u32 queue{};
+    u64 begin{};
+    u64 end{};
+    std::vector<u64> expected; ///< sorted tag addresses of the span
+    std::vector<u8> seen;
+    std::array<u32, 256> other{}; ///< packets by opcode that are not entries
+    u32 extra{};
+    std::vector<std::pair<u64, u64>> nested;  ///< address ranges of the indirect buffers the walk followed
+    std::vector<std::pair<u64, u64>> skipped; ///< payloads of the no-ops the walk stepped over
+};
+/// Tags the walk found without an index entry, by tag kind (/native).
+u64 ShadowExtraByKind(u32 kind);
 
 /// The Ghidra address of the call that made record `seq` (0 when the record is gone).
 u64 RecordCaller(u64 seq);

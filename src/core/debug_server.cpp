@@ -121,6 +121,33 @@ nlohmann::json Native(const Params&) {
     j["sync_acquires_stripped"] = live.sync_acquires_stripped.load();
     j["sync_events_stripped"] = live.sync_events_stripped.load();
     j["barrier_calls_skipped"] = live.barrier_calls_skipped.load();
+    j["shadow_anchors"] = live.shadow_anchors.load();
+    j["shadow_spans"] = live.shadow_spans.load();
+    j["shadow_pure"] = live.shadow_pure.load();
+    j["shadow_mixed"] = live.shadow_mixed.load();
+    j["shadow_matched"] = live.shadow_matched.load();
+    j["shadow_extra"] = live.shadow_extra.load();
+    j["shadow_missing"] = live.shadow_missing.load();
+    j["shadow_nested"] = live.shadow_nested.load();
+    j["shadow_stale"] = live.shadow_stale.load();
+    {
+        nlohmann::json kinds = nlohmann::json::object();
+        for (u32 kind = 0; kind < 64; ++kind) {
+            if (const u64 n = Core::NativeDraw::ShadowExtraByKind(kind); n != 0) {
+                kinds[std::to_string(kind)] = n;
+            }
+        }
+        j["shadow_extra_by_kind"] = std::move(kinds);
+    }
+    {
+        nlohmann::json other = nlohmann::json::object();
+        for (u32 opcode = 0; opcode < 256; ++opcode) {
+            if (const u64 n = Core::NativeDraw::ShadowNonEntryCount(opcode); n != 0) {
+                other[fmt::format("{:#x}", opcode)] = n;
+            }
+        }
+        j["shadow_non_entry"] = std::move(other);
+    }
     j["fixed_native"] = live.fixed_native.load();
     j["fixed_checked"] = live.fixed_checked.load();
     j["fixed_diff"] = live.fixed_diff.load();

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <set>
 #include <bitset>
 #include <bit>
 #include <cmath>
@@ -612,6 +614,23 @@ bool WriteDwordsAt(u64 writer, const u32* words, u32 count) {
     }
     std::memcpy(reinterpret_cast<void*>(cur), words, count * sizeof(u32));
     Wr<u64>(writer, 0x10, cur + count * sizeof(u32));
+    if (SubmitShadowEnabled()) {
+        for (u32 i = 0; i + 1 < count;) {
+            const u32 header = words[i];
+            if ((header >> 30) != 3) {
+                ++i;
+                continue;
+            }
+            const u32 size = ((header >> 16) & 0x3fff) + 2;
+            if (((header >> 8) & 0xff) == 0x10 && size >= 2 + VideoCore::NativeTagPayloadDwords - 1 && words[i + 1] == VideoCore::NativeTagMagic &&
+                i + size <= count) {
+                u64 tag_seq;
+                std::memcpy(&tag_seq, &words[i + 9], sizeof(tag_seq));
+                NoteAnchor(cur + i * sizeof(u32), tag_seq, (words[i + 2] >> 8) & 0xff);
+            }
+            i += size;
+        }
+    }
     return true;
 }
 
@@ -4113,6 +4132,7 @@ u64 PS4_SYSV_ABI TagDeviceBegin(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     for (u32 k = 0; k < TagDwords; ++k) {
         Wr<u32>(tail, k * 4, words[k]);
     }
+    NoteAnchor(tail, 0, 12);
     const u32 rest = tail_dwords - TagDwords;
     Wr<u32>(tail + TagDwords * 4, 0, 0xC0000000u | ((rest - 2) << 16) | (0x10u << 8));
     Wr<u32>(tail + TagDwords * 4, 4, 0);
@@ -4880,6 +4900,7 @@ bool ConvertClearQuad(u64 target, u64 start, u64 begin, u64 end, u64 caller, con
     for (u32 k = 0; k < TagDwords; ++k) {
         Wr<u32>(start, k * 4, words[k]);
     }
+    NoteAnchor(start, seq, 7);
     if (middle >= 2) {
         const u64 run = start + TagDwords * 4;
         Wr<u32>(run, 0, 0xC0000000u | (static_cast<u32>(middle - 2) << 16) | (0x10u << 8));
@@ -5170,6 +5191,195 @@ u64 FindHandler(const std::string& name) {
 LiveCounters& Live() {
     static LiveCounters counters;
     return counters;
+}
+
+// ---- direct submission, step 1: the shadow index (documents/tlg/native-direct-submission.md) ---------------------------------
+namespace {
+struct Anchor {
+    std::atomic<u64> address{0};
+    std::atomic<u64> seq{0};
+    std::atomic<u32> kind{0};
+};
+constexpr u32 AnchorSlots = 16384;
+std::unique_ptr<Anchor[]> anchors;
+std::once_flag anchors_once;
+std::atomic<u64> anchor_next{0};
+std::array<std::atomic<u64>, 256> shadow_other{};
+std::array<std::atomic<u64>, 64> shadow_extra_kind{};
+
+Anchor* AnchorRing() {
+    std::call_once(anchors_once, [] { anchors = std::make_unique<Anchor[]>(AnchorSlots); });
+    return anchors.get();
+}
+
+/// True when a native tag (of record `seq`, 0: any) is at `address`.
+bool IsTagAt(u64 address, u64 seq) {
+    const u32 header = Rd<u32>(address, 0);
+    if ((header >> 30) != 3 || ((header >> 8) & 0xff) != 0x10 || ((header >> 16) & 0x3fff) + 1 < VideoCore::NativeTagPayloadDwords ||
+        Rd<u32>(address, 4) != VideoCore::NativeTagMagic) {
+        return false;
+    }
+    return seq == 0 || Rd<u64>(address, 9 * sizeof(u32)) == seq;
+}
+} // namespace
+
+bool SubmitShadowEnabled() {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 1048576) != 0;
+}
+
+void NoteAnchor(u64 address, u64 seq, u32 kind) {
+    if (!SubmitShadowEnabled()) {
+        return;
+    }
+    auto& slot = AnchorRing()[anchor_next.fetch_add(1, std::memory_order_relaxed) % AnchorSlots];
+    slot.address.store(0, std::memory_order_release);
+    slot.seq.store(seq, std::memory_order_relaxed);
+    slot.kind.store(kind, std::memory_order_relaxed);
+    slot.address.store(address, std::memory_order_release);
+    Live().shadow_anchors.fetch_add(1, std::memory_order_relaxed);
+}
+
+u64 ShadowExtraByKind(u32 kind) {
+    return kind < 64 ? shadow_extra_kind[kind].load(std::memory_order_relaxed) : 0;
+}
+
+u64 ShadowNonEntryCount(u32 opcode) {
+    return opcode < 256 ? shadow_other[opcode].load(std::memory_order_relaxed) : 0;
+}
+
+void SubmitShadow::Begin(u32 queue_id, const u32* span, u32 dwords) {
+    active = span != nullptr && dwords != 0 && SubmitShadowEnabled();
+    if (!active) {
+        return;
+    }
+    queue = queue_id;
+    begin = reinterpret_cast<u64>(span);
+    end = begin + dwords * sizeof(u32);
+    Anchor* ring = AnchorRing();
+    for (u32 i = 0; i < AnchorSlots; ++i) {
+        const u64 address = ring[i].address.load(std::memory_order_acquire);
+        if (address >= begin && address + VideoCore::NativeTagPayloadDwords * sizeof(u32) <= end && IsTagAt(address, ring[i].seq.load(std::memory_order_relaxed))) {
+            expected.push_back(address);
+        }
+    }
+    std::ranges::sort(expected);
+    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+    seen.assign(expected.size(), 0);
+}
+
+void SubmitShadow::Tag(const void* header) {
+    if (!active) {
+        return;
+    }
+    const u64 address = reinterpret_cast<u64>(header);
+    const auto it = std::lower_bound(expected.begin(), expected.end(), address);
+    if (it != expected.end() && *it == address) {
+        seen[it - expected.begin()] = 1;
+        Live().shadow_matched.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Live().shadow_extra.fetch_add(1, std::memory_order_relaxed);
+    const u32 kind = (Rd<u32>(address, 8) >> 8) & 0xff;
+    shadow_extra_kind[kind & 63].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+        LOG_INFO(Core, "submission shadow: the walk found a tag (kind {}, seq {}) at {:#x} (queue {}, span {:#x}..{:#x}, offset {:#x}) that the index has not",
+                 kind, Rd<u64>(address, 9 * sizeof(u32)), address, queue, begin, end, address - begin);
+    }
+    ++extra;
+}
+
+void SubmitShadow::Packet(u32 opcode, bool inert) {
+    if (active && !inert) {
+        ++other[opcode & 255];
+    }
+}
+
+void SubmitShadow::Indirect(u64 address, u32 dwords) {
+    if (active) {
+        nested.emplace_back(address, address + dwords * sizeof(u32));
+    }
+}
+
+void SubmitShadow::Skipped(u64 address, u32 dwords) {
+    if (active) {
+        skipped.emplace_back(address, address + dwords * sizeof(u32));
+    }
+}
+
+void SubmitShadow::End() {
+    if (!active) {
+        return;
+    }
+    active = false;
+    auto& live = Live();
+    live.shadow_spans.fetch_add(1, std::memory_order_relaxed);
+    u32 missing = 0;
+    u64 first_missing = 0;
+    for (size_t i = 0; i < seen.size(); ++i) {
+        if (seen[i] == 0) {
+            const bool in_child = std::ranges::any_of(nested, [&](const auto& range) { return expected[i] >= range.first && expected[i] < range.second; });
+            const bool in_payload = std::ranges::any_of(skipped, [&](const auto& range) { return expected[i] >= range.first && expected[i] < range.second; });
+            if (in_child) {
+                live.shadow_nested.fetch_add(1, std::memory_order_relaxed);
+            } else if (in_payload) {
+                live.shadow_stale.fetch_add(1, std::memory_order_relaxed);
+            } else if (missing++ == 0) {
+                first_missing = expected[i];
+            }
+        }
+    }
+    if (missing != 0) {
+        live.shadow_missing.fetch_add(missing, std::memory_order_relaxed);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            std::string around;
+            for (int k = -10; k < 3; ++k) {
+                around += fmt::format(" {:08x}", Rd<u32>(first_missing, k * 4));
+            }
+            LOG_INFO(Core,
+                     "submission shadow: {} indexed tags of the span {:#x}..{:#x} (queue {}) were not found by the walk, first at {:#x} (offset {:#x}, "
+                     "kind {}, seq {}, still a tag {}), dwords from -10:{}",
+                     missing, begin, end, queue, first_missing, first_missing - begin, (Rd<u32>(first_missing, 8) >> 8) & 0xff,
+                     Rd<u64>(first_missing, 9 * sizeof(u32)), IsTagAt(first_missing, 0), around);
+        }
+    }
+    u32 other_total = 0;
+    std::string signature;
+    for (u32 opcode = 0; opcode < 256; ++opcode) {
+        if (other[opcode] != 0) {
+            other_total += other[opcode];
+            shadow_other[opcode].fetch_add(other[opcode], std::memory_order_relaxed);
+            signature += fmt::format(" {:#x}:{}", opcode, other[opcode]);
+        }
+    }
+    if (other_total == 0) {
+        live.shadow_pure.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        live.shadow_mixed.fetch_add(1, std::memory_order_relaxed);
+        // one line per distinct set of opcodes (the counts change from frame to frame)
+        static std::mutex signatures_mutex;
+        static std::set<std::string> signatures;
+        std::string key = fmt::format("q{}", queue);
+        for (u32 opcode = 0; opcode < 256; ++opcode) {
+            if (other[opcode] != 0) {
+                key += fmt::format(" {:#x}", opcode);
+            }
+        }
+        std::scoped_lock lock{signatures_mutex};
+        if (signatures.size() < 48 && signatures.insert(key).second) {
+            LOG_INFO(Core, "submission shadow: mixed span, queue {}, {} dwords, {} tags, packets that are not entries:{}", queue,
+                     (end - begin) / sizeof(u32), expected.size(), signature);
+        }
+    }
+    nested.clear();
+    skipped.clear();
+    expected.clear();
+    expected.shrink_to_fit();
+    seen.clear();
+    other.fill(0);
 }
 
 u64 EngineDevice() {

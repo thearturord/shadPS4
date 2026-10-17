@@ -1823,6 +1823,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     // CE task should be moved into more global scope
     Task ce_task{};
 
+    Core::NativeDraw::SubmitShadow shadow;
+    shadow.Begin(0, dcb.data(), static_cast<u32>(dcb.size()));
+
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
         ce_task = ProcessCeUpdate(ccb);
@@ -1854,6 +1857,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             VideoCore::ReadbackStats::CpPacket(GfxQueueId, static_cast<u32>(opcode));
             if (VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
                 CountGameCommand(header, opcode, count);
+            }
+            if (shadow.Active()) {
+                const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+                if (opcode != PM4ItOpcode::Nop) {
+                    shadow.Packet(static_cast<u32>(opcode), false);
+                } else if (nop->header.count.Value() != 0 && nop->data_block[0] == PM4CmdNop::PayloadType::NativeDrawTag &&
+                           nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
+                    shadow.Tag(header);
+                } else {
+                    shadow.Packet(static_cast<u32>(opcode),
+                                  nop->header.count.Value() == 0 || nop->data_block[0] != PM4CmdNop::PayloadType::PatchedFlip);
+                    shadow.Skipped(reinterpret_cast<u64>(header) + sizeof(u32), nop->header.count.Value());
+                }
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
@@ -2611,6 +2627,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+                shadow.Indirect(reinterpret_cast<u64>(indirect_buffer->Address<const u32>()), indirect_buffer->ib_size);
                 if (indirect_buffer->ib_size <= 256 &&
                     VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0 &&
                     (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8192) != 0) {
@@ -2705,6 +2722,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
+    Core::NativeDraw::SubmitShadow shadow;
+    shadow.Begin(vqid + 1, acb.data(), static_cast<u32>(acb.size()));
     while (!acb.empty()) {
         ProcessCommands();
 
@@ -2750,6 +2769,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const PM4ItOpcode opcode = header->type3.opcode;
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
         CountComputeQueueCommand(header, opcode);
+        if (shadow.Active()) {
+            const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+            if (opcode != PM4ItOpcode::Nop) {
+                shadow.Packet(static_cast<u32>(opcode), false);
+            } else if (nop->header.count.Value() != 0 && nop->data_block[0] == PM4CmdNop::PayloadType::NativeDrawTag &&
+                       nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
+                shadow.Tag(header);
+            } else {
+                shadow.Packet(static_cast<u32>(opcode), true);
+                shadow.Skipped(reinterpret_cast<u64>(header) + sizeof(u32), nop->header.count.Value());
+            }
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -2771,6 +2802,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::IndirectBuffer: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            shadow.Indirect(reinterpret_cast<u64>(indirect_buffer->Address<const u32>()), indirect_buffer->ib_size);
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
             RESUME_ASC(task, vqid);

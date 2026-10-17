@@ -36,6 +36,7 @@ void InitFromSettings() {
     s.native_synth_verify = EmulatorSettings.IsNativeSynthVerify() ? 1 : 0;
     s.native_draw_exec = EmulatorSettings.IsNativeDrawExec() ? 1 : 0;
     s.native_audit_every = EmulatorSettings.GetNativeAuditEvery();
+    s.map_native = static_cast<s32>(EmulatorSettings.GetNativeMap());
     s.native_sdk_strip = EmulatorSettings.GetNativeSdkStrip();
 }
 
@@ -89,6 +90,8 @@ bool Set(std::string_view name, s64 value) {
         s.rt_reuse_override = static_cast<s32>(value);
     } else if (name == "stage_reuse") {
         s.stage_reuse_override = static_cast<s32>(value);
+    } else if (name == "map_native") {
+        s.map_native = static_cast<s32>(value);
     } else if (name == "register_packets") {
         s.register_packets = static_cast<s32>(value);
     } else {
@@ -130,6 +133,7 @@ nlohmann::json Dump() {
             {"stream_reuse", s.stream_reuse_override.load()},
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
+            {"map_native", s.map_native.load()},
             {"register_packets", s.register_packets.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};

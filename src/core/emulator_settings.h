@@ -504,6 +504,7 @@ struct GPUSettings {
     // With native execution: every Nth draw / dispatch of a call site still takes the game's packet path and is compared
     // with its record (the safety net that notices a state the builder does not know). 0 = never.
     Setting<u32> native_audit_every{64};
+    Setting<u32> native_map{0};
     // With native execution: the packets of SDK helper calls the command processor has no use for are replaced by one NOP
     // (bit 0: depth transition quads of the render target tracking, bit 1: resource tracking, bit 2: copies).
     Setting<u32> native_sdk_strip{0};
@@ -569,6 +570,7 @@ struct GPUSettings {
             make_override<GPUSettings>("native_synth_verify", &GPUSettings::native_synth_verify),
             make_override<GPUSettings>("native_draw_exec", &GPUSettings::native_draw_exec),
             make_override<GPUSettings>("native_audit_every", &GPUSettings::native_audit_every),
+            make_override<GPUSettings>("native_map", &GPUSettings::native_map),
             make_override<GPUSettings>("native_sdk_strip", &GPUSettings::native_sdk_strip),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
@@ -579,7 +581,7 @@ struct GPUSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
                                    internal_screen_height, null_gpu, copy_gpu_buffers,
                                    readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, readback_batching_enabled, readback_async_fences_enabled, readback_fence_wait_shortcut, readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime, rt_lookup_reuse_enabled, stage_lookup_reuse, readback_async_guest_faults, readback_linear_images_async, readback_dma_async, readback_hot_file, cp_encoder_mode, cp_encoder_debug, cp_thread_priority, cp_encoder_queue_depth, cp_full_fence_kinds, cp_split_mode, cp_flush_commands, cp_raster_core, cp_front_core, cp_encoder_core, debug_server_port, cpu_prepatch_tcb, native_draw_mode, native_draw_classes, native_synth_verify, native_draw_exec, native_audit_every,
+                                   direct_memory_access_enabled, readback_batching_enabled, readback_async_fences_enabled, readback_fence_wait_shortcut, readback_stream_reuse_enabled, readback_prefetch_mode, readback_prefetch_lifetime, rt_lookup_reuse_enabled, stage_lookup_reuse, readback_async_guest_faults, readback_linear_images_async, readback_dma_async, readback_hot_file, cp_encoder_mode, cp_encoder_debug, cp_thread_priority, cp_encoder_queue_depth, cp_full_fence_kinds, cp_split_mode, cp_flush_commands, cp_raster_core, cp_front_core, cp_encoder_core, debug_server_port, cpu_prepatch_tcb, native_draw_mode, native_draw_classes, native_synth_verify, native_draw_exec, native_audit_every, native_map,
                                    dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
@@ -895,6 +897,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, NativeSynthVerify, native_synth_verify)
     SETTING_FORWARD_BOOL(m_gpu, NativeDrawExec, native_draw_exec)
     SETTING_FORWARD(m_gpu, NativeAuditEvery, native_audit_every)
+    SETTING_FORWARD(m_gpu, NativeMap, native_map)
     SETTING_FORWARD(m_gpu, NativeSdkStrip, native_sdk_strip)
     SETTING_FORWARD(m_gpu, CpEncoderQueueDepth, cp_encoder_queue_depth)
     SETTING_FORWARD(m_gpu, CpFullFenceKinds, cp_full_fence_kinds)

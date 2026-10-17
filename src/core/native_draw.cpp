@@ -28,6 +28,7 @@
 #include "core/native_draw.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
+#include "video_core/amdgpu/pixel_format.h"
 #include "video_core/native_draw_tag.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fixed_state.h"
@@ -2307,37 +2308,30 @@ u64 MakeCopyRecord(u64 ctx, u64 destination, u64 source, u64 bytes, u64 caller, 
 /// device's copy shader for the destination's format: shader resource = the source subresource, constant buffer = the
 /// source size at the subresource's mip, RW resource = the destination subresource). Returns 0 when the arguments are not
 /// the plain case.
-u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 source, u32 source_sub, u64 caller) {
+/// The T# of a resource's subresource as the game's copy functions hand it to their copy shader.
+void ResourceTextureDescriptor(u64 resource, u32 subresource, bool writable, std::array<u32, 8>& t) {
+    for (u32 k = 0; k < 8; ++k) {
+        t[k] = Rd<u32>(resource, 0x70 + k * 4);
+    }
+    const u32 mips = t[3] > 0xdfffffffu ? 1u : ((t[3] >> 16) & 0xf) + 1;
+    if (((t[3] >> 28) | 1) != 0xf) {
+        const u32 mip = (subresource % mips) & 0xf;
+        t[3] = (mip << 16) | (mip << 12) | (t[3] & 0xfff00fffu);
+    }
+    const u32 slice = subresource / mips;
+    t[5] = ((slice & 0x1fff) << 13) | (slice & 0x1fff) | (t[5] & 0xfc000000u);
+    if (writable) {
+        t[3] &= ~(1u << 26);
+        t[1] = (t[1] & 0x3fffff3fu) | 0xc0000040u;
+    }
+}
+
+/// The record of the texture copy dispatch (the game's copy shader: a T# in, a T# out, the extent as constants).
+u64 MakeUploadRecord(u64 ctx, const std::array<u32, 8>& srv, const std::array<u32, 8>& uav, u32 width, u32 height, u64 caller) {
     const VAddr image = image_base.load(std::memory_order_relaxed);
-    if (image == 0) {
+    if (image == 0 || width == 0 || height == 0) {
         return 0;
     }
-    const auto texture_descriptor = [&](u64 resource, u32 subresource, bool writable, std::array<u32, 8>& t) {
-        for (u32 k = 0; k < 8; ++k) {
-            t[k] = Rd<u32>(resource, 0x70 + k * 4);
-        }
-        const u32 mips = t[3] > 0xdfffffffu ? 1u : ((t[3] >> 16) & 0xf) + 1;
-        if (((t[3] >> 28) | 1) != 0xf) {
-            const u32 mip = (subresource % mips) & 0xf;
-            t[3] = (mip << 16) | (mip << 12) | (t[3] & 0xfff00fffu);
-        }
-        const u32 slice = subresource / mips;
-        t[5] = ((slice & 0x1fff) << 13) | (slice & 0x1fff) | (t[5] & 0xfc000000u);
-        if (writable) {
-            t[3] &= ~(1u << 26);
-            t[1] = (t[1] & 0x3fffff3fu) | 0xc0000040u;
-        }
-    };
-    std::array<u32, 8> srv{}, uav{};
-    texture_descriptor(destination, destination_sub, true, uav);
-    texture_descriptor(source, source_sub, false, srv);
-    const u32 source_mips = Rd<u32>(source, 0x188);
-    if (source_mips == 0) {
-        return 0;
-    }
-    const u32 mip_shift = (source_sub % source_mips) & 0x1f;
-    const u32 width = Rd<u32>(source, 0x180) >> mip_shift;
-    const u32 height = Rd<u32>(source, 0x184) >> mip_shift;
     const u32 format_bits = (uav[1] >> 20) & 0x3f;
     const u32 class_entry = format_bits < 0x3d ? Rd<u32>(image + 0x25e0520 - 0x1000000, format_bits * 4) : 0;
     const u64 shader_index = format_bits < 0x3d ? static_cast<u64>(static_cast<s64>(static_cast<s32>(class_entry) + 3)) : 3;
@@ -2346,7 +2340,7 @@ u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 so
     }
     const u64 device = Rd<u64>(image + 0x6b034e0 - 0x1000000, shader_index * 8);
     const u64 gnm = device ? Rd<u64>(device, 0x120) : 0;
-    if (gnm == 0 || width == 0 || height == 0) {
+    if (gnm == 0) {
         return 0;
     }
     const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
@@ -2443,6 +2437,18 @@ u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 so
     slot.flags = (table_overflow || bad_object_seen ? SpecialPipeline : 0u) | synth_flags | (slot.unsupported_inputs != 0 ? SpecialPipeline : 0u);
     slot.seq.store(seq, std::memory_order_release);
     return seq;
+}
+
+u64 MakeCopyResourceRecord(u64 ctx, u64 destination, u32 destination_sub, u64 source, u32 source_sub, u64 caller) {
+    std::array<u32, 8> srv{}, uav{};
+    ResourceTextureDescriptor(destination, destination_sub, true, uav);
+    ResourceTextureDescriptor(source, source_sub, false, srv);
+    const u32 source_mips = Rd<u32>(source, 0x188);
+    if (source_mips == 0) {
+        return 0;
+    }
+    const u32 mip_shift = (source_sub % source_mips) & 0x1f;
+    return MakeUploadRecord(ctx, srv, uav, Rd<u32>(source, 0x180) >> mip_shift, Rd<u32>(source, 0x184) >> mip_shift, caller);
 }
 
 /// Guest thread: the record of FUN_02485c00 with a source of several different dwords: the device's copy-with-wrap shader
@@ -4499,6 +4505,121 @@ u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, 
     return 1;
 }
 
+/// JsDeviceContext::Map of a 2D texture with a map type that is not a pure read or no-overwrite (the game maps three small dynamic
+/// textures a frame with type 4): the function allocates a linear scratch, returns it for the CPU to fill and records the copy
+/// dispatch that later moves the scratch into the texture (the shader of CopyResource: T# in, T# out, extent constants). `map_native`
+/// 1: the tag points at the record built from the objects and the game's packets stay, so the record is compared with them; 2: the
+/// record is executed and the packets become one no-op. The game's function always runs (it sets the scratch, the output and the
+/// engine's fields); only what it wrote into the command buffer changes.
+u64 MakeMapUploadRecord(u64 ctx, u64 resource, u64 scratch, u64 caller) {
+    std::array<u32, 8> uav{}, srv{};
+    ResourceTextureDescriptor(resource, 0, true, uav);
+    ResourceTextureDescriptor(resource, 0, false, srv);
+    const u32 width = Rd<u32>(resource, 0x180);
+    const u32 height = Rd<u32>(resource, 0x184);
+    const auto data_format = static_cast<AmdGpu::DataFormat>((srv[1] >> 20) & 0x3f);
+    const u32 bits = AmdGpu::NumBitsPerElement(data_format);
+    if (bits == 0 || bits % 8 != 0 || (scratch & 0xff) != 0 || scratch >= (1ull << 48)) {
+        return 0;
+    }
+    // the scratch is read as a linear aligned texture whose rows are padded to 64 bytes
+    const u32 bytes = bits / 8;
+    const u32 pitch = (width * bytes + 63) / 64 * 64 / bytes;
+    const u64 base = scratch >> 8;
+    srv[0] = static_cast<u32>(base);
+    srv[1] = (srv[1] & ~0xffu) | static_cast<u32>((base >> 32) & 0xff);
+    srv[3] = (srv[3] & ~(0x1fu << 20)) | (8u << 20);
+    srv[4] = (srv[4] & ~(0x3fffu << 13)) | (((pitch - 1) & 0x3fffu) << 13);
+    return MakeUploadRecord(ctx, srv, uav, width, height, caller);
+}
+
+using GuestMap7 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64, u64);
+
+u64 PS4_SYSV_ABI TagMap(u64 ctx, u64 resource, u64 subresource, u64 type, u64 a4, u64 size, u64 ret, u64 caller_rsp) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    const s32 mode = policy.map_native.load(std::memory_order_relaxed);
+    const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
+    if (mode == 0 || ctx == 0 || !valid(resource) || subresource != 0 || (type != 2 && type != 3 && type != 4) ||
+        policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
+        policy.native_draw_exec.load(std::memory_order_relaxed) == 0 || Rd<u32>(resource, 0x124) != 3) {
+        return 0;
+    }
+    const u64 original = Core::GuestHooks::OriginalEntry("Map");
+    const u64 out = Rd<u64>(caller_rsp, 0);
+    if (original == 0 || out == 0 || (out & 7) != 0) {
+        return 0;
+    }
+    auto& live = Live();
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    // a tag in front of the function's packets: a placeholder record the game's packets stay valid for until the real one is known
+    const u64 placeholder = next_seq.fetch_add(1, std::memory_order_relaxed);
+    {
+        auto& slot = Slot(placeholder);
+        slot.seq.store(0, std::memory_order_release);
+        slot.check_count = 0;
+        slot.count = 0;
+        slot.kind = 3;
+        slot.caller = ret;
+        slot.flags = SpecialPipeline;
+        slot.seq.store(placeholder, std::memory_order_release);
+    }
+    u32 words[TagDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8);
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (3u << 8);
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &placeholder, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    const u64 writer = ctx + 0x47c0;
+    if (!WriteDwords(ctx, words, TagDwords)) {
+        tags_failed.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const u64 tag_address = Rd<u64>(writer, 0x10) - TagDwords * sizeof(u32);
+    const u64 base_before = Rd<u64>(writer, 0x0);
+    const u64 value = 0x8000000000000000ull | (reinterpret_cast<GuestMap7>(original)(ctx, resource, subresource, type, a4, size, out) & 0x7fffffffffffffffull);
+    live.map_tried.fetch_add(1, std::memory_order_relaxed);
+    const u64 span_begin = tag_address + TagDwords * sizeof(u32);
+    const u64 span_end = Rd<u64>(writer, 0x10);
+    const u64 scratch = Rd<u64>(out, 0);
+    if (Rd<u64>(writer, 0x0) != base_before || span_end < span_begin + 2 * sizeof(u32) || span_end > Rd<u64>(writer, 0x8) ||
+        scratch == 0 || scratch != Rd<u64>(resource, 0x170)) {
+        live.map_refused.fetch_add(1, std::memory_order_relaxed);
+        return value;
+    }
+    const u64 seq = Guarded([&] { return MakeMapUploadRecord(ctx, resource, scratch, ret); });
+    if (seq == 0 || Slot(seq).flags != 0) {
+        live.map_refused.fetch_add(1, std::memory_order_relaxed);
+        return value;
+    }
+    const bool exec = mode >= 2 && ExecEligibleCompute(ctx, seq, ret);
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    if (exec) {
+        words[2] |= ExecFlag;
+    }
+    std::memcpy(reinterpret_cast<void*>(tag_address), words, sizeof(words));
+    NoteAnchor(tag_address, seq, 3);
+    live.map_patched.fetch_add(1, std::memory_order_relaxed);
+    if (exec) {
+        u32 remaining = static_cast<u32>((span_end - span_begin) / sizeof(u32));
+        u64 at = span_begin;
+        while (remaining != 0) {
+            u32 count = std::min<u32>(remaining, 0x4001);
+            if (remaining - count == 1) {
+                --count;
+            }
+            Wr<u32>(at, 0, 0xC0000000u | ((count - 2) << 16) | (0x10u << 8));
+            at += count * sizeof(u32);
+            remaining -= count;
+        }
+        live.map_exec.fetch_add(1, std::memory_order_relaxed);
+        live.compute_exec.fetch_add(1, std::memory_order_relaxed);
+        compute_drawn.fetch_add(1, std::memory_order_relaxed);
+    }
+    return value;
+}
+
 /// JsDeviceContext::ExCsDepthCopy(context, destination, source): the depth surface and its HTILE surface copied as raw
 /// dwords with the device's copy shader, two dispatches (the buffer copy of CsCopyBufferDwords), with event and scratch
 /// label fences in between. With execution: two copy records, the fields the function sets at its end, nothing else.
@@ -5383,6 +5504,9 @@ u64 FindHandler(const std::string& name) {
     }
     if (name == "tag_asc_cs_copy") {
         return reinterpret_cast<u64>(&TagAscCsCopy);
+    }
+    if (name == "tag_map") {
+        return reinterpret_cast<u64>(&TagMap);
     }
     if (name == "tag_copy_resource") {
         return reinterpret_cast<u64>(&TagCopyResource);

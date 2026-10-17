@@ -132,6 +132,7 @@ nlohmann::json Native(const Params&) {
     j["sync_acquires_stripped"] = live.sync_acquires_stripped.load();
     j["sync_events_stripped"] = live.sync_events_stripped.load();
     j["barrier_calls_skipped"] = live.barrier_calls_skipped.load();
+    j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();

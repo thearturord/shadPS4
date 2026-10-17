@@ -80,10 +80,22 @@ std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwor
         const auto* write = reinterpret_cast<const PM4CmdWriteData*>(header);
         const u32 count = dwords >= 4 ? dwords - 3 : 0;
         std::string text = fmt::format("WRITE label={:#x} dst_sel={} dwords={}", write->Address<u64>(), write->dst_sel.Value(), count);
-        for (u32 i = 0; i < count && i < 2; ++i) {
-            text += fmt::format(" {:#x}", write->data[i]);
+        for (u32 i = 0; i < count && i < 64; ++i) {
+            text += fmt::format(" {:x}", write->data[i]);
         }
         return text;
+    }
+    case PM4ItOpcode::SetShReg: {
+        const auto* set = reinterpret_cast<const AmdGpu::PM4CmdSetData*>(header);
+        std::string text = fmt::format("SET_SH reg={:#x} n={}:", set->reg_offset.Value(), dwords - 1);
+        for (u32 i = 0; i + 1 < dwords && i < 16; ++i) {
+            text += fmt::format(" {:x}", set->data[i]);
+        }
+        return text;
+    }
+    case PM4ItOpcode::DispatchDirect: {
+        const auto* dispatch = reinterpret_cast<const AmdGpu::PM4CmdDispatchDirect*>(header);
+        return fmt::format("DISPATCH {}x{}x{} initiator {:#x}", dispatch->dim_x, dispatch->dim_y, dispatch->dim_z, dispatch->dispatch_initiator);
     }
     case PM4ItOpcode::WaitRegMem: {
         const auto* wait = reinterpret_cast<const PM4CmdWaitRegMem*>(header);

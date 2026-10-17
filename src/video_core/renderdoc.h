@@ -50,4 +50,16 @@ u32 ConsumeWithOverlaysScreenshotRequests();
 /// Atomically consumes and returns pending screenshot request counters.
 ScreenshotRequests ConsumeScreenshotRequests();
 
+/// Debug: capture the guest output of the next `frames` presented game frames (every flip once), cropped to the rectangle given in
+/// fractions of the image, into log/frame_sequence (debug server /capture).
+struct FrameSequenceStep {
+    u32 index{};
+    float x0{}, y0{}, x1{1.0f}, y1{1.0f};
+};
+void RequestFrameSequence(u32 frames, float x0, float y0, float x1, float y1);
+/// True when the game frame being prepared is part of the sequence; fills in what to capture.
+bool TakeFrameSequenceStep(FrameSequenceStep& step);
+/// Frames of the sequence not captured yet.
+u32 FrameSequenceRemaining();
+
 } // namespace VideoCore

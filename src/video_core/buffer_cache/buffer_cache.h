@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/readback_policy.h"
+
 #include <condition_variable>
 #include <mutex>
 #include <vector>
@@ -147,7 +149,7 @@ public:
     /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
     /// Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size) {
-        if (stream_reuse_enabled) {
+        if (StreamReuseOn()) {
             InvalidateStreamReuse(device_addr, size);
         }
     }
@@ -292,6 +294,10 @@ private:
     /// readback_stream_reuse_enabled: stream copies of the current command buffer by range. A copy
     /// is only reused while the command buffer, and the stream buffer pass, are the same.
     const bool stream_reuse_enabled;
+    bool StreamReuseOn() const {
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().stream_reuse_override.load(std::memory_order_relaxed);
+        return override_mode >= 0 ? override_mode != 0 : stream_reuse_enabled;
+    }
     /// readback_prefetch_mode: 0 = no prefetch, 1 = read and write faults, 2 = read faults only.
     const u32 prefetch_mode;
     /// readback_async_guest_faults: guest threads wait for their readbacks themselves.

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 #include <nlohmann/json_fwd.hpp>
 #include "common/types.h"
 
@@ -74,6 +75,13 @@ void NoteImageClear(bool done, u32 reason);
 
 /// Usage of a JsBuffer / JsTexture object (0 default, 1 immutable, 2 dynamic, 3 staging), ~0u when it cannot be read.
 u32 ResourceUsage(u64 object);
+
+/// The usage class (0 unknown, else 1 + (kind - 1) * 4 + usage) of the heap block that contains `address`, from the census snapshot.
+u32 UsageClassOf(VAddr address);
+/// "buffer/dynamic" and the like.
+std::string UsageClassNameOf(u32 usage_class);
+/// The heap block around `address`: class, begin and size ("unknown" when the census is off or the address is in no block).
+std::string DescribeAddress(VAddr address);
 
 void Start();
 nlohmann::json Report();

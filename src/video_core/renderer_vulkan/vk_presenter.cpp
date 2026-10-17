@@ -413,6 +413,29 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
+/// One frame of a debug capture sequence: the cropped guest output as a PNG (the crop is in fractions of the image).
+static void SaveSequenceFrame(const ScreenshotReadback& readback, const VideoCore::FrameSequenceStep& step) {
+    if (readback.paths.empty()) {
+        return;
+    }
+    std::vector<u8> rgba;
+    if (!ConvertReadbackToRgba8(readback, rgba)) {
+        return;
+    }
+    const u32 x0 = static_cast<u32>(std::clamp(step.x0, 0.0f, 1.0f) * readback.width);
+    const u32 x1 = std::max(x0 + 1, static_cast<u32>(std::clamp(step.x1, 0.0f, 1.0f) * readback.width));
+    const u32 y0 = static_cast<u32>(std::clamp(step.y0, 0.0f, 1.0f) * readback.height);
+    const u32 y1 = std::max(y0 + 1, static_cast<u32>(std::clamp(step.y1, 0.0f, 1.0f) * readback.height));
+    const u32 w = std::min(x1, readback.width) - x0;
+    const u32 h = std::min(y1, readback.height) - y0;
+    std::vector<u8> crop(static_cast<size_t>(w) * h * 4);
+    for (u32 row = 0; row < h; ++row) {
+        std::memcpy(crop.data() + static_cast<size_t>(row) * w * 4, rgba.data() + (static_cast<size_t>(y0 + row) * readback.width + x0) * 4,
+                    static_cast<size_t>(w) * 4);
+    }
+    WritePng(readback.paths.front(), crop, w, h);
+}
+
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
         return;
@@ -737,6 +760,34 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    VideoCore::FrameSequenceStep sequence_step;
+    std::optional<ScreenshotReadback> pending_sequence;
+    if (!pending_screenshot && VideoCore::TakeFrameSequenceStep(sequence_step)) {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_sequence";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        const bool hdr_encoded =
+            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
+        auto& readback = pending_sequence.emplace(
+            instance, ScreenshotKind::GameOnly,
+            std::vector<std::filesystem::path>{dir / fmt::format("f{:04}_p{}.png", sequence_step.index, Core::DebugServer::PresentCount())},
+            image_size.width, image_size.height, view_info.format, hdr_encoded);
+        const vk::BufferImageCopy copy_region = {
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {readback.width, readback.height, 1},
+        };
+        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -760,6 +811,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             [deferred_screenshot = std::move(pending_screenshot)]() {
                 SavePendingScreenshot(deferred_screenshot.value());
             });
+    }
+    if (pending_sequence) {
+        draw_scheduler.DeferPriorityOperation(
+            [deferred = std::move(pending_sequence), sequence_step]() { SaveSequenceFrame(deferred.value(), sequence_step); });
     }
 
     // Flush frame creation commands.

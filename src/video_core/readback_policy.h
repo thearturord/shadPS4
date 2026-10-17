@@ -69,6 +69,11 @@ struct State {
     std::atomic<u32> native_audit_every{64}; ///< see emulator_settings.h
     std::atomic<u32> native_sdk_strip{0};    ///< see emulator_settings.h
     std::atomic<u32> native_draw_exec{0};
+    /// Ablation switches (documents/tlg/native-isolation.md): -1 = the setting, otherwise the value. Applied live.
+    std::atomic<s32> fence_shortcut_override{-1}; ///< readback_fence_wait_shortcut 0..3
+    std::atomic<s32> stream_reuse_override{-1};   ///< readback_stream_reuse_enabled 0/1
+    std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
+    std::atomic<s32> stage_reuse_override{-1};    ///< stage_lookup_reuse 0..2
 };
 
 State& Get();

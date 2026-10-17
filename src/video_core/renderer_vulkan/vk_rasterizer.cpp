@@ -9,6 +9,7 @@
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "core/debug_state.h"
@@ -298,11 +299,36 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
         live.fixed_native.fetch_add(1, std::memory_order_relaxed);
         // the clear flags of the render pass are register state the native path does not describe
         native_stale |= StaleClear;
+        // The surface group (culling, front face, polygon mode) comes from the engine's rasterizer state object, also where the engine did
+        // not write the register for this draw. The register mirror is not a reliable source for it: its value differs from the object's in
+        // nearly every such draw and changes with the frame (a period of three), which flickers tattoos, leaves and whole meshes
+        // (native-isolation.md). Bit 268435456 of native_sdk_strip restores the old behaviour (bit 536870912 does the same for the clip group,
+        // which is not measured to matter).
+        const u32 strip = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
+        const bool surface_from_mirror = (strip & 268435456) != 0;
+        if (!surface_from_mirror) {
+            native_stale &= ~StaleSurface;
+        }
+        if ((strip & 536870912) != 0) {
+            native_stale &= ~StaleClip;
+        }
         FixedState merged = *native;
         TakeFromRegisters(merged, regs, native_stale);
+        if (Core::NativeAudit::StaleEnabled()) {
+            const std::string stale_diff = DiffFixedState(*native, merged);
+            Core::NativeAudit::NoteStale(native_stale, !stale_diff.empty(), stale_diff, Core::NativeAudit::PlanCaller(),
+                                         Core::DebugServer::PresentCount());
+        }
         const FixedState* use = &merged;
         if (verify) {
             plan->fixed = MakeFixedState(regs);
+            if (!surface_from_mirror) {
+                // the mirror's surface group is not the reference any more (see above): compare everything else
+                plan->fixed.cull_mode = merged.cull_mode;
+                plan->fixed.front_face = merged.front_face;
+                plan->fixed.polygon_mode = merged.polygon_mode;
+                plan->fixed.provoking_first = merged.provoking_first;
+            }
             live.fixed_checked.fetch_add(1, std::memory_order_relaxed);
             const std::string diff = DiffFixedState(*use, plan->fixed);
             if (!diff.empty() && live.fixed_diff.fetch_add(1, std::memory_order_relaxed) < 60) {
@@ -463,7 +489,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             continue;
         }
         const auto& hint = liverpool->RasterCbExtents()[cb];
-        if (rt_reuse_enabled && TargetInputsMatch(rt_cache[cb], col_buf, hint)) {
+        if (RtReuseOn() && TargetInputsMatch(rt_cache[cb], col_buf, hint)) {
             // Same registers and no image registered or removed since: FindImage would find the
             // same image again (image_id and desc still hold its result).
             bound_images.emplace_back(image_id);
@@ -471,7 +497,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
         } else {
             std::construct_at(&desc, col_buf, hint);
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
-            if (rt_reuse_enabled) {
+            if (RtReuseOn()) {
                 rt_cache[cb].valid = true;
                 rt_cache[cb].generation = texture_cache.ImageGeneration();
             }
@@ -486,7 +512,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
         const auto& hint = liverpool->RasterDbExtent();
         auto& [image_id, desc] = db_desc;
         auto& cache = rt_cache[AmdGpu::NUM_COLOR_BUFFERS];
-        if (rt_reuse_enabled && TargetInputsMatch(cache, regs.depth_buffer, regs.depth_view,
+        if (RtReuseOn() && TargetInputsMatch(cache, regs.depth_buffer, regs.depth_view,
                                                   regs.depth_control, htile_address, hint)) {
             bound_images.emplace_back(image_id);
             texture_cache.TouchFoundImage(image_id);
@@ -494,7 +520,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
             std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                               htile_address, hint);
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
-            if (rt_reuse_enabled) {
+            if (RtReuseOn()) {
                 cache.valid = true;
                 cache.generation = texture_cache.ImageGeneration();
             }

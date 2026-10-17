@@ -81,6 +81,14 @@ bool Set(std::string_view name, s64 value) {
         s.native_audit_every = static_cast<u32>(value);
     } else if (name == "native_sdk_strip") {
         s.native_sdk_strip = static_cast<u32>(value);
+    } else if (name == "fence_shortcut") {
+        s.fence_shortcut_override = static_cast<s32>(value);
+    } else if (name == "stream_reuse") {
+        s.stream_reuse_override = static_cast<s32>(value);
+    } else if (name == "rt_reuse") {
+        s.rt_reuse_override = static_cast<s32>(value);
+    } else if (name == "stage_reuse") {
+        s.stage_reuse_override = static_cast<s32>(value);
     } else {
         return false;
     }
@@ -116,6 +124,10 @@ nlohmann::json Dump() {
             {"native_draw_classes", s.native_draw_classes.load()},
             {"native_audit_every", s.native_audit_every.load()},
             {"native_sdk_strip", s.native_sdk_strip.load()},
+            {"fence_shortcut", s.fence_shortcut_override.load()},
+            {"stream_reuse", s.stream_reuse_override.load()},
+            {"rt_reuse", s.rt_reuse_override.load()},
+            {"stage_reuse", s.stage_reuse_override.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};
 }

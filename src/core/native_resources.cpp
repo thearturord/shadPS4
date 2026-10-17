@@ -674,6 +674,27 @@ void NoteImmutableSync() {
     immutable_syncs.fetch_add(1, std::memory_order_relaxed);
 }
 
+u32 UsageClassOf(VAddr address) {
+    const Snapshot* snapshot = current.load(std::memory_order_acquire);
+    size_t index = 0;
+    const Block* block = Find(snapshot, address, &index);
+    return block ? block->usage_class : 0;
+}
+
+std::string UsageClassNameOf(u32 usage_class) {
+    return UsageClassName(usage_class);
+}
+
+std::string DescribeAddress(VAddr address) {
+    const Snapshot* snapshot = current.load(std::memory_order_acquire);
+    size_t index = 0;
+    const Block* block = Find(snapshot, address, &index);
+    if (block == nullptr) {
+        return "unknown";
+    }
+    return fmt::format("{} block {:#x}+{:#x} (heap {})", UsageClassName(block->usage_class), block->address, block->size, block->heap);
+}
+
 u32 ResourceUsage(u64 object) {
     Resource resource;
     return ReadResource(object, resource) ? resource.usage : ~0u;

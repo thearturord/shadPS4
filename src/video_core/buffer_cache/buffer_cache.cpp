@@ -13,6 +13,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/native_audit.h"
 #include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -650,7 +651,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
         // Stream copies are at most STREAM_THRESHOLD bytes, so the size fits in the low 16 bits.
         const u64 reuse_key = (device_addr << 16) | size;
-        if (stream_reuse_enabled) {
+        if (StreamReuseOn()) {
             const u64 tick = scheduler.CurrentTick();
             const u64 wraps = stream_buffer.WrapCount();
             if (tick != stream_reuse_tick || wraps != stream_reuse_wraps) {
@@ -672,7 +673,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         stream_buffer.Commit();
         Core::NativeResources::NoteBufferRequest(device_addr, size, false,
                                                  Core::NativeResources::BufferPath::StreamCopy, size);
-        if (stream_reuse_enabled && stream_buffer.WrapCount() == stream_reuse_wraps) {
+        if (StreamReuseOn() && stream_buffer.WrapCount() == stream_reuse_wraps) {
             stream_reuse.emplace(reuse_key, offset);
             stream_reuse_min = std::min<VAddr>(stream_reuse_min, device_addr);
             stream_reuse_max = std::max<VAddr>(stream_reuse_max, device_addr + size);
@@ -709,6 +710,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     if (is_written) {
         std::unique_lock lock{gpu_ranges_mutex};
         gpu_modified_ranges.Add(device_addr, size);
+        if (Core::NativeAudit::Enabled()) {
+            Core::NativeAudit::NoteGpuWrite(device_addr, size);
+        }
+    } else if (Core::NativeAudit::Enabled() && !is_texel_buffer && !IsRegionGpuModified(device_addr, size)) {
+        Core::NativeAudit::CheckClean(device_addr, size);
     }
     const u64 offset = arena->Offset(device_addr);
     if (memo) {
@@ -959,6 +965,11 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
+        if (Core::NativeAudit::Enabled()) {
+            for (const auto& copy : copies) {
+                Core::NativeAudit::NoteUpload(copy.dstOffset + arena->cpu_addr, staging.mapped + (copy.srcOffset - staging.offset), copy.size);
+            }
+        }
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
     if (is_texel_buffer && !is_written) {

@@ -7,6 +7,7 @@
 #include "core/native_draw.h"
 
 #include "video_core/native_draw_tag.h"
+#include "video_core/readback_policy.h"
 
 #include <source_location>
 #include <condition_variable>
@@ -349,7 +350,9 @@ private:
     /// queue waits, 3 = like 2 plus a GPU barrier that orders the work after the wait on the
     /// GPU (the wait passes on a recorded fence instead of a finished one).
     [[nodiscard]] bool FenceShortcutEnabled(bool is_compute) const noexcept {
-        return fence_wait_shortcut != 0 && (!is_compute || fence_wait_shortcut >= 2);
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().fence_shortcut_override.load(std::memory_order_relaxed);
+        const u32 mode = override_mode >= 0 ? static_cast<u32>(override_mode) : fence_wait_shortcut;
+        return mode != 0 && (!is_compute || mode >= 2);
     }
 
     /// Called when a wait passed on a recorded fence: orders the following GPU work after it.

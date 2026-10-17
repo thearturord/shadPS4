@@ -831,14 +831,18 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     // Most lookups pick the same variant as the previous one: check it first, without building
     // a new specialization (stage_lookup_reuse).
     size_t fast_perm = ~size_t{0};
-    if (stage_lookup_reuse != 0 && program->last_perm < program->modules.size()) {
+    const u32 stage_reuse = [&] {
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().stage_reuse_override.load(std::memory_order_relaxed);
+        return override_mode >= 0 ? static_cast<u32>(override_mode) : stage_lookup_reuse;
+    }();
+    if (stage_reuse != 0 && program->last_perm < program->modules.size()) {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageSpec};
         if (program->modules[program->last_perm].spec.Matches(info, runtime_info, binding)) {
             fast_perm = program->last_perm;
             VideoCore::ReadbackStats::OnReuse(VideoCore::ReadbackStats::Reuse::StageFastPath);
         }
     }
-    if (fast_perm != ~size_t{0} && stage_lookup_reuse != 2) {
+    if (fast_perm != ~size_t{0} && stage_reuse != 2) {
         VideoCore::ReadbackStats::CpTimer t{VideoCore::ReadbackStats::CpTime::StageFind};
         info.AddBindings(binding);
         const auto& found = program->modules[fast_perm];

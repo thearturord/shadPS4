@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "video_core/readback_policy.h"
+
 #include "video_core/amdgpu/draw_state.h"
 #include <mutex>
 #include <vector>
@@ -300,6 +302,10 @@ private:
     };
     std::array<CachedTextureLookup, 512> texture_lookup_cache{};
     const bool rt_reuse_enabled;
+    bool RtReuseOn() const {
+        const s32 override_mode = VideoCore::ReadbackPolicy::Get().rt_reuse_override.load(std::memory_order_relaxed);
+        return override_mode >= 0 ? override_mode != 0 : rt_reuse_enabled;
+    }
     const u32 encoder_debug;
     /// Encoder thread: fences without readbacks wait for all work recorded before them.
     const bool full_eop_fences;

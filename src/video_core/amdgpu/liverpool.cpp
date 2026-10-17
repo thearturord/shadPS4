@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
+#include "core/native_audit.h"
 #include "core/native_direct.h"
 #include "core/native_draw.h"
 #include "core/native_readbacks.h"
@@ -633,6 +634,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
                                              .instance_sgpr_offset = call.instance_sgpr_offset,
                                              .is_indirect = true}
                 : Vulkan::DrawIndirectParams{};
+        Core::NativeAudit::SetPlanCaller(call.tag.valid ? Core::NativeDraw::RecordCaller(call.tag.seq) : 0);
         op.draw_plan = rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale,
                                                   native_fixed_verify);
     }

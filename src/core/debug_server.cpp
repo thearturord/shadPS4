@@ -21,6 +21,8 @@
 #include "core/memory.h"
 #include "core/native_draw.h"
 #include "core/native_entry_dump.h"
+#include "core/native_audit.h"
+#include "video_core/renderdoc.h"
 #include "core/native_readbacks.h"
 #include "video_core/readback_policy.h"
 #include "video_core/thread_profiler.h"
@@ -392,6 +394,22 @@ void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
     Register("/native", "native renderer counters (cumulative)", Native);
+    Register("/capture",
+             "?frames=24&x0=0&y0=0&x1=1&y1=1: save the guest output of the next frames (every game flip once), cropped (fractions), to log/frame_sequence/f<index>_p<present>.png; "
+             "without frames: how many are left",
+             [](const Params& params) {
+                 if (params.find("frames") != params.end()) {
+                     const auto number = [&](const char* key, float fallback) {
+                         const auto it = params.find(key);
+                         return it == params.end() || it->second.empty() ? fallback : std::stof(it->second);
+                     };
+                     VideoCore::RequestFrameSequence(static_cast<u32>(std::min<u64>(ParseNumber(params, "frames", 24), 600)), number("x0", 0.0f),
+                                                     number("y0", 0.0f), number("x1", 1.0f), number("y1", 1.0f));
+                 }
+                 return nlohmann::json{{"remaining", VideoCore::FrameSequenceRemaining()}};
+             });
+    Register("/audit", "tracker audit: how often the buffer cache called a page clean that the CPU had changed (native_sdk_strip bit 67108864)",
+             [](const Params&) { return Core::NativeAudit::Report(); });
     Register("/readbacks", "explicit readbacks, step 1: destinations of the engine's copy / counter read-back records, AsyncMap ranges, CPU read faults",
              [](const Params&) { return Core::NativeReadbacks::Report(); });
     Register("/entrydump",

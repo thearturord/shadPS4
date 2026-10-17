@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include "common/assert.h"
 #include "common/logging/formatter.h"
 #include "core/emulator_settings.h"
@@ -160,6 +161,36 @@ ScreenshotRequests ConsumeScreenshotRequests() {
         .game_only_count = ConsumeGameOnlyScreenshotRequests(),
         .with_overlays_count = ConsumeWithOverlaysScreenshotRequests(),
     };
+}
+
+namespace {
+std::mutex sequence_mutex;
+u32 sequence_remaining{};
+u32 sequence_next{};
+FrameSequenceStep sequence_crop{};
+} // namespace
+
+void RequestFrameSequence(u32 frames, float x0, float y0, float x1, float y1) {
+    std::scoped_lock lock{sequence_mutex};
+    sequence_remaining = frames;
+    sequence_next = 0;
+    sequence_crop = {0, x0, y0, x1, y1};
+}
+
+bool TakeFrameSequenceStep(FrameSequenceStep& step) {
+    std::scoped_lock lock{sequence_mutex};
+    if (sequence_remaining == 0) {
+        return false;
+    }
+    --sequence_remaining;
+    step = sequence_crop;
+    step.index = sequence_next++;
+    return true;
+}
+
+u32 FrameSequenceRemaining() {
+    std::scoped_lock lock{sequence_mutex};
+    return sequence_remaining;
 }
 
 } // namespace VideoCore

@@ -25,7 +25,8 @@ public:
     Span& operator=(const Span&) = delete;
 
     /// The walk is at the type 3 packet `header` of this span.
-    void Packet(const void* header);
+    /// `address`: where the packet sat in the game's buffer when `header` is a copy (0: `header` is the packet). `show`: false skips the line.
+    void Packet(const void* header, u64 address = 0, bool show = true);
 
 private:
     bool tracked{};

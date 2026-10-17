@@ -35,7 +35,7 @@ constexpr u32 OtherIndirect = 3;     ///< an indirect buffer that cannot be foll
 constexpr u32 OtherConstantBuffer = 4; ///< the submission has a constant engine buffer
 constexpr u32 BuildOnlyLimit = 5;    ///< indices below this (and above 1) are only found by the build
 
-Classified Classify(const u32* packet, bool markers) {
+Classified Classify(const u32* packet, bool markers, u32 queue) {
     const u32 header = packet[0];
     const u32 count = (header >> 16) & 0x3fff;
     const u32 opcode = (header >> 8) & 0xff;
@@ -59,6 +59,9 @@ Classified Classify(const u32* packet, bool markers) {
     }
     std::array<u32, 8> restored;
     if (const u32 sync = Core::NativeDraw::RestoreSyncTag(packet, restored, false)) {
+        if (queue == 0 && sync == 0x49) {
+            return {Class::Other, sync, dwords}; // a release memory write belongs to the async queues
+        }
         return {Class::Sync, sync, dwords};
     }
     if (magic == PM4CmdNop::PayloadType::PatchedFlip) {
@@ -107,6 +110,7 @@ void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64
 }
 
 void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool markers, bool templates) {
+    const u32 queue = buffer.queue;
     const u32* at = begin;
     const u32* const end = begin + dwords;
     while (at < end) {
@@ -119,7 +123,7 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
             ++buffer.other[OtherBadPacket];
             return;
         }
-        const Classified packet = Classify(at, markers);
+        const Classified packet = Classify(at, markers, queue);
         if (at + packet.dwords > end) {
             ++buffer.other[OtherBadPacket];
             return;
@@ -147,8 +151,11 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
                 break;
             }
             const auto* target_packets = reinterpret_cast<const u32*>(target.address);
-            if (target.dwords <= 256 && templates && Core::NativeDraw::IndirectStateTemplate(target_packets, target.dwords) != nullptr) {
+            const Core::NativeDraw::StateTemplate* state =
+                target.dwords <= 256 && templates ? Core::NativeDraw::IndirectStateTemplate(target_packets, target.dwords) : nullptr;
+            if (state != nullptr) {
                 AddEntry(buffer, EntryKind::StateBuffer, at, std::min<u32>(packet.dwords, 4), target.address, 0);
+                buffer.entries.back().seq = reinterpret_cast<u64>(state);
             } else if (depth < 3) {
                 AddSpan(buffer, target_packets, target.dwords, depth + 1, markers, templates);
             } else {
@@ -163,6 +170,10 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
 
 } // namespace
 
+bool ExecuteEnabled() {
+    return Enabled() && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8388608) != 0;
+}
+
 bool Enabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const u32 bits = policy.native_sdk_strip.load(std::memory_order_relaxed);
@@ -175,15 +186,17 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
     }
     auto buffer = std::make_shared<Buffer>();
     buffer->queue = queue;
+    buffer->begin = reinterpret_cast<u64>(dcb);
     buffer->dwords = dwords;
     buffer->markers = markers;
     const bool templates = StateTemplatesOn();
     if (has_constant_buffer) {
         ++buffer->other[OtherConstantBuffer];
-    } else if (dwords <= 256 && templates && Core::NativeDraw::IndirectStateTemplate(dcb, dwords) != nullptr) {
+    } else if (const auto* state = dwords <= 256 && templates ? Core::NativeDraw::IndirectStateTemplate(dcb, dwords) : nullptr) {
         Entry entry;
         entry.kind = EntryKind::StateBuffer;
         entry.address = reinterpret_cast<u64>(dcb);
+        entry.seq = reinterpret_cast<u64>(state);
         buffer->entries.push_back(entry);
     } else {
         buffer->entries.reserve(dwords / 8);
@@ -222,7 +235,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
 void Buffer::Expect(EntryKind kind, u64 address, u32 opcode, u64 seq) {
     if (cursor < entries.size()) {
         const Entry& entry = entries[cursor];
-        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && entry.seq == seq) {
+        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && (kind == EntryKind::StateBuffer || entry.seq == seq)) {
             ++cursor;
             ++matched;
             return;
@@ -256,7 +269,7 @@ void Buffer::Walk(const u32* packet) {
     if (!complete) {
         return;
     }
-    const Classified found = Classify(packet, markers);
+    const Classified found = Classify(packet, markers, queue);
     const u64 address = reinterpret_cast<u64>(packet);
     switch (found.cls) {
     case Class::Inert:

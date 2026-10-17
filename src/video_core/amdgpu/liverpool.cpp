@@ -685,6 +685,28 @@ void Liverpool::SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop) {
                               GfxQueueId, VideoCore::FenceGfxEop);
 }
 
+void Liverpool::StartNativeTag(const u32* tag) {
+    native_tag_pending.valid = true;
+    native_tag_pending.meta = tag[2];
+    std::memcpy(&native_tag_pending.k1, &tag[3], sizeof(u64));
+    std::memcpy(&native_tag_pending.k2, &tag[5], sizeof(u64));
+    std::memcpy(&native_tag_pending.k3, &tag[7], sizeof(u64));
+    std::memcpy(&native_tag_pending.seq, &tag[9], sizeof(u64));
+    native_follow_pending = (native_tag_pending.meta & VideoCore::NativeTagFollowFlag) != 0;
+    if (((native_tag_pending.meta >> 8) & 0xff) == 12) {
+        // hardware default state: the register writes of a constant packet sequence, applied directly
+        native_tag_pending.valid = false;
+        native_follow_pending = false;
+        if (native_tag_pending.k1 != 0) {
+            ApplyStateTemplate(*reinterpret_cast<const Core::NativeDraw::StateTemplate*>(native_tag_pending.k1));
+        }
+    } else if (native_follow_pending) {
+        // executed when the draw packet comes
+    } else if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
+        ExecuteNativeDraw();
+    }
+}
+
 void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
@@ -1833,6 +1855,94 @@ void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
 }
 } // namespace
 
+/// A wait of the graphics queue on a memory label (the walk's WaitRegMem case for a tag): tests the label, passes on the recorded
+/// fence timeline, and yields to the other queues until the label has the value.
+Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
+    FIBER_ENTER(dcb_task_name);
+    const PM4CmdWaitRegMem* wait_reg_mem = &wait_packet;
+    const u64* wait_addr = wait_reg_mem->Address<u64*>();
+    if (vo_port->IsVoLabel(wait_addr) && num_submits == mapped_queues[GfxQueueId].submits.size()) {
+        VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::FlipSleep};
+        vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+    } else if (!wait_reg_mem->Test(regs.reg_array)) {
+        using VideoCore::ReadbackStats::WaitClass;
+        const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+        bool reported = false;
+        bool blocked = false;
+        bool held_back = false;
+        WaitClass wait_class{};
+        while (true) {
+            const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+            if (match.satisfied && FenceShortcutEnabled(false)) {
+                OnWaitPassedOnFence(*wait_reg_mem, match, GfxQueueId);
+                wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                break;
+            }
+            held_back |= match.satisfied;
+            if (wait_reg_mem->Test(regs.reg_array)) {
+                wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                break;
+            }
+            blocked = true;
+            ReportLongWait(*wait_reg_mem, "gfx", wait_start, reported);
+            VideoCore::ReadbackStats::CpWaitYield(vo_port->IsVoLabel(wait_addr));
+            YIELD_GFX();
+        }
+        if (VideoCore::ReadbackStats::IsEnabled()) {
+            VideoCore::ReadbackStats::OnCommandWait(false, wait_reg_mem->Address<VAddr>(), wait_class,
+                                                    blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+        }
+    }
+    FIBER_EXIT;
+}
+
+/// A pure graphics command buffer: the entries copied at submit (Core::NativeDirect::Build), executed in order. No packet is decoded;
+/// every entry runs the function the walk runs for its packet.
+Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct) {
+    FIBER_ENTER(dcb_task_name);
+    cblock.Reset();
+    Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
+    using Core::NativeDirect::EntryKind;
+    for (const auto& entry : direct->entries) {
+        ProcessCommands();
+        entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
+        switch (entry.kind) {
+        case EntryKind::Tag:
+            StartNativeTag(entry.words.data());
+            break;
+        case EntryKind::Flip:
+            RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
+            break;
+        case EntryKind::StateBuffer: {
+            u64 pointer;
+            std::memcpy(&pointer, &entry.seq, sizeof(pointer));
+            ApplyStateTemplate(*reinterpret_cast<const Core::NativeDraw::StateTemplate*>(pointer));
+            break;
+        }
+        case EntryKind::Sync: {
+            std::array<u32, 8> restored;
+            const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
+            if (opcode == 0x47) {
+                SignalGraphicsEop(*reinterpret_cast<const PM4CmdEventWriteEop*>(restored.data()));
+            } else if (opcode == 0x37) {
+                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(restored.data());
+                CpWriteData(write_data->Address<u64*>(), write_data->data, (write_data->header.count.Value() - 2) * 4, GfxQueueId);
+            } else if (opcode == 0x3c) {
+                auto task = DirectWait(*reinterpret_cast<const PM4CmdWaitRegMem*>(restored.data()));
+                RESUME_GFX(task);
+                while (!task.handle.done()) {
+                    YIELD_GFX();
+                    RESUME_GFX(task);
+                }
+                task.handle.destroy();
+            }
+            break;
+        }
+        }
+    }
+    FIBER_EXIT;
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(dcb_task_name);
     if (direct) {
@@ -1928,25 +2038,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::NativeDrawTag: {
                     if (nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
-                        native_tag_pending.valid = true;
-                        native_tag_pending.meta = nop->data_block[1];
-                        std::memcpy(&native_tag_pending.k1, &nop->data_block[2], sizeof(u64));
-                        std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
-                        std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
-                        std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
-                        native_follow_pending = (native_tag_pending.meta & VideoCore::NativeTagFollowFlag) != 0;
-                        if (((native_tag_pending.meta >> 8) & 0xff) == 12) {
-                            // hardware default state: the register writes of a constant packet sequence, applied directly
-                            native_tag_pending.valid = false;
-                            native_follow_pending = false;
-                            if (native_tag_pending.k1 != 0) {
-                                ApplyStateTemplate(*reinterpret_cast<const Core::NativeDraw::StateTemplate*>(native_tag_pending.k1));
-                            }
-                        } else if (native_follow_pending) {
-                            // executed when the draw packet comes
-                        } else if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
-                            ExecuteNativeDraw();
-                        }
+                        StartNativeTag(reinterpret_cast<const u32*>(header));
                     }
                     break;
                 }
@@ -3163,7 +3255,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
-    auto task = ProcessGraphics(dcb, ccb, std::move(direct));
+    const bool run_direct = direct && direct->pure && Core::NativeDirect::ExecuteEnabled();
+    auto task = run_direct ? ProcessDirect(direct) : ProcessGraphics(dcb, ccb, std::move(direct));
+    Core::NativeDraw::Live().direct_executed.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

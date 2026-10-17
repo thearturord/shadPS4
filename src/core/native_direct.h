@@ -28,6 +28,7 @@ struct Entry {
 class Buffer {
 public:
     u32 queue{};
+    u64 begin{};
     u32 dwords{};
     bool pure{true};
     bool markers{};
@@ -51,6 +52,9 @@ private:
     u32 mismatched{};
     std::array<u32, 256> walk_other{};
 };
+
+/// Pure graphics buffers run from the list (bit 8388608 of `native_sdk_strip`, needs the bit above).
+bool ExecuteEnabled();
 
 /// Direct submission is on: execution, the sync tags and the setting for it (bit 4194304 of `native_sdk_strip`).
 bool Enabled();

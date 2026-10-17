@@ -175,10 +175,11 @@ Span::Span(u32 queue_id, const u32* span_begin, u32 span_dwords)
     : tracked{state.load(std::memory_order_relaxed) != Idle}, queue{queue_id}, dwords{span_dwords}, id{next_span.fetch_add(1, std::memory_order_relaxed)},
       begin{reinterpret_cast<u64>(span_begin)} {}
 
-void Span::Packet(const void* packet) {
-    if (!tracked) {
+void Span::Packet(const void* packet, u64 address, bool show) {
+    if (!tracked || !show) {
         return;
     }
+    const u64 packet_address = address != 0 ? address : reinterpret_cast<u64>(packet);
     if (state.load(std::memory_order_acquire) == Idle) {
         tracked = false;
         return;
@@ -239,7 +240,7 @@ void Span::Packet(const void* packet) {
         return;
     }
     CountLabel(text);
-    lines.push_back(fmt::format("{:7} q{} s{:<5} +{:06x}  {}", order++, queue, id, reinterpret_cast<u64>(packet) - begin, text));
+    lines.push_back(fmt::format("{:7} q{} s{:<5} +{:06x}  {}", order++, queue, id, packet_address - begin, text));
     if (flip && queue == 0) {
         lines.emplace_back("---- frame end (flip) ----");
         if (++frames_done >= frames_wanted) {

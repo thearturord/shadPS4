@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <string_view>
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -285,6 +287,57 @@ const FixedState& DefaultFixedState() {
         return MakeFixedState(regs);
     }();
     return state;
+}
+
+DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs) {
+    DrawInputs in;
+    std::copy(std::begin(regs.color_buffers), std::end(regs.color_buffers), std::begin(in.color_buffers));
+    in.depth_buffer = regs.depth_buffer;
+    in.depth_view = regs.depth_view;
+    in.depth_control = regs.depth_control;
+    in.depth_htile_data_base = regs.depth_htile_data_base;
+    in.depth_render_control = regs.depth_render_control;
+    in.depth_clear = regs.depth_clear;
+    in.stencil_clear = regs.stencil_clear;
+    in.num_indices = regs.num_indices;
+    in.num_instances = regs.num_instances;
+    in.index_offset = regs.index_offset;
+    in.vgt_instance_step_rate_0 = regs.vgt_instance_step_rate_0;
+    in.vgt_instance_step_rate_1 = regs.vgt_instance_step_rate_1;
+    in.index_base_address = regs.index_base_address;
+    in.index_buffer_type = regs.index_buffer_type;
+    in.max_index_size = regs.max_index_size;
+    return in;
+}
+
+std::string DiffDrawInputs(const DrawInputs& a, const DrawInputs& b) {
+    std::string out;
+    const auto note = [&](bool differs, std::string_view name) {
+        if (differs) {
+            out += name;
+            out += ' ';
+        }
+    };
+    const auto bytes = [](const auto& x, const auto& y) { return std::memcmp(&x, &y, sizeof(x)) != 0; };
+    for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+        note(bytes(a.color_buffers[i], b.color_buffers[i]), "color_buffer" + std::to_string(i));
+    }
+    note(bytes(a.depth_buffer, b.depth_buffer), "depth_buffer");
+    note(bytes(a.depth_view, b.depth_view), "depth_view");
+    note(bytes(a.depth_control, b.depth_control), "depth_control");
+    note(bytes(a.depth_htile_data_base, b.depth_htile_data_base), "depth_htile_data_base");
+    note(bytes(a.depth_render_control, b.depth_render_control), "depth_render_control");
+    note(std::bit_cast<u32>(a.depth_clear) != std::bit_cast<u32>(b.depth_clear), "depth_clear");
+    note(a.stencil_clear != b.stencil_clear, "stencil_clear");
+    note(a.num_indices != b.num_indices, "num_indices");
+    note(bytes(a.num_instances, b.num_instances), "num_instances");
+    note(a.index_offset != b.index_offset, "index_offset");
+    note(a.vgt_instance_step_rate_0 != b.vgt_instance_step_rate_0, "step_rate_0");
+    note(a.vgt_instance_step_rate_1 != b.vgt_instance_step_rate_1, "step_rate_1");
+    note(bytes(a.index_base_address, b.index_base_address), "index_base_address");
+    note(bytes(a.index_buffer_type, b.index_buffer_type), "index_buffer_type");
+    note(a.max_index_size != b.max_index_size, "max_index_size");
+    return out;
 }
 
 std::string DiffFixedState(const FixedState& a, const FixedState& b) {

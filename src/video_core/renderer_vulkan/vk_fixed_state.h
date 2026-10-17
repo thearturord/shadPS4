@@ -114,6 +114,32 @@ struct FixedState {
     }
 };
 
+/// What a draw reads besides its fixed-function state: the render target and depth target descriptions (they keep the AMD
+/// surface layout because the memory behind them does), the clear values of the render pass and the draw arguments. Taken from the
+/// register state when the draw is planned and carried in the plan, so the raster thread does not read the register mirror for it.
+struct DrawInputs {
+    AmdGpu::ColorBuffer color_buffers[AmdGpu::NUM_COLOR_BUFFERS];
+    AmdGpu::DepthBuffer depth_buffer;
+    AmdGpu::DepthView depth_view;
+    AmdGpu::DepthControl depth_control;
+    AmdGpu::Address depth_htile_data_base;
+    AmdGpu::DepthRenderControl depth_render_control;
+    float depth_clear;
+    u32 stencil_clear;
+    u32 num_indices;
+    AmdGpu::VgtNumInstances num_instances;
+    u32 index_offset;
+    u32 vgt_instance_step_rate_0;
+    u32 vgt_instance_step_rate_1;
+    AmdGpu::IndexBufferBase index_base_address;
+    AmdGpu::IndexBufferType index_buffer_type;
+    u32 max_index_size;
+};
+
+DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs);
+/// Names of the members in which two sets differ (empty when equal).
+std::string DiffDrawInputs(const DrawInputs& a, const DrawInputs& b);
+
 /// The packet path: the fixed-function state of the draw described by `regs`.
 FixedState MakeFixedState(const AmdGpu::DrawRegs& regs);
 

@@ -31,6 +31,7 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 struct FixedState;
+struct DrawInputs;
 
 class Rasterizer {
 public:
@@ -196,6 +197,8 @@ private:
     void ClearDepthTarget();
 
     const FixedState& FixedFor(const DrawPlan* plan, FixedState& storage) const;
+    /// The draw inputs of the draw being recorded: the plan's, or built from the register mirror without a plan.
+    const DrawInputs& InputsFor(const DrawPlan* plan, DrawInputs& storage) const;
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
                             const FixedState& fixed) const;
     void UpdateViewportScissorState(const FixedState& fixed) const;
@@ -311,6 +314,7 @@ private:
         std::array<u32, 4> pattern{};
     };
     PendingFill pending_fill{};
+    const DrawInputs* draw_inputs{}; ///< of the draw being recorded (Draw / DrawIndirect)
     u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;

@@ -313,8 +313,29 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
     } else {
         plan->fixed = MakeFixedState(regs);
     }
+    plan->inputs = MakeDrawInputs(regs);
     pipeline_cache.PlanGraphics(regs, plan->fixed, params, *plan);
     return plan;
+}
+
+const DrawInputs& Rasterizer::InputsFor(const DrawPlan* plan, DrawInputs& storage) const {
+    if (plan == nullptr) {
+        storage = MakeDrawInputs(liverpool->RasterRegs());
+        return storage;
+    }
+    // the plan's copy was taken from the command processor's register state; the first draws are compared with the mirror
+    static std::atomic<u64> compared{0};
+    static std::atomic<u64> differing{0};
+    if (compared.fetch_add(1, std::memory_order_relaxed) < 100000) {
+        storage = MakeDrawInputs(liverpool->RasterRegs());
+        if (const std::string diff = DiffDrawInputs(plan->inputs, storage); !diff.empty()) {
+            if (differing.fetch_add(1, std::memory_order_relaxed) < 40) {
+                LOG_INFO(Render_Vulkan, "draw inputs of the plan differ from the register mirror in: {}", diff);
+            }
+            return storage;
+        }
+    }
+    return plan->inputs;
 }
 
 const FixedState& Rasterizer::FixedFor(const DrawPlan* plan, FixedState& storage) const {
@@ -425,7 +446,7 @@ bool Rasterizer::TargetInputsMatch(CachedTarget& cache, const Ts&... parts) {
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
-    const auto& regs = liverpool->RasterRegs();
+    const auto& regs = *draw_inputs;
     if (fixed.degamma) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -485,7 +506,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline, const Fixe
     }
 }
 
-static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::DrawRegs& regs, const Shader::Info& info,
+static std::pair<u32, u32> GetDrawOffsets(const DrawInputs& regs, const Shader::Info& info,
                                           const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
@@ -572,13 +593,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const DrawPlan* plan) {
         return;
     }
 
-    const auto& regs = liverpool->RasterRegs();
     const GraphicsPipeline* pipeline = ResolveDrawPipeline(plan);
     if (!pipeline) {
         return;
     }
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
+    DrawInputs inputs_storage;
+    draw_inputs = &InputsFor(plan, inputs_storage);
+    const auto& regs = *draw_inputs;
     const bool same_cmdbuf = use_tag && last.valid && last.tick == scheduler.CurrentTick();
     const bool same_pipeline = same_cmdbuf && last.pipeline == pipeline;
     const bool same_dynamic_state = same_pipeline && last.k2 == tag.k2;
@@ -656,6 +679,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     FixedState fixed_storage;
     const FixedState& fixed = FixedFor(plan, fixed_storage);
+    DrawInputs inputs_storage;
+    draw_inputs = &InputsFor(plan, inputs_storage);
 
     PrepareRenderState(pipeline, fixed);
     if (!BindResources(pipeline, &fixed)) {
@@ -946,7 +971,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const FixedState* fixed
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
-    const auto& regs = liverpool->RasterRegs();
+    const auto& regs = *draw_inputs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
@@ -1051,7 +1076,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
-    const auto& regs = liverpool->RasterRegs();
+    const auto& regs = *draw_inputs;
 
     // Figure out index type and size.
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
@@ -1578,7 +1603,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
-    const auto& regs = liverpool->RasterRegs();
+    const auto& regs = *draw_inputs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();

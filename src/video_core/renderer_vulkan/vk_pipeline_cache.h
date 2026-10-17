@@ -105,6 +105,7 @@ struct StagePlan {
 struct DrawPlan {
     const GraphicsPipeline* pipeline{}; ///< Null if the pipeline lookup failed.
     FixedState fixed{};
+    DrawInputs inputs{};
     bool executed{}; ///< the draw was executed from a record: no register based classification
     std::array<StagePlan, MaxShaderStages> stages{};
 };

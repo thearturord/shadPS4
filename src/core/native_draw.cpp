@@ -797,6 +797,12 @@ std::once_flag records_once;
 std::atomic<u64> next_seq{1};
 std::atomic<u64> consumed_seq{0};
 
+/// Trust at once (`native_sdk_strip` bit 16777216): a record that the builder did not flag runs from the record from the first draw
+/// of its call site, without the warm-up in which the game's packets are compared with the record.
+bool TrustAtOnce() {
+    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 16777216) != 0;
+}
+
 /// Draws are executed from records only for call sites whose records matched what the game's own packets produced.
 /// Call sites that set state around the render layer (own shaders, direct packets) never match and stay on the
 /// packet path.
@@ -3268,6 +3274,9 @@ bool ExecEligible(u64 ctx, u64 seq, u64 caller) {
     if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
         return no(FbRing);
     }
+    if (TrustAtOnce()) {
+        return true;
+    }
     CallerTrust* trust = TrustFor(caller);
     if (trust == nullptr) {
         return no(FbTrustNew);
@@ -3791,6 +3800,9 @@ bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
     }
     if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
         return false;
+    }
+    if (TrustAtOnce()) {
+        return true;
     }
     CallerTrust* trust = TrustFor(caller);
     if (trust == nullptr) {
@@ -4419,6 +4431,9 @@ u64 PS4_SYSV_ABI TagCsCopyHandler(u64 writer, u64 a1, u64 a2, u64 a3, u64 a4, u6
 bool ExecEligibleAsc(u64 seq, u64 caller) {
     if (Slot(seq).flags != 0 || seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
         return false;
+    }
+    if (TrustAtOnce()) {
+        return true;
     }
     CallerTrust* trust = TrustFor(caller);
     if (trust == nullptr) {

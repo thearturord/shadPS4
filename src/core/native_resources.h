@@ -68,6 +68,9 @@ void NoteImmutableSync();
 void NoteImageCopy(bool done, u32 reason);
 /// True when native_sdk_strip bit 131072 is set.
 bool ImageCopyEnabled();
+/// A memory fill of an image: done as an image clear, or refused (reason: 0 no image there, 1 the image is not a plain colour
+/// image of the fill's size, 2 the pattern is not one texel or the format is not handled).
+void NoteImageClear(bool done, u32 reason);
 
 void Start();
 nlohmann::json Report();

@@ -572,6 +572,10 @@ struct NativeRecord {
     };
     u32 check_count{};
     std::array<TableCheck, 8> checks{};
+    u64 fill_destination{}; ///< a dispatch of the device's fill shader: the pattern fill it performs
+    u32 fill_bytes{};
+    u32 fill_dwords{};
+    std::array<u32, 4> fill_pattern{};
     u64 copy_destination{}; ///< a dispatch of the device's buffer copy shader (CsCopyBufferDwords): what it copies
     u64 copy_source{};
     u32 copy_bytes{};
@@ -678,6 +682,7 @@ NativeRecord& Slot(u64 seq);
 
 void BeginTables(u64 seq) {
     Slot(seq).copy_bytes = 0;
+    Slot(seq).fill_dwords = 0;
     table_seq = seq;
     table_used = 0;
     table_overflow = false;
@@ -2276,6 +2281,14 @@ u64 MakeFillPatternRecord(u64 writer, u64 destination, u32 count, u64 source, u3
     slot.caller = caller;
     slot.a1 = (count + 0x3f) >> 6;
     slot.a2 = 1;
+    if (size <= 4) {
+        slot.fill_destination = destination;
+        slot.fill_bytes = count * 4;
+        slot.fill_dwords = size;
+        for (u32 k = 0; k < size; ++k) {
+            slot.fill_pattern[k] = Rd<u32>(source, k * 4);
+        }
+    }
     slot.rt_info = 0;
     slot.dbg_vs = slot.dbg_fetch = slot.dbg_layout = 0;
     slot.ps_gnm = 0;
@@ -2924,6 +2937,11 @@ u32 RecordDrawCount(u64 seq) {
     return slot.seq.load(std::memory_order_acquire) == seq ? count : 0xffffffffu;
 }
 
+u64 RecordCaller(u64 seq) {
+    auto& slot = Slot(seq);
+    return slot.seq.load(std::memory_order_acquire) == seq ? slot.caller : 0;
+}
+
 bool TakeExecDraw(u64 seq, ExecDraw& out) {
     NoteConsumed(seq);
     auto& slot = Slot(seq);
@@ -2954,6 +2972,12 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     out.cb_extents_only = slot.kind == 4;
     out.instance_sgpr = slot.instance_sgpr;
     // a fast clear eliminate is not an ordinary draw: it keeps the register based classification
+    if (slot.kind == 3 && slot.fill_dwords != 0) {
+        out.fill_destination = slot.fill_destination;
+        out.fill_bytes = slot.fill_bytes;
+        out.fill_dwords = slot.fill_dwords;
+        out.fill_pattern = slot.fill_pattern;
+    }
     if (slot.kind == 3 && slot.copy_bytes != 0) {
         out.copy_destination = slot.copy_destination;
         out.copy_source = slot.copy_source;
@@ -3708,6 +3732,13 @@ u64 TagCsCopy(u64 writer, u64 destination, u64 source, u64 bytes, u64 ret) {
         ((policy.native_draw_classes.load(std::memory_order_relaxed) >> Other) & 1) == 0) {
         return 0;
     }
+    if (bytes >= (8u << 20)) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 12) {
+            LOG_INFO(Core, "CsCopyBufferDwords of {} bytes: caller {:#x} destination {:#x} source {:#x}", bytes, ret - ImageBase() + 0x1000000,
+                     destination, source);
+        }
+    }
     const u64 seq = Guarded([&] { return MakeCopyRecord(ctx, destination, source, bytes, ret); });
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -3741,6 +3772,8 @@ bool ExecEligibleAsc(u64 seq, u64 caller);
 /// FUN_02473340(async compute context, destination, source, bytes): the async context's buffer copy, the device's copy shader
 /// with both buffers described as read-write buffers. While the record of the call site is not verified the tag precedes the
 /// game's packets; then the function is replaced by the tag.
+u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from, u64 bytes, u64 ret);
+
 u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_arg, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const u64 bytes = bytes_arg & 0xffffffff;
@@ -3749,6 +3782,12 @@ u64 PS4_SYSV_ABI TagAscCsCopy(u64 jcc, u64 destination, u64 source, u64 bytes_ar
         policy.native_synth_verify.load(std::memory_order_relaxed) == 0 ||
         ((policy.native_sdk_strip.load(std::memory_order_relaxed) >> 6) & 1) == 0) {
         return 0;
+    }
+    const auto in_guest_memory = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull; };
+    if ((policy.native_sdk_strip.load(std::memory_order_relaxed) & 131072) != 0 && policy.native_draw_exec.load(std::memory_order_relaxed) != 0 &&
+        in_guest_memory(destination) && in_guest_memory(source) && (bytes & 3) == 0) {
+        // the device's buffer copy is a copy of memory: the command processor copies it (two images of the same layout as images)
+        return PublishAscMemoryCopy(jcc, 0, 0, destination, source, bytes, ret);
     }
     const u64 seq = Guarded([&] { return MakeCopyRecord(jcc, destination, source, bytes, ret, true); });
     if (seq == 0 || Slot(seq).flags != 0) {
@@ -3849,6 +3888,44 @@ u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u6
 /// FUN_024717c0(async compute context, destination resource, source resource): AsyncCopyResource. The game copies the
 /// resource memory with DMA packets (a buffer's bytes, a texture's width x height bytes) and orders it with a scratch label;
 /// with execution it is a memory copy record (kind 10). Copies of more than one DMA chunk keep the game's function.
+/// Writes the tag of a memory copy record (kind 10: destination, source, bytes) for the async compute context `jcc`.
+/// `destination` / `source` are the engine resources to stamp as used (0 when the copy was given plain addresses).
+u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from, u64 bytes, u64 ret) {
+    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
+    if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
+        return 0;
+    }
+    auto& record = Slot(seq);
+    record.seq.store(0, std::memory_order_release);
+    record.check_count = 0;
+    record.count = 0;
+    record.kind = 10;
+    record.flags = 0;
+    record.caller = ret;
+    record.a1 = static_cast<u32>(bytes);
+    record.args_addr = to;
+    record.extra_addr = from;
+    record.seq.store(seq, std::memory_order_release);
+    u32 words[2 + VideoCore::NativeTagPayloadDwords];
+    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
+    words[1] = VideoCore::NativeTagMagic;
+    words[2] = static_cast<u32>(Other) | (10u << 8) | ExecFlag;
+    std::memset(&words[3], 0, 3 * sizeof(u64));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    words[11] = 0;
+    words[12] = 0;
+    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
+        return 0;
+    }
+    tags_written.fetch_add(1, std::memory_order_relaxed);
+    if (destination != 0) {
+        Wr<u32>(destination, 0x2c, Rd<u32>(jcc, 0x22fc));
+        Wr<u32>(source, 0x2c, Rd<u32>(jcc, 0x22fc));
+    }
+    Live().async_copy_exec.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3, u64 a4, u64 a5, u64 ret) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     const auto valid = [](u64 pointer) { return pointer >= 0x200000000ull && pointer < 0x400000000ull && (pointer & 7) == 0; };
@@ -3880,37 +3957,7 @@ u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3
     if (bytes == 0 || bytes >= 0x1ffffc || to == 0 || from == 0) {
         return 0;
     }
-    const u64 seq = next_seq.fetch_add(1, std::memory_order_relaxed);
-    if (seq - consumed_seq.load(std::memory_order_relaxed) > RecordSlots - 4096) {
-        return 0;
-    }
-    auto& record = Slot(seq);
-    record.seq.store(0, std::memory_order_release);
-    record.check_count = 0;
-    record.count = 0;
-    record.kind = 10;
-    record.flags = 0;
-    record.caller = ret;
-    record.a1 = static_cast<u32>(bytes);
-    record.args_addr = to;
-    record.extra_addr = from;
-    record.seq.store(seq, std::memory_order_release);
-    u32 words[2 + VideoCore::NativeTagPayloadDwords];
-    words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
-    words[1] = VideoCore::NativeTagMagic;
-    words[2] = static_cast<u32>(Other) | (10u << 8) | ExecFlag;
-    std::memset(&words[3], 0, 3 * sizeof(u64));
-    std::memcpy(&words[9], &seq, sizeof(u64));
-    words[11] = 0;
-    words[12] = 0;
-    if (!WriteDwordsAt(jcc + 0x60, words, 2 + VideoCore::NativeTagPayloadDwords - 1)) {
-        return 0;
-    }
-    tags_written.fetch_add(1, std::memory_order_relaxed);
-    Wr<u32>(destination, 0x2c, Rd<u32>(jcc, 0x22fc));
-    Wr<u32>(source, 0x2c, Rd<u32>(jcc, 0x22fc));
-    Live().async_copy_exec.fetch_add(1, std::memory_order_relaxed);
-    return 1;
+    return PublishAscMemoryCopy(jcc, destination, source, to, from, bytes, ret);
 }
 
 /// FUN_024826c0(draw context): the reset at the start of a frame. It sets the engine fields, has the driver write the hardware
@@ -4030,6 +4077,14 @@ u64 PS4_SYSV_ABI TagCopyResource(u64 ctx, u64 destination, u64 destination_sub, 
         (Rd<u8>(destination, 0x1a0) & 0x40) != 0 || format != Rd<u32>(source, 0x190) || format > 0x65 ||
         ((Rd<u32>(destination, 0x194) | Rd<u32>(source, 0x194)) > 1) || Rd<u32>(source, 0x188) == 0) {
         return 0; // the game's function reports the error or handles another resource kind
+    }
+    if (Rd<u32>(destination, 0x180) >= 1900) {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 12) {
+            LOG_INFO(Core, "CopyResource of a large texture: caller {:#x} destination {:#x} ({}x{} format {} mips {} sub {}) source {:#x} (sub {})",
+                     ret - ImageBase() + 0x1000000, Rd<u64>(destination, 0x30), Rd<u32>(destination, 0x180), Rd<u32>(destination, 0x184), format,
+                     Rd<u32>(destination, 0x188), destination_sub, Rd<u64>(source, 0x30), source_sub);
+        }
     }
     const u32 current_mode = Rd<u32>(ctx, 0x278);
     if ((current_mode != 0 && current_mode != 0x8000) || (Rd<u8>(ctx, 0x13009) & 1) != 0) {

@@ -112,6 +112,8 @@ std::map<u64, std::shared_ptr<ImmutableBuffer>> immutables;                  ///
 std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> immutable_by_object;
 std::vector<std::pair<u64, std::shared_ptr<ImmutableBuffer>>> immutable_graveyard; ///< destroyed, kept alive for readers
 std::atomic<u64> immutable_epoch{1};
+std::atomic<u64> image_clears_done{};
+std::array<std::atomic<u64>, 3> image_clears_refused;
 std::atomic<u64> image_copies_done{};
 std::array<std::atomic<u64>, 3> image_copies_refused;
 std::atomic<u64> immutable_hits{}, immutable_syncs{}, immutable_drops{}, immutable_checks{}, immutable_stale{};
@@ -518,6 +520,14 @@ void NoteImageCopy(bool done, u32 reason) {
     }
 }
 
+void NoteImageClear(bool done, u32 reason) {
+    if (done) {
+        image_clears_done.fetch_add(1, std::memory_order_relaxed);
+    } else if (reason < image_clears_refused.size()) {
+        image_clears_refused[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool ImageCopyEnabled() {
     return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 131072) != 0;
 }
@@ -725,6 +735,10 @@ nlohmann::json Report() {
     top([](const History& h) { return h.cpu_writes; }, "top_written_by_cpu", 20);
     top([](const History& h) { return h.requests; }, "top_requested", 20);
     out["blocks_with_history"] = all.size();
+    out["image_clears"] = {{"native", image_clears_done.load()},
+                           {"refused_no_image", image_clears_refused[0].load()},
+                           {"refused_not_a_plain_colour_image", image_clears_refused[1].load()},
+                           {"refused_pattern_or_format", image_clears_refused[2].load()}};
     out["image_copies"] = {{"enabled", ImageCopyEnabled()},
                            {"native", image_copies_done.load()},
                            {"refused_no_source_image", image_copies_refused[0].load()},

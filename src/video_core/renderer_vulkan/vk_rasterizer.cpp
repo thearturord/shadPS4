@@ -725,6 +725,11 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
 
     scheduler.PopPendingOperations();
 
+    if (const auto fill = std::exchange(pending_fill, {});
+        fill.dwords != 0 && TryClearImage(fill.dst, fill.bytes, fill.pattern.data(), fill.dwords)) {
+        return;
+    }
+
     const auto& cs_program = liverpool->RasterCsRegs();
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
@@ -1350,8 +1355,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     if (size >= (8u << 20)) {
                         static std::atomic<u32> logged{0};
                         if (logged.fetch_add(1) < 6) {
-                            LOG_INFO(Render_Vulkan, "stage {:#x} (user data {}) writes {} bytes at {:#x} through a storage buffer", stage.pgm_hash,
-                                     stage.user_data.size(), size, vsharp.base_address);
+                            LOG_INFO(Render_Vulkan, "stage {:#x} (user data {}) writes {} bytes at {:#x} through a storage buffer, caller {:#x}",
+                                     stage.pgm_hash, stage.user_data.size(), size, vsharp.base_address,
+                                     dispatch_caller ? dispatch_caller - Core::NativeDraw::ImageBase() + 0x1000000 : 0);
                         }
                     }
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size, "a written storage buffer view");
@@ -1774,9 +1780,148 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     ++recorded_work;
 }
 
+namespace {
+float HalfToFloat(u16 h) {
+    const u32 sign = (h >> 15) & 1;
+    const u32 exponent = (h >> 10) & 0x1f;
+    const u32 mantissa = h & 0x3ff;
+    float value;
+    if (exponent == 0) {
+        value = std::ldexp(static_cast<float>(mantissa), -24);
+    } else if (exponent == 31) {
+        value = mantissa ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+    } else {
+        value = std::ldexp(static_cast<float>(mantissa | 0x400), static_cast<int>(exponent) - 25);
+    }
+    return sign ? -value : value;
+}
+
+float UnsignedFloat(u32 bits, u32 mantissa_bits) {
+    const u32 exponent = bits >> mantissa_bits;
+    const u32 mantissa = bits & ((1u << mantissa_bits) - 1);
+    if (exponent == 0) {
+        return std::ldexp(static_cast<float>(mantissa), -14 - static_cast<int>(mantissa_bits));
+    }
+    if (exponent == 31) {
+        return mantissa ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+    }
+    return std::ldexp(1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits), static_cast<int>(exponent) - 15);
+}
+
+/// The clear colour of a texel (its bytes in memory order) in `format`; false for formats not handled.
+bool DecodeTexel(vk::Format format, const u32* texel, vk::ClearColorValue& out) {
+    const auto u8_at = [&](u32 i) { return static_cast<float>((texel[i / 4] >> ((i & 3) * 8)) & 0xff) / 255.0f; };
+    const auto u16_at = [&](u32 i) { return static_cast<u16>(texel[i / 2] >> ((i & 1) * 16)); };
+    switch (format) {
+    case vk::Format::eR16G16B16A16Sfloat:
+        out.float32 = {{HalfToFloat(u16_at(0)), HalfToFloat(u16_at(1)), HalfToFloat(u16_at(2)), HalfToFloat(u16_at(3))}};
+        return true;
+    case vk::Format::eR16G16B16A16Unorm:
+        out.float32 = {{u16_at(0) / 65535.0f, u16_at(1) / 65535.0f, u16_at(2) / 65535.0f, u16_at(3) / 65535.0f}};
+        return true;
+    case vk::Format::eR16G16Sfloat:
+        out.float32 = {{HalfToFloat(u16_at(0)), HalfToFloat(u16_at(1)), 0.0f, 1.0f}};
+        return true;
+    case vk::Format::eR16Sfloat:
+        out.float32 = {{HalfToFloat(u16_at(0)), 0.0f, 0.0f, 1.0f}};
+        return true;
+    case vk::Format::eR8G8B8A8Unorm:
+        out.float32 = {{u8_at(0), u8_at(1), u8_at(2), u8_at(3)}};
+        return true;
+    case vk::Format::eB8G8R8A8Unorm:
+        out.float32 = {{u8_at(2), u8_at(1), u8_at(0), u8_at(3)}};
+        return true;
+    case vk::Format::eR8Unorm:
+        out.float32 = {{u8_at(0), 0.0f, 0.0f, 1.0f}};
+        return true;
+    case vk::Format::eR32Sfloat:
+        out.float32 = {{std::bit_cast<float>(texel[0]), 0.0f, 0.0f, 1.0f}};
+        return true;
+    case vk::Format::eR32G32Sfloat:
+        out.float32 = {{std::bit_cast<float>(texel[0]), std::bit_cast<float>(texel[1]), 0.0f, 1.0f}};
+        return true;
+    case vk::Format::eR32G32B32A32Sfloat:
+        out.float32 = {{std::bit_cast<float>(texel[0]), std::bit_cast<float>(texel[1]), std::bit_cast<float>(texel[2]),
+                        std::bit_cast<float>(texel[3])}};
+        return true;
+    case vk::Format::eB10G11R11UfloatPack32:
+        out.float32 = {{UnsignedFloat(texel[0] & 0x7ff, 6), UnsignedFloat((texel[0] >> 11) & 0x7ff, 6),
+                        UnsignedFloat((texel[0] >> 22) & 0x3ff, 5), 1.0f}};
+        return true;
+    default:
+        return false;
+    }
+}
+} // namespace
+
+bool Rasterizer::TryClearImage(VAddr dst, u32 bytes, const u32* pattern, u32 dwords) {
+    const auto id = texture_cache.FindImageFromRange(dst, bytes, false);
+    if (!id) {
+        Core::NativeResources::NoteImageClear(false, 0);
+        return false;
+    }
+    auto& image = texture_cache.GetImage(id);
+    const auto& info = image.info;
+    if (info.guest_address != dst || info.guest_size != bytes || info.num_samples != 1 || info.props.is_depth ||
+        info.props.is_block || info.num_bits == 0 || (info.num_bits & 31) != 0) {
+        Core::NativeResources::NoteImageClear(false, 1);
+        return false;
+    }
+    // every texel must get the same bytes: the pattern repeats an integer number of times in a texel, or its texels are equal
+    const u32 texel_dwords = info.num_bits / 32;
+    bool uniform = true;
+    std::array<u32, 4> texel{};
+    if (texel_dwords > 4) {
+        uniform = false;
+    } else if (texel_dwords % dwords == 0) {
+        for (u32 k = 0; k < texel_dwords; ++k) {
+            texel[k] = pattern[k % dwords];
+        }
+    } else if (dwords % texel_dwords == 0) {
+        for (u32 k = 0; k < texel_dwords; ++k) {
+            texel[k] = pattern[k];
+        }
+        for (u32 k = texel_dwords; k < dwords; ++k) {
+            uniform &= pattern[k] == texel[k % texel_dwords];
+        }
+    } else {
+        uniform = false;
+    }
+    vk::ClearValue value{};
+    if (!uniform || !DecodeTexel(info.pixel_format, texel.data(), value.color)) {
+        Core::NativeResources::NoteImageClear(false, 2);
+        return false;
+    }
+    {
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1) < 6) {
+            LOG_INFO(Render_Vulkan, "memory fill of {:#x} + {} bytes is a clear of the {}x{} {} image: {:#x} {:#x} {:#x} {:#x} -> {} {} {} {}", dst,
+                     bytes, info.size.width, info.size.height, vk::to_string(info.pixel_format), texel[0], texel[1], texel[2], texel[3],
+                     value.color.float32[0], value.color.float32[1], value.color.float32[2], value.color.float32[3]);
+        }
+    }
+    texture_cache.InvalidateMemoryFromGPU(dst, bytes, "an image clear");
+    runtime.ClearImage(&image, VideoCore::SubresourceRange{.base = {0, 0}, .extent = {static_cast<u16>(info.resources.levels), static_cast<u16>(info.resources.layers)}}, value);
+    ++recorded_work;
+    Core::NativeResources::NoteImageClear(true, 0);
+    return true;
+}
+
 bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     const auto src_id = texture_cache.FindImageFromRange(src, num_bytes);
     if (!src_id) {
+        const auto any = texture_cache.FindImageFromRange(src, num_bytes, false);
+        const auto dst_any = texture_cache.FindImageFromRange(dst, num_bytes, false);
+        if (num_bytes >= (8u << 20) && (any || dst_any)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1) < 16) {
+                LOG_INFO(Render_Vulkan,
+                         "image copy refused: source {:#x} has {} ({}), destination {:#x} has {}, {} bytes, source gpu modified {}",
+                         src, any ? "an image that is not safe to download" : "no image",
+                         any ? static_cast<u32>(texture_cache.GetImage(any).flags) : 0u, dst, dst_any ? "an image" : "no image",
+                         num_bytes, buffer_cache.IsRegionGpuModified(src, num_bytes));
+            }
+        }
         Core::NativeResources::NoteImageCopy(false, 0);
         return false;
     }

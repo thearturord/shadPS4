@@ -117,6 +117,15 @@ public:
 
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
+    void SetDispatchCaller(u64 caller) {
+        dispatch_caller = caller;
+    }
+    /// A memory fill (a pattern of up to four dwords repeated over `bytes`): when an image of the fill's size lives at the
+    /// address the fill is an image clear. SetPendingFill covers the next dispatch.
+    bool TryClearImage(VAddr dst, u32 bytes, const u32* pattern, u32 dwords);
+    void SetPendingFill(VAddr dst, u32 bytes, const u32* pattern, u32 dwords) {
+        pending_fill = {dst, bytes, dwords, {pattern[0], dwords > 1 ? pattern[1] : 0, dwords > 2 ? pattern[2] : 0, dwords > 3 ? pattern[3] : 0}};
+    }
     /// The memory copy of two images that live on the GPU with the same layout is an image copy.
     bool TryCopyImages(VAddr dst, VAddr src, u32 num_bytes);
     /// Clears the depth / stencil target the registers describe (native depth clear record).
@@ -295,6 +304,14 @@ private:
     const u32 flush_commands;
     std::mutex plan_pool_mutex;
     std::vector<std::unique_ptr<DrawPlan>> draw_plan_pool;
+    struct PendingFill {
+        VAddr dst{};
+        u32 bytes{};
+        u32 dwords{};
+        std::array<u32, 4> pattern{};
+    };
+    PendingFill pending_fill{};
+    u64 dispatch_caller{}; ///< diagnostics: the game call that made the dispatch being bound
     u8 clip_plane_mask{}; ///< user clip planes of the draw being bound
     std::vector<std::unique_ptr<DispatchPlan>> dispatch_plan_pool;
     /// True if the inputs match the cached lookup; otherwise stores them for the next draw.

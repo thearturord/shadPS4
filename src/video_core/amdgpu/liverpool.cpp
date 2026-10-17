@@ -144,6 +144,10 @@ struct Liverpool::RasterCall {
     u16 instance_sgpr_offset{};
     u32 dispatch_size{};
     VideoCore::NativeTag tag{}; ///< From the game's native draw hook, draws only.
+    VAddr fill_destination{};   ///< A dispatch of the fill shader: the pattern fill it performs (the raster thread may clear an image instead).
+    u32 fill_bytes{};
+    u32 fill_dwords{};
+    std::array<u32, 4> fill_pattern{};
 };
 
 struct Liverpool::RasterOp {
@@ -689,7 +693,12 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         if (rasterizer) {
             RasterRun(
                 [this, destination = static_cast<VAddr>(draw.args_addr), value = draw.start_index, bytes = draw.a1 * 4u,
-                 gds = draw.kind == 8] { rasterizer->FillBuffer(destination, bytes, value, gds); },
+                 gds = draw.kind == 8] {
+                    if (!gds && Core::NativeResources::ImageCopyEnabled() && rasterizer->TryClearImage(destination, bytes, &value, 1)) {
+                        return;
+                    }
+                    rasterizer->FillBuffer(destination, bytes, value, gds);
+                },
                 false, true);
         }
         return;
@@ -741,6 +750,12 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         RasterCall dispatch{};
         dispatch.kind = RasterCall::Kind::DispatchDirect;
+        if (draw.fill_dwords != 0 && asc_vqid == ~0u && Core::NativeResources::ImageCopyEnabled()) {
+            dispatch.fill_destination = static_cast<VAddr>(draw.fill_destination);
+            dispatch.fill_bytes = draw.fill_bytes;
+            dispatch.fill_dwords = draw.fill_dwords;
+            dispatch.fill_pattern = draw.fill_pattern;
+        }
         if (draw.kind == 11) {
             dispatch.kind = RasterCall::Kind::DispatchIndirect;
             dispatch.args_addr = draw.args_addr;
@@ -884,6 +899,10 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     case RasterCall::Kind::DispatchDirect:
         rasterizer->NativeInvalidate();
+        rasterizer->SetDispatchCaller(c.tag.valid ? Core::NativeDraw::RecordCaller(c.tag.seq) : 0);
+        if (c.fill_dwords != 0) {
+            rasterizer->SetPendingFill(c.fill_destination, c.fill_bytes, c.fill_pattern.data(), c.fill_dwords);
+        }
         if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
             static u32 compute_debug = 0;
             if (compute_debug++ < 6) {

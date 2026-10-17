@@ -91,6 +91,10 @@ struct ExecDraw {
     bool has_extents{};
     u32 a1{}; ///< kind 6 (buffer fill): number of dwords; start_index holds the value, args_addr the destination
     bool cb_extents_only{}; ///< fast clear eliminate: only the render target extents change
+    u64 fill_destination{}; ///< dispatches of the device's fill shader: the pattern fill it performs (0: not one)
+    u32 fill_bytes{};
+    u32 fill_dwords{}; ///< dwords of the pattern (at most 4)
+    std::array<u32, 4> fill_pattern{};
     u64 copy_destination{}; ///< dispatches of the device's buffer copy shader: the memory copy it performs (null: not one)
     u64 copy_source{};
     u32 copy_bytes{};
@@ -100,6 +104,9 @@ struct ExecDraw {
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).
 u32 RecordDrawCount(u64 seq);
+
+/// The Ghidra address of the call that made record `seq` (0 when the record is gone).
+u64 RecordCaller(u64 seq);
 
 /// Command processor: the record of a draw the hook executed natively. False when the record was overwritten.
 bool TakeExecDraw(u64 seq, ExecDraw& out);

@@ -329,6 +329,8 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     if (next_offs_dw < offs_dw && next_offs_dw != 0) {
+        Core::NativeDraw::PrepareSubmittedBuffer(reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
+                                                 asc_queue.ring_size_dw - offs_dw);
         // For cases if a submission is split at the end of the ring buffer, we need to submit it in
         // two parts to handle the wrap
         liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
@@ -341,6 +343,8 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     const std::span acb_span{acb_ptr, acb_size_dw};
 
     asc_next_offs_dw[vqid] = next_offs_dw;
+
+    Core::NativeDraw::PrepareSubmittedBuffer(acb_ptr, static_cast<u32>(acb_size_dw));
 
     if (DebugState.DumpingCurrentFrame()) {
         static auto last_frame_num = -1LL;

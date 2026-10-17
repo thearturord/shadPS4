@@ -1882,7 +1882,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             continue;
         case 3:
             const u32 count = header->type3.NumWords();
-            const PM4ItOpcode opcode = header->type3.opcode;
+            PM4ItOpcode opcode = header->type3.opcode;
             VideoCore::ReadbackStats::CpPacket(GfxQueueId, static_cast<u32>(opcode));
             if (VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
                 CountGameCommand(header, opcode, count);
@@ -1901,6 +1901,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     shadow.Skipped(reinterpret_cast<u64>(header) + sizeof(u32), nop->header.count.Value());
                 }
             }
+            std::array<u32, 8> restored;
+            if (opcode == PM4ItOpcode::Nop) {
+                if (const u32 restored_opcode = Core::NativeDraw::RestoreSyncTag(reinterpret_cast<const u32*>(header), restored)) {
+                    header = reinterpret_cast<const PM4Header*>(restored.data());
+                    opcode = static_cast<PM4ItOpcode>(restored_opcode);
+                }
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1909,14 +1916,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
 
                 switch (nop->data_block[0]) {
-                case PM4CmdNop::PayloadType::NativeFence: {
-                    if (nop->header.count.Value() == 4) {
-                        Core::NativeDraw::Live().fence_exec.fetch_add(1, std::memory_order_relaxed);
-                        const std::array<u32, 6> packet{0xC0044700u, 0, nop->data_block[1], nop->data_block[2], nop->data_block[3], nop->data_block[4]};
-                        SignalGraphicsEop(*reinterpret_cast<const PM4CmdEventWriteEop*>(packet.data()));
-                    }
-                    break;
-                }
                 case PM4CmdNop::PayloadType::NativeDrawTag: {
                     if (nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
                         native_tag_pending.valid = true;
@@ -2775,7 +2774,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             UNREACHABLE_MSG("Invalid PM4 type {}", header->type.Value());
         }
 
-        const PM4ItOpcode opcode = header->type3.opcode;
+        PM4ItOpcode opcode = header->type3.opcode;
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
         CountComputeQueueCommand(header, opcode);
         entry_dump.Packet(header);
@@ -2792,6 +2791,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
         }
 
+        std::array<u32, 8> restored;
+        if (opcode == PM4ItOpcode::Nop) {
+            if (const u32 restored_opcode = Core::NativeDraw::RestoreSyncTag(reinterpret_cast<const u32*>(header), restored)) {
+                header = reinterpret_cast<const PM4Header*>(restored.data());
+                opcode = static_cast<PM4ItOpcode>(restored_opcode);
+            }
+        }
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
         case PM4ItOpcode::Nop: {

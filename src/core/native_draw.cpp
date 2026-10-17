@@ -504,17 +504,49 @@ inline void Wr(u64 base, u64 offset, T value) {
 
 bool StripPackets(u64 begin, u64 end);
 
-/// A graphics end-of-pipe write (the 6 dword packet: label, value, data and interrupt select) becomes a no-op of the same size
-/// whose second dword is the fence magic; the command processor signals the fence from it. The label write and the interrupt
-/// stay the same function, only the stream no longer holds a packet of the hardware's encoding.
-bool ConvertFenceEop(u64 at) {
+/// Synchronization packets that connect the GPU to the CPU or to another queue become tags of the same size, in place: a no-op
+/// whose second dword is a magic and whose other dwords are the packet's. The command processor rebuilds the packet from the tag
+/// (RestoreSyncTag) and runs the same code, at the same place of the stream, so the timeline and the fence kinds do not change.
+///  - graphics end-of-pipe write (6 dwords: fence, frame counter, frame interrupt): magic NativeFenceMagic; the event control
+///    dword is not used by anything and is dropped;
+///  - release memory (7 dwords, async compute labels): ReleaseMagic; the same;
+///  - wait on a memory label (7 dwords): WaitMagicBase + the control dword (function, memory space, engine; only when it fits a byte).
+/// Returns the kind (SyncEop, SyncRelease, SyncWait) or 0 when the packet is not one of them.
+constexpr u32 ReleaseMagic = 0x4E44524Cu;  // "NDRL"
+constexpr u32 WaitMagicBase = 0x4E445700u; // "NDW" + control byte
+enum SyncKind : u32 { SyncNone, SyncEop, SyncRelease, SyncWait };
+
+u32 ConvertSyncPacket(u64 at) {
     const u32 header = Rd<u32>(at, 0);
-    if (header != 0xC0044700u) {
-        return false;
+    if ((header >> 30) != 3) {
+        return SyncNone;
     }
-    Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
-    Wr<u32>(at, 0, 0xC0041000u);
-    return true;
+    const u32 opcode = (header >> 8) & 0xff;
+    const u32 count = (header >> 16) & 0x3fff;
+    if (opcode == 0x47 && header == 0xC0044700u) {
+        Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
+        Wr<u32>(at, 0, 0xC0041000u);
+        return SyncEop;
+    }
+    if (opcode == 0x49 && count == 5) {
+        Wr<u32>(at, 4, ReleaseMagic);
+        Wr<u32>(at, 0, 0xC0051000u);
+        return SyncRelease;
+    }
+    if (opcode == 0x3c && count == 5) {
+        const u32 control = Rd<u32>(at, 4);
+        if ((control & ~0xffu) == 0 && (control & 0x10) != 0) {
+            Wr<u32>(at, 4, WaitMagicBase | control);
+            Wr<u32>(at, 0, 0xC0051000u);
+            return SyncWait;
+        }
+    }
+    return SyncNone;
+}
+
+void CountSyncConverted(u32 kind, std::atomic<u64>& place) {
+    Live().sync_converted[kind].fetch_add(1, std::memory_order_relaxed);
+    place.fetch_add(1, std::memory_order_relaxed);
 }
 
 /// Synchronization the game writes between its commands that only orders the GPU against itself. The raster thread runs the
@@ -562,8 +594,16 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
                 }
             }
         } else if (opcode == 0x47) {
-            if ((policy_bits & 2097152) != 0 && ConvertFenceEop(at)) {
-                Live().fence_converted_sweep.fetch_add(1, std::memory_order_relaxed);
+            if ((policy_bits & 2097152) != 0) {
+                if (const u32 kind = ConvertSyncPacket(at)) {
+                    CountSyncConverted(kind, Live().sync_converted_sweep);
+                }
+            }
+        } else if (opcode == 0x49 || opcode == 0x3c) {
+            if ((policy_bits & 2097152) != 0) {
+                if (const u32 kind = ConvertSyncPacket(at)) {
+                    CountSyncConverted(kind, Live().sync_converted_sweep);
+                }
             }
         } else if (opcode == 0x58) {
             if (StripPackets(at, at + size)) {
@@ -4095,7 +4135,7 @@ u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3
 
 /// FUN_02480d60(draw context): a CPU visible fence. The function takes eight bytes from the frame ring, stores 0x11 in them, writes
 /// an end-of-pipe packet that stores 0x10 there, and returns the address the game polls. The game's function runs (it owns the
-/// label); the packet it wrote becomes a fence tag (ConvertFenceEop).
+/// label); the packet it wrote becomes a fence tag (ConvertSyncPacket).
 u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
     static std::atomic<u64> original_entry{0};
     const auto& policy = VideoCore::ReadbackPolicy::Get();
@@ -4114,8 +4154,8 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
     const u64 before = Rd<u64>(ctx, 0x47d0);
     const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
     const u64 after = Rd<u64>(ctx, 0x47d0);
-    if (after == before + 6 * sizeof(u32) && (before & 3) == 0 && ConvertFenceEop(before)) {
-        Live().fence_converted_hook.fetch_add(1, std::memory_order_relaxed);
+    if (after == before + 6 * sizeof(u32) && (before & 3) == 0 && ConvertSyncPacket(before) == SyncEop) {
+        CountSyncConverted(SyncEop, Live().sync_converted_hook);
     } else {
         Live().fence_packets_kept.fetch_add(1, std::memory_order_relaxed);
     }
@@ -5273,14 +5313,9 @@ bool IsTagAt(u64 address, u64 seq) {
 }
 } // namespace
 
-void PrepareSubmittedBuffer(const u32* dcb, u32 dwords) {
-    const auto& policy = VideoCore::ReadbackPolicy::Get();
-    if (dcb == nullptr || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
-        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
-        return;
-    }
-    const u64 end = reinterpret_cast<u64>(dcb) + dwords * sizeof(u32);
-    for (u64 at = reinterpret_cast<u64>(dcb); at < end;) {
+namespace {
+void PrepareBuffer(u64 begin, u64 end, u32 depth) {
+    for (u64 at = begin; at < end;) {
         const u32 header = Rd<u32>(at, 0);
         if ((header >> 30) != 3) {
             break;
@@ -5289,11 +5324,55 @@ void PrepareSubmittedBuffer(const u32* dcb, u32 dwords) {
         if (at + size > end) {
             break;
         }
-        if (((header >> 8) & 0xff) == 0x47 && ConvertFenceEop(at)) {
-            Live().fence_converted_submit.fetch_add(1, std::memory_order_relaxed);
+        const u32 opcode = (header >> 8) & 0xff;
+        if (opcode == 0x3f && size == 16 && depth < 2) {
+            // an indirect buffer: the game's command buffer behind a ring window or a call (async queues, small state buffers)
+            const u64 target = Rd<u32>(at, 4) | static_cast<u64>(Rd<u32>(at, 8) & 0xffff) << 32;
+            const u64 dwords = Rd<u32>(at, 12) & 0xfffff;
+            if (target >= 0x200000000ull && target < 0x1000000000ull && (target & 3) == 0 && dwords != 0 && dwords <= (1u << 20)) {
+                PrepareBuffer(target, target + dwords * sizeof(u32), depth + 1);
+            }
+        } else if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c) {
+            if (const u32 kind = ConvertSyncPacket(at)) {
+                CountSyncConverted(kind, Live().sync_converted_submit);
+            }
         }
         at += size;
     }
+}
+} // namespace
+
+void PrepareSubmittedBuffer(const u32* dcb, u32 dwords) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (dcb == nullptr || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
+        return;
+    }
+    PrepareBuffer(reinterpret_cast<u64>(dcb), reinterpret_cast<u64>(dcb) + dwords * sizeof(u32), 0);
+}
+
+u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execution) {
+    const u32 count = (tag[0] >> 16) & 0x3fff;
+    const u32 magic = tag[1];
+    u32 kind = SyncNone;
+    u32 opcode = 0;
+    if (magic == VideoCore::NativeFenceMagic && count == 4) {
+        packet = {0xC0044700u, 0, tag[2], tag[3], tag[4], tag[5]};
+        kind = SyncEop;
+        opcode = 0x47;
+    } else if (magic == ReleaseMagic && count == 5) {
+        packet = {0xC0054902u, 0, tag[2], tag[3], tag[4], tag[5], tag[6]};
+        kind = SyncRelease;
+        opcode = 0x49;
+    } else if ((magic & ~0xffu) == WaitMagicBase && count == 5) {
+        packet = {0xC0053C00u, magic & 0xff, tag[2], tag[3], tag[4], tag[5], tag[6]};
+        kind = SyncWait;
+        opcode = 0x3c;
+    }
+    if (kind != SyncNone && count_execution) {
+        Live().sync_exec[kind].fetch_add(1, std::memory_order_relaxed);
+    }
+    return opcode;
 }
 
 bool SubmitShadowEnabled() {

@@ -104,7 +104,9 @@ std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwor
 
 void CountLabel(const std::string& text) {
     const size_t first = text.find(' ');
-    if (first != std::string::npos && (text.starts_with("ENTRY") || text.starts_with("SIGNAL"))) {
+    if (text.starts_with("ENTRY SIGNAL")) {
+        ++by_label[text.substr(0, text.find(' ', text.find(' ', first + 1) + 1))];
+    } else if (first != std::string::npos && (text.starts_with("ENTRY") || text.starts_with("SIGNAL"))) {
         ++by_label[text.substr(0, text.find(' ', first + 1))];
     } else {
         ++by_label[text.substr(0, first)];
@@ -196,14 +198,12 @@ void Span::Packet(const void* packet) {
                 return;
             }
             text = Core::NativeDraw::DescribeEntry(header);
-        } else if (nop->data_block[0] == PM4CmdNop::PayloadType::NativeFence && nop->header.count.Value() == 4) {
+        } else if (std::array<u32, 8> restored; Core::NativeDraw::RestoreSyncTag(reinterpret_cast<const u32*>(header), restored, false) != 0) {
             if (state.load(std::memory_order_acquire) == Armed) {
                 return;
             }
-            const u32 data_control = nop->data_block[2];
-            text = fmt::format("ENTRY FENCE_SIGNAL label={:#x} value={:#x} data={} irq={}", nop->data_block[1] | u64(data_control & 0xffff) << 32,
-                               nop->data_block[3] | u64(nop->data_block[4]) << 32, DataSelectName(static_cast<DataSelect>(data_control >> 29)),
-                               (data_control >> 24) & 3);
+            text = "ENTRY " + DescribePacket(reinterpret_cast<const PM4Header*>(restored.data()), static_cast<PM4ItOpcode>((restored[0] >> 8) & 0xff),
+                                             (restored[0] >> 16 & 0x3fff) + 2);
         } else if (nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip) {
             flip = true;
             text = fmt::format("FLIP patched flip request");

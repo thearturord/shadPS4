@@ -510,11 +510,13 @@ bool StripPackets(u64 begin, u64 end);
 ///  - graphics end-of-pipe write (6 dwords: fence, frame counter, frame interrupt): magic NativeFenceMagic; the event control
 ///    dword is not used by anything and is dropped;
 ///  - release memory (7 dwords, async compute labels): ReleaseMagic; the same;
-///  - wait on a memory label (7 dwords): WaitMagicBase + the control dword (function, memory space, engine; only when it fits a byte).
+///  - wait on a memory label (7 dwords): WaitMagicBase + the control dword (function, memory space, engine; only when it fits a byte);
+///  - CPU style write of one to four dwords to a label (WRITE_DATA, destination select 2 or 5): WriteMagicBase + the destination select.
 /// Returns the kind (SyncEop, SyncRelease, SyncWait) or 0 when the packet is not one of them.
 constexpr u32 ReleaseMagic = 0x4E44524Cu;  // "NDRL"
 constexpr u32 WaitMagicBase = 0x4E445700u; // "NDW" + control byte
-enum SyncKind : u32 { SyncNone, SyncEop, SyncRelease, SyncWait };
+constexpr u32 WriteMagicBase = 0x4E445800u; // "NDX" + destination select
+enum SyncKind : u32 { SyncNone, SyncEop, SyncRelease, SyncWait, SyncWrite };
 
 u32 ConvertSyncPacket(u64 at) {
     const u32 header = Rd<u32>(at, 0);
@@ -539,6 +541,15 @@ u32 ConvertSyncPacket(u64 at) {
             Wr<u32>(at, 4, WaitMagicBase | control);
             Wr<u32>(at, 0, 0xC0051000u);
             return SyncWait;
+        }
+    }
+    if (opcode == 0x37 && count >= 3 && count <= 6) {
+        const u32 control = Rd<u32>(at, 4);
+        const u32 destination = (control >> 8) & 0xf;
+        if ((control & 0x10000) == 0 && (destination == 2 || destination == 5)) {
+            Wr<u32>(at, 4, WriteMagicBase | destination);
+            Wr<u32>(at, 0, 0xC0001000u | count << 16);
+            return SyncWrite;
         }
     }
     return SyncNone;
@@ -599,7 +610,7 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
                     CountSyncConverted(kind, Live().sync_converted_sweep);
                 }
             }
-        } else if (opcode == 0x49 || opcode == 0x3c) {
+        } else if (opcode == 0x49 || opcode == 0x3c || opcode == 0x37) {
             if ((policy_bits & 2097152) != 0) {
                 if (const u32 kind = ConvertSyncPacket(at)) {
                     CountSyncConverted(kind, Live().sync_converted_sweep);
@@ -5332,7 +5343,7 @@ void PrepareBuffer(u64 begin, u64 end, u32 depth) {
             if (target >= 0x200000000ull && target < 0x1000000000ull && (target & 3) == 0 && dwords != 0 && dwords <= (1u << 20)) {
                 PrepareBuffer(target, target + dwords * sizeof(u32), depth + 1);
             }
-        } else if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c) {
+        } else if (opcode == 0x47 || opcode == 0x49 || opcode == 0x3c || opcode == 0x37) {
             if (const u32 kind = ConvertSyncPacket(at)) {
                 CountSyncConverted(kind, Live().sync_converted_submit);
             }
@@ -5368,6 +5379,14 @@ u32 RestoreSyncTag(const u32* tag, std::array<u32, 8>& packet, bool count_execut
         packet = {0xC0053C00u, magic & 0xff, tag[2], tag[3], tag[4], tag[5], tag[6]};
         kind = SyncWait;
         opcode = 0x3c;
+    }
+    if (kind == SyncNone && (magic & ~0xffu) == WriteMagicBase && count >= 3 && count <= 6) {
+        packet = {0xC0003700u | count << 16, (magic & 0xf) << 8};
+        for (u32 i = 2; i < count + 2; ++i) {
+            packet[i] = tag[i];
+        }
+        kind = SyncWrite;
+        opcode = 0x37;
     }
     if (kind != SyncNone && count_execution) {
         Live().sync_exec[kind].fetch_add(1, std::memory_order_relaxed);

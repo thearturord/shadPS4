@@ -133,8 +133,8 @@ nlohmann::json Native(const Params&) {
     j["sync_converted_sweep"] = live.sync_converted_sweep.load();
     j["sync_converted_submit"] = live.sync_converted_submit.load();
     j["sync_packets_kept"] = live.fence_packets_kept.load();
-    j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}};
-    j["sync_exec"] = {{"eop", live.sync_exec[1].load()}, {"release", live.sync_exec[2].load()}, {"wait", live.sync_exec[3].load()}};
+    j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}, {"write", live.sync_converted[4].load()}};
+    j["sync_exec"] = {{"eop", live.sync_exec[1].load()}, {"release", live.sync_exec[2].load()}, {"wait", live.sync_exec[3].load()}, {"write", live.sync_exec[4].load()}};
     j["shadow_anchors"] = live.shadow_anchors.load();
     j["shadow_spans"] = live.shadow_spans.load();
     j["shadow_pure"] = live.shadow_pure.load();

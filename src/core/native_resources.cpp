@@ -112,6 +112,15 @@ std::map<u64, std::shared_ptr<ImmutableBuffer>> immutables;                  ///
 std::unordered_map<u64, std::shared_ptr<ImmutableBuffer>> immutable_by_object;
 std::vector<std::pair<u64, std::shared_ptr<ImmutableBuffer>>> immutable_graveyard; ///< destroyed, kept alive for readers
 std::atomic<u64> immutable_epoch{1};
+// ---- frame ring upload redundancy ---------------------------------------------------------------------------------------
+// 64 byte granules of the frame ring already copied to the GPU in the current lap of the ring (a lap ends when the engine's
+// write offset wraps; the scan thread notices that once per second, so the figure is approximate).
+constexpr u64 RingGranule = 64;
+std::atomic<u64> ring_base{0}, ring_size{0};
+std::unique_ptr<std::atomic<u8>[]> ring_marks;
+std::atomic<u64> ring_laps{}, ring_bytes_new{}, ring_bytes_repeated{}, ring_requests_with_upload{};
+std::atomic<u64> ring_last_offset{0};
+
 std::atomic<u64> image_clears_done{};
 std::array<std::atomic<u64>, 3> image_clears_refused;
 std::atomic<u64> image_copies_done{};
@@ -269,7 +278,63 @@ void AddResource(const Resource& resource) {
     address_by_object[resource.object] = resource.address;
 }
 
+void UpdateRing() {
+    u64 allocator = 0, first = 0, base = 0;
+    const u64 device = Core::NativeDraw::EngineDevice();
+    if (device == 0 || !SafeRead64(device + 0x10238, &allocator) || allocator == 0 || !SafeRead64(allocator, &first) ||
+        !SafeRead64(allocator + 0x18, &base)) {
+        return;
+    }
+    const u64 size = first & 0xffffffffull;
+    const u64 offset = first >> 32;
+    if (size == 0 || size > (1ull << 30)) {
+        return;
+    }
+    if (ring_size.load() != size || ring_base.load() != base) {
+        auto marks = std::make_unique<std::atomic<u8>[]>(size / RingGranule + 1);
+        ring_marks = std::move(marks); // not safe against a concurrent event, once at the start only
+        ring_base.store(base);
+        ring_size.store(size);
+    }
+    ring_last_offset.store(offset);
+}
+
+void NoteRingUpload(VAddr address, u64 bytes) {
+    const u64 base = ring_base.load(std::memory_order_relaxed);
+    const u64 size = ring_size.load(std::memory_order_relaxed);
+    if (size == 0 || address < base || address >= base + size || !ring_marks) {
+        return;
+    }
+    ring_requests_with_upload.fetch_add(1, std::memory_order_relaxed);
+    {
+        // the engine's frame counter (JsDevice + 0x10240): the marks are per frame
+        static std::atomic<u32> last_frame{~0u};
+        const u64 device = Core::NativeDraw::EngineDevice();
+        u64 frame_word = 0;
+        if (device != 0 && SafeRead64(device + 0x10240, &frame_word)) {
+            const u32 frame = static_cast<u32>(frame_word);
+            if (last_frame.exchange(frame, std::memory_order_relaxed) != frame) {
+                ring_laps.fetch_add(1, std::memory_order_relaxed); // counts frames from here on
+                for (u64 i = 0; i < size / RingGranule + 1; ++i) {
+                    ring_marks[i].store(0, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+    const u64 first = (address - base) / RingGranule;
+    const u64 last = std::min<u64>((address - base + bytes - 1) / RingGranule, size / RingGranule);
+    u64 fresh = 0;
+    for (u64 g = first; g <= last; ++g) {
+        if (ring_marks[g].exchange(1, std::memory_order_relaxed) == 0) {
+            ++fresh;
+        }
+    }
+    ring_bytes_new.fetch_add(fresh * RingGranule, std::memory_order_relaxed);
+    ring_bytes_repeated.fetch_add((last - first + 1 - fresh) * RingGranule, std::memory_order_relaxed);
+}
+
 void ScanOnce() {
+    UpdateRing();
     {
         std::vector<u64> textures;
         {
@@ -436,6 +501,9 @@ void NoteBufferRequest(VAddr address, u32 size, bool written, BufferPath path, u
         return;
     }
     const Located at = Locate(address, size);
+    if (uploaded != 0) {
+        NoteRingUpload(address, size);
+    }
     for (Counters* c : {at.block, at.cls, at.usage}) {
         if (c == nullptr) {
             continue;
@@ -735,6 +803,21 @@ nlohmann::json Report() {
     top([](const History& h) { return h.cpu_writes; }, "top_written_by_cpu", 20);
     top([](const History& h) { return h.requests; }, "top_requested", 20);
     out["blocks_with_history"] = all.size();
+    {
+        // the frame allocator (JsVolatileMemory): size and write offset in its first qword, base address at +0x18
+        u64 allocator = 0, first = 0, base = 0;
+        const u64 device = Core::NativeDraw::EngineDevice();
+        if (device != 0 && SafeRead64(device + 0x10238, &allocator) && allocator != 0 && SafeRead64(allocator, &first) &&
+            SafeRead64(allocator + 0x18, &base)) {
+            out["frame_ring"] = {{"base", fmt::format("{:#x}", base)},
+                                 {"size", first & 0xffffffffull},
+                                 {"offset", first >> 32},
+                                 {"frames_seen", ring_laps.load()},
+                                 {"requests_that_uploaded", ring_requests_with_upload.load()},
+                                 {"requested_bytes_not_uploaded_before_this_lap", ring_bytes_new.load()},
+                                 {"requested_bytes_already_uploaded_this_lap", ring_bytes_repeated.load()}};
+        }
+    }
     out["image_clears"] = {{"native", image_clears_done.load()},
                            {"refused_no_image", image_clears_refused[0].load()},
                            {"refused_not_a_plain_colour_image", image_clears_refused[1].load()},

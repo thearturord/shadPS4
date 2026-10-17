@@ -244,6 +244,7 @@ struct PM4CmdNop {
         PrepareFlipInterrupt = 0x68750780u, ///< Flip marker with interrupt
         PrepareFlipInterruptLabel = 0x68750781u, ///< Flip marker with interrupt and label
         NativeDrawTag = 0x4E445447u, ///< Tag of the next draw written by the native draw hook (TLG)
+        NativeFence = 0x4E444653u,   ///< A graphics end-of-pipe write turned into a 6 dword no-op in place: the words after the magic are the packet's (TLG)
     };
 };
 

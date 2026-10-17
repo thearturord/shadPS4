@@ -657,6 +657,33 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     }
 }
 
+void Liverpool::SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop) {
+    // The packet is copied: the signal may run after the command buffer is reused.
+    static constexpr auto irq = [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); };
+    auto signal = [this, eop = event_eop] {
+        RunFenceSignal(
+            *this, gpu_id,
+            [&] {
+                bool backed = true;
+                eop.SignalFence(
+                    [&](void* address, u64 data, u32 num_bytes) {
+                        backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
+                    },
+                    [] {});
+                if (backed) {
+                    // Writes landed, now raise the interrupt (if any) after them.
+                    eop.SignalFence(NoFenceWrite, irq);
+                }
+                return backed;
+            },
+            [eop] { eop.SignalFence(WriteFenceMemory, irq); });
+    };
+    const auto eop_data_sel = event_eop.data_sel.Value();
+    const u32 eop_bytes = eop_data_sel == DataSelect::Data32Low ? sizeof(u32) : eop_data_sel == DataSelect::Data64 ? sizeof(u64) : 0;
+    SignalFenceAfterReadbacks(std::move(signal), false, reinterpret_cast<VAddr>(event_eop.Address<u8>()), event_eop.DataQWord(), eop_bytes,
+                              GfxQueueId, VideoCore::FenceGfxEop);
+}
+
 void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_count) {
     native_exec_calls++;
     Core::NativeDraw::ExecDraw draw;
@@ -1882,6 +1909,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
 
                 switch (nop->data_block[0]) {
+                case PM4CmdNop::PayloadType::NativeFence: {
+                    if (nop->header.count.Value() == 4) {
+                        Core::NativeDraw::Live().fence_exec.fetch_add(1, std::memory_order_relaxed);
+                        const std::array<u32, 6> packet{0xC0044700u, 0, nop->data_block[1], nop->data_block[2], nop->data_block[3], nop->data_block[4]};
+                        SignalGraphicsEop(*reinterpret_cast<const PM4CmdEventWriteEop*>(packet.data()));
+                    }
+                    break;
+                }
                 case PM4CmdNop::PayloadType::NativeDrawTag: {
                     if (nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
                         native_tag_pending.valid = true;
@@ -2441,37 +2476,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                // The packet is copied: the signal may run after the command buffer is reused.
-                static constexpr auto irq = [] {
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
-                };
-                auto signal = [this, eop = *event_eop] {
-                    RunFenceSignal(
-                        *this, gpu_id,
-                        [&] {
-                            bool backed = true;
-                            eop.SignalFence(
-                                [&](void* address, u64 data, u32 num_bytes) {
-                                    backed &= TryWriteFenceOffThread(rasterizer, address, data,
-                                                                     num_bytes);
-                                },
-                                [] {});
-                            if (backed) {
-                                // Writes landed, now raise the interrupt (if any) after them.
-                                eop.SignalFence(NoFenceWrite, irq);
-                            }
-                            return backed;
-                        },
-                        [eop] { eop.SignalFence(WriteFenceMemory, irq); });
-                };
-                const auto eop_data_sel = event_eop->data_sel.Value();
-                const u32 eop_bytes = eop_data_sel == DataSelect::Data32Low ? sizeof(u32)
-                                      : eop_data_sel == DataSelect::Data64  ? sizeof(u64)
-                                                                            : 0;
-                SignalFenceAfterReadbacks(
-                    std::move(signal), false, reinterpret_cast<VAddr>(event_eop->Address<u8>()),
-                    event_eop->DataQWord(), eop_bytes, GfxQueueId, VideoCore::FenceGfxEop);
+                SignalGraphicsEop(*reinterpret_cast<const PM4CmdEventWriteEop*>(header));
                 break;
             }
             case PM4ItOpcode::DmaData: {

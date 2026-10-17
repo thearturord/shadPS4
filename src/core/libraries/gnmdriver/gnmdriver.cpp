@@ -2481,6 +2481,7 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
                 .base_addr = reinterpret_cast<uintptr_t>(ccb),
             });
         }
+        Core::NativeDraw::PrepareSubmittedBuffer(const_cast<u32*>(dcb_span.data()), static_cast<u32>(dcb_span.size()));
         liverpool->SubmitGfx(dcb_span, ccb_span);
     }
     return ORBIS_OK;

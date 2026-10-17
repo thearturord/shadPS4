@@ -504,6 +504,19 @@ inline void Wr(u64 base, u64 offset, T value) {
 
 bool StripPackets(u64 begin, u64 end);
 
+/// A graphics end-of-pipe write (the 6 dword packet: label, value, data and interrupt select) becomes a no-op of the same size
+/// whose second dword is the fence magic; the command processor signals the fence from it. The label write and the interrupt
+/// stay the same function, only the stream no longer holds a packet of the hardware's encoding.
+bool ConvertFenceEop(u64 at) {
+    const u32 header = Rd<u32>(at, 0);
+    if (header != 0xC0044700u) {
+        return false;
+    }
+    Wr<u32>(at, 4, VideoCore::NativeFenceMagic);
+    Wr<u32>(at, 0, 0xC0041000u);
+    return true;
+}
+
 /// Synchronization the game writes between its commands that only orders the GPU against itself. The raster thread runs the
 /// operations in order and the rasterizer inserts the barriers its resources need, so:
 ///  - a scratch barrier unit (a label inside the command buffer, an end of shader event that writes 1 to it, a wait for it
@@ -514,6 +527,7 @@ bool StripPackets(u64 begin, u64 end);
 /// Fences with game visible labels, waits on them, CPU writes and flips stay. Returns the number of packets taken out.
 u32 SweepSyncPackets(u64 begin, u64 end) {
     u32 removed = 0;
+    const u32 policy_bits = VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed);
     for (u64 at = begin; at < end;) {
         const u32 header = Rd<u32>(at, 0);
         if ((header >> 30) != 3) {
@@ -546,6 +560,10 @@ u32 SweepSyncPackets(u64 begin, u64 end) {
                     at = after;
                     continue;
                 }
+            }
+        } else if (opcode == 0x47) {
+            if ((policy_bits & 2097152) != 0 && ConvertFenceEop(at)) {
+                Live().fence_converted_sweep.fetch_add(1, std::memory_order_relaxed);
             }
         } else if (opcode == 0x58) {
             if (StripPackets(at, at + size)) {
@@ -4075,6 +4093,35 @@ u64 PS4_SYSV_ABI TagAscCopyResource(u64 jcc, u64 destination, u64 source, u64 a3
     return PublishAscMemoryCopy(jcc, destination, source, to, from, bytes, ret);
 }
 
+/// FUN_02480d60(draw context): a CPU visible fence. The function takes eight bytes from the frame ring, stores 0x11 in them, writes
+/// an end-of-pipe packet that stores 0x10 there, and returns the address the game polls. The game's function runs (it owns the
+/// label); the packet it wrote becomes a fence tag (ConvertFenceEop).
+u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (ctx == 0 || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
+        return 0;
+    }
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("FenceEop");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0) {
+        return 0;
+    }
+    const u64 before = Rd<u64>(ctx, 0x47d0);
+    const u64 label = reinterpret_cast<GuestFunction6>(original)(ctx, a1, a2, a3, a4, a5);
+    const u64 after = Rd<u64>(ctx, 0x47d0);
+    if (after == before + 6 * sizeof(u32) && (before & 3) == 0 && ConvertFenceEop(before)) {
+        Live().fence_converted_hook.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        Live().fence_packets_kept.fetch_add(1, std::memory_order_relaxed);
+    }
+    return label | (1ull << 63);
+}
+
 /// FUN_024826c0(draw context): the reset at the start of a frame. It sets the engine fields, has the driver write the hardware
 /// default state (a template tag with padding) and then writes a few context registers and the index type itself. Those
 /// register packets after the padding become one state template tag.
@@ -5185,6 +5232,9 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_auto") {
         return reinterpret_cast<u64>(&TagAuto);
     }
+    if (name == "tag_fence") {
+        return reinterpret_cast<u64>(&TagFenceSignal);
+    }
     return 0;
 }
 
@@ -5222,6 +5272,29 @@ bool IsTagAt(u64 address, u64 seq) {
     return seq == 0 || Rd<u64>(address, 9 * sizeof(u32)) == seq;
 }
 } // namespace
+
+void PrepareSubmittedBuffer(const u32* dcb, u32 dwords) {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    if (dcb == nullptr || policy.native_draw_exec.load(std::memory_order_relaxed) == 0 ||
+        (policy.native_sdk_strip.load(std::memory_order_relaxed) & 2097152) == 0) {
+        return;
+    }
+    const u64 end = reinterpret_cast<u64>(dcb) + dwords * sizeof(u32);
+    for (u64 at = reinterpret_cast<u64>(dcb); at < end;) {
+        const u32 header = Rd<u32>(at, 0);
+        if ((header >> 30) != 3) {
+            break;
+        }
+        const u64 size = (((header >> 16) & 0x3fff) + 2) * 4ull;
+        if (at + size > end) {
+            break;
+        }
+        if (((header >> 8) & 0xff) == 0x47 && ConvertFenceEop(at)) {
+            Live().fence_converted_submit.fetch_add(1, std::memory_order_relaxed);
+        }
+        at += size;
+    }
+}
 
 bool SubmitShadowEnabled() {
     const auto& policy = VideoCore::ReadbackPolicy::Get();

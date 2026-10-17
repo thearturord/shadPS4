@@ -43,6 +43,9 @@ struct LiveCounters {
     /// buffer spans walked, spans without any packet besides entries ("pure") and with some ("mixed"), tags the walk found that
     /// the index has / has not, indexed tags the walk did not find
     std::atomic<u64> shadow_anchors{}, shadow_spans{}, shadow_pure{}, shadow_mixed{}, shadow_matched{}, shadow_extra{}, shadow_missing{}, shadow_nested{}, shadow_stale{};
+    /// sync records (`native_sdk_strip` bit 2097152): graphics fences turned into fence tags by the hook of FUN_02480d60, by the
+    /// sweep of the other writers and when a command buffer is submitted (the writes at its end), packets the hook left as written, fence tags executed by the command processor
+    std::atomic<u64> fence_converted_hook{}, fence_converted_sweep{}, fence_converted_submit{}, fence_packets_kept{}, fence_exec{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
     std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};
@@ -119,6 +122,8 @@ bool SubmitShadowEnabled();
 void NoteAnchor(u64 address, u64 seq, u32 kind);
 /// One line that describes the tag at `header` and the record it names (kind, mode, calling function as a Ghidra address, operands). Used by the entry dump.
 std::string DescribeEntry(const void* header);
+/// Submit time: the synchronization packets of the command buffer that become records (graphics end-of-pipe writes: fence tags).
+void PrepareSubmittedBuffer(const u32* dcb, u32 dwords);
 /// Per opcode: packets in walked spans that are not entries, flips and indirect buffers included (/native).
 u64 ShadowNonEntryCount(u32 opcode);
 

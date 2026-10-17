@@ -44,6 +44,7 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 struct PM4CmdWaitRegMem;
+struct PM4CmdEventWriteEop;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -259,6 +260,7 @@ private:
     void RasterDispatch(const RasterCall& call);
     /// Draws the pending native draw tag from its record instead of from command packets.
     void ExecuteNativeDraw(const void* header = nullptr, u32 asc_vqid = ~0u, u32 index_count = ~0u);
+    void SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop);
     bool native_follow_pending{}; ///< an executed draw waits for its draw packet (index count)
     void RasterPush(RasterOp&& op, bool wait);
     /// Blocks until every queued closure that writes guest memory has run.

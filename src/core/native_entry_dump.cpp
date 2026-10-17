@@ -196,6 +196,14 @@ void Span::Packet(const void* packet) {
                 return;
             }
             text = Core::NativeDraw::DescribeEntry(header);
+        } else if (nop->data_block[0] == PM4CmdNop::PayloadType::NativeFence && nop->header.count.Value() == 4) {
+            if (state.load(std::memory_order_acquire) == Armed) {
+                return;
+            }
+            const u32 data_control = nop->data_block[2];
+            text = fmt::format("ENTRY FENCE_SIGNAL label={:#x} value={:#x} data={} irq={}", nop->data_block[1] | u64(data_control & 0xffff) << 32,
+                               nop->data_block[3] | u64(nop->data_block[4]) << 32, DataSelectName(static_cast<DataSelect>(data_control >> 29)),
+                               (data_control >> 24) & 3);
         } else if (nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip) {
             flip = true;
             text = fmt::format("FLIP patched flip request");

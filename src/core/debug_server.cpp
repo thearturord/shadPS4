@@ -129,6 +129,11 @@ nlohmann::json Native(const Params&) {
     j["sync_acquires_stripped"] = live.sync_acquires_stripped.load();
     j["sync_events_stripped"] = live.sync_events_stripped.load();
     j["barrier_calls_skipped"] = live.barrier_calls_skipped.load();
+    j["fence_converted_hook"] = live.fence_converted_hook.load();
+    j["fence_converted_sweep"] = live.fence_converted_sweep.load();
+    j["fence_converted_submit"] = live.fence_converted_submit.load();
+    j["fence_packets_kept"] = live.fence_packets_kept.load();
+    j["fence_exec"] = live.fence_exec.load();
     j["shadow_anchors"] = live.shadow_anchors.load();
     j["shadow_spans"] = live.shadow_spans.load();
     j["shadow_pure"] = live.shadow_pure.load();

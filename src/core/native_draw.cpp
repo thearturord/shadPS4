@@ -5382,6 +5382,118 @@ void SubmitShadow::End() {
     other.fill(0);
 }
 
+std::string DescribeEntry(const void* header) {
+    const u64 address = reinterpret_cast<u64>(header);
+    const u32 meta = Rd<u32>(address, 8);
+    const u32 kind = (meta >> 8) & 0xff;
+    const u64 seq = Rd<u64>(address, 9 * sizeof(u32));
+    const char* mode = (meta & VideoCore::NativeTagExecFlag) == 0       ? "packets-follow"
+                       : (meta & VideoCore::NativeTagFollowFlag) != 0 ? "at-draw-packet"
+                                                                      : "record";
+    const char* name = "UNKNOWN";
+    switch (kind) {
+    case 0: name = "DRAW_INDEXED"; break;
+    case 1: name = "DRAW_AUTO"; break;
+    case 2: name = "DRAW_INDIRECT"; break;
+    case 3: name = "DISPATCH"; break;
+    case 4: name = "FAST_CLEAR_ELIMINATE"; break;
+    case 6: name = "FILL"; break;
+    case 7: name = "DEPTH_CLEAR"; break;
+    case 8: name = "GDS_FILL"; break;
+    case 9: name = "GDS_READBACK"; break;
+    case 10: name = "COPY"; break;
+    case 11: name = "DISPATCH_INDIRECT"; break;
+    case 12: name = "STATE_TEMPLATE"; break;
+    default: break;
+    }
+    std::string text = fmt::format("ENTRY {} seq={} {} class={}", name, seq, mode, meta & 0xff);
+    if (kind == 12) {
+        if (const u64 pointer = Rd<u64>(address, 12); pointer != 0) {
+            text += fmt::format(" writes={}", reinterpret_cast<const StateTemplate*>(pointer)->writes.size());
+        }
+        return text;
+    }
+    if (seq == 0) {
+        return text + " no-record";
+    }
+    const auto& slot = Slot(seq);
+    if (slot.seq.load(std::memory_order_acquire) != seq) {
+        return text + " record-gone";
+    }
+    const auto find = [&](u32 index, u32& value) {
+        for (u32 i = 0; i < slot.count; ++i) {
+            if (slot.regs[i].index == index) {
+                value = slot.regs[i].value;
+                return true;
+            }
+        }
+        return false;
+    };
+    const VAddr image = image_base.load(std::memory_order_relaxed);
+    text += fmt::format(" caller={:#x}", image != 0 && slot.caller >= image ? slot.caller - image + 0x1000000 : slot.caller);
+    switch (kind) {
+    case 0:
+    case 1:
+    case 2: {
+        if (kind == 2) {
+            text += fmt::format(" args={:#x}+{}", slot.args_addr, slot.a2);
+        } else if (slot.a1 == UnknownDrawCount) {
+            text += fmt::format(" count=? first={}", slot.a2);
+        } else {
+            text += fmt::format(" count={} first={}", slot.a1, slot.a2);
+        }
+        text += fmt::format(" vs={:#x} ps={:#x} keys={:#x}/{:#x}/{:#x}", slot.vs_gnm, slot.ps_gnm, Rd<u64>(address, 12), Rd<u64>(address, 20),
+                            Rd<u64>(address, 28));
+        for (u32 target = 0; target < 8; ++target) {
+            if (u32 base; find(ContextBase + 0x318 + 0xf * target, base) && base != 0) {
+                text += fmt::format(" rt{}={:#x}", target, u64{base} << 8);
+            }
+        }
+        if (u32 base; find(ContextBase + 0x14, base) && base != 0) {
+            text += fmt::format(" z={:#x}", u64{base} << 8);
+        }
+        text += fmt::format(" fixed={} special={:#x}", slot.fixed != nullptr, slot.flags);
+        break;
+    }
+    case 3:
+    case 11: {
+        if (u32 x, y, z; find(ComputeRegisterBase + 1, x) && find(ComputeRegisterBase + 2, y) && find(ComputeRegisterBase + 3, z)) {
+            text += fmt::format(" groups={}x{}x{}", x, y, z);
+        }
+        if (kind == 11) {
+            text += fmt::format(" args={:#x}+{}", slot.args_addr, slot.a2);
+        }
+        if (slot.copy_bytes != 0) {
+            text += fmt::format(" as-copy dst={:#x} src={:#x} bytes={}", slot.copy_destination, slot.copy_source, slot.copy_bytes);
+        } else if (slot.fill_dwords != 0) {
+            text += fmt::format(" as-fill dst={:#x} bytes={} pattern-dwords={} first={:#x}", slot.fill_destination, slot.fill_bytes, slot.fill_dwords,
+                                slot.fill_pattern[0]);
+        }
+        break;
+    }
+    case 4:
+        break;
+    case 6:
+    case 8:
+        text += fmt::format(" dst={:#x}{} dwords={} value={:#x}", slot.args_addr, kind == 8 ? "(gds)" : "", slot.a1, slot.a2);
+        break;
+    case 9:
+        text += fmt::format(" dst={:#x} gds={:#x} dwords={}", slot.args_addr, slot.a2, slot.a1);
+        break;
+    case 10:
+        text += fmt::format(" dst={:#x} src={:#x} bytes={}", slot.args_addr, slot.extra_addr, slot.a1);
+        break;
+    case 7:
+        if (u32 base; find(ContextBase + 0x14, base)) {
+            text += fmt::format(" z={:#x}", u64{base} << 8);
+        }
+        break;
+    default:
+        break;
+    }
+    return text;
+}
+
 u64 EngineDevice() {
     return ResolveDevice().device;
 }

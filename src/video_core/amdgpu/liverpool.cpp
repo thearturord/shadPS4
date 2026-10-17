@@ -17,6 +17,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
 #include "core/native_draw.h"
+#include "core/native_entry_dump.h"
 #include "core/native_resources.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -1825,6 +1826,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     Core::NativeDraw::SubmitShadow shadow;
     shadow.Begin(0, dcb.data(), static_cast<u32>(dcb.size()));
+    Core::EntryDump::Span entry_dump{0, dcb.data(), static_cast<u32>(dcb.size())};
 
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
@@ -1858,6 +1860,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (VideoCore::ReadbackPolicy::Get().native_draw_exec.load(std::memory_order_relaxed) != 0) {
                 CountGameCommand(header, opcode, count);
             }
+            entry_dump.Packet(header);
             if (shadow.Active()) {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
                 if (opcode != PM4ItOpcode::Nop) {
@@ -2724,6 +2727,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     Core::NativeDraw::SubmitShadow shadow;
     shadow.Begin(vqid + 1, acb.data(), static_cast<u32>(acb.size()));
+    Core::EntryDump::Span entry_dump{vqid + 1, acb.data(), static_cast<u32>(acb.size())};
     while (!acb.empty()) {
         ProcessCommands();
 
@@ -2769,6 +2773,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const PM4ItOpcode opcode = header->type3.opcode;
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
         CountComputeQueueCommand(header, opcode);
+        entry_dump.Packet(header);
         if (shadow.Active()) {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
             if (opcode != PM4ItOpcode::Nop) {

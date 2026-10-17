@@ -117,6 +117,8 @@ u32 RecordDrawCount(u64 seq);
 /// the packets that are not entries (inert padding aside), which tells whether the span could be submitted without the walk.
 bool SubmitShadowEnabled();
 void NoteAnchor(u64 address, u64 seq, u32 kind);
+/// One line that describes the tag at `header` and the record it names (kind, mode, calling function as a Ghidra address, operands). Used by the entry dump.
+std::string DescribeEntry(const void* header);
 /// Per opcode: packets in walked spans that are not entries, flips and indirect buffers included (/native).
 u64 ShadowNonEntryCount(u32 opcode);
 

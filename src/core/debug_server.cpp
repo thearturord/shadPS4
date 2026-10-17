@@ -20,6 +20,7 @@
 #include "core/native_resources.h"
 #include "core/memory.h"
 #include "core/native_draw.h"
+#include "core/native_entry_dump.h"
 #include "video_core/readback_policy.h"
 #include "video_core/thread_profiler.h"
 #include "video_core/thread_usage.h"
@@ -91,6 +92,13 @@ nlohmann::json Status(const Params&) {
     j["fps_5s"] = FpsOver(5.0);
     j["game_serial"] = MemoryPatcher::g_game_serial;
     return j;
+}
+
+nlohmann::json EntryDumpEndpoint(const Params& params) {
+    if (params.find("frames") != params.end()) {
+        Core::EntryDump::Request(static_cast<u32>(std::min<u64>(ParseNumber(params, "frames", 1), 16)));
+    }
+    return Core::EntryDump::Status();
 }
 
 nlohmann::json Native(const Params&) {
@@ -367,6 +375,9 @@ void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
     Register("/native", "native renderer counters (cumulative)", Native);
+    Register("/entrydump",
+             "?frames=1: dump the next frames of the command stream as entries to log/entry_dump.txt (without frames: the state of the last request)",
+             EntryDumpEndpoint);
     Register("/resources", "?start=1 turns the resource census on; the engine's GPU memory blocks and who uses, uploads and writes them",
              [](const Params& params) {
                  if (ParseNumber(params, "start", 0) != 0) {

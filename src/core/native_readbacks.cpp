@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <map>
@@ -8,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <fmt/format.h>
 #include "core/native_readbacks.h"
+#include "video_core/readback_policy.h"
 
 namespace Core::NativeReadbacks {
 
@@ -24,6 +26,13 @@ struct Range {
     u64 maps{};           ///< AsyncMap calls that returned (part of) it
     u64 faults{};         ///< CPU read faults inside it
     u64 shared_faults{};  ///< CPU read faults on a page it shares but outside it
+    u64 values{};         ///< 4 byte ranges: the first dword at each map (counters)
+    u64 value_sum{};
+    u32 value_min{~0u};
+    u32 value_max{};
+    u64 value_zero{};
+    u64 value_repeat{};   ///< maps that saw the same value as the previous one
+    u32 value_last{~0u};
     std::map<u64, u64> map_callers;
 };
 
@@ -35,6 +44,9 @@ size_t range_count{};
 std::atomic<u64> faults_other{}, maps_other{}, faults_total{};
 std::map<u64, u64> other_map_callers;
 std::map<std::pair<u64, u32>, std::pair<u64, u64>> per_caller; ///< (caller, record kind) -> records, bytes
+
+std::atomic<u64> explicit_copies{}, explicit_bytes{};
+std::array<std::atomic<u64>, 2> explicit_refused{};
 
 constexpr u64 PageSize = 4096;
 
@@ -81,11 +93,20 @@ void NoteDestination(VAddr address, u64 size, u32 usage, u32 kind, u64 caller) {
     range.bytes = size;
 }
 
-void NoteMap(VAddr address, u64 size, u64 caller) {
+void NoteMap(VAddr address, u64 size, u64 caller, u32 first_dword) {
     std::scoped_lock lock{mutex};
     if (Range* range = Find(address, size ? size : 1)) {
         ++range->maps;
         ++range->map_callers[caller];
+        if (size == sizeof(u32)) {
+            ++range->values;
+            range->value_sum += first_dword;
+            range->value_min = std::min(range->value_min, first_dword);
+            range->value_max = std::max(range->value_max, first_dword);
+            range->value_zero += first_dword == 0;
+            range->value_repeat += first_dword == range->value_last;
+            range->value_last = first_dword;
+        }
     } else {
         maps_other.fetch_add(1, std::memory_order_relaxed);
         ++other_map_callers[caller];
@@ -110,6 +131,21 @@ void NoteReadFault(VAddr address, u64 size) {
     faults_other.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool ExplicitEnabled() {
+    const auto& policy = VideoCore::ReadbackPolicy::Get();
+    return policy.native_draw_exec.load(std::memory_order_relaxed) != 0 && policy.dma_async.load(std::memory_order_relaxed) &&
+           (policy.native_sdk_strip.load(std::memory_order_relaxed) & 33554432) != 0;
+}
+
+void NoteExplicit(bool done, u64 bytes, u32 reason) {
+    if (done) {
+        explicit_copies.fetch_add(1, std::memory_order_relaxed);
+        explicit_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (reason < explicit_refused.size()) {
+        explicit_refused[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 nlohmann::json Report() {
     using nlohmann::json;
     std::scoped_lock lock{mutex};
@@ -131,7 +167,14 @@ nlohmann::json Report() {
                         {"maps", range.maps},
                         {"map_callers", callers},
                         {"read_faults_inside", range.faults},
-                        {"read_faults_same_page", range.shared_faults}});
+                        {"read_faults_same_page", range.shared_faults},
+                        {"counter_values", range.values == 0 ? json(nullptr)
+                                                              : json{{"maps", range.values},
+                                                                     {"min", range.value_min},
+                                                                     {"max", range.value_max},
+                                                                     {"mean", static_cast<double>(range.value_sum) / static_cast<double>(range.values)},
+                                                                     {"zero", range.value_zero},
+                                                                     {"same_as_previous", range.value_repeat}}}});
     }
     out["destinations"] = list;
     json callers_json = json::array();
@@ -145,6 +188,11 @@ nlohmann::json Report() {
     }
     out["maps_outside_destinations"] = maps_other.load();
     out["map_callers_outside"] = other;
+    out["explicit"] = {{"enabled", ExplicitEnabled()},
+                       {"copies", explicit_copies.load()},
+                       {"bytes", explicit_bytes.load()},
+                       {"refused_other_path", explicit_refused[0].load()},
+                       {"refused_too_large", explicit_refused[1].load()}};
     out["read_faults_total"] = faults_total.load();
     out["read_faults_elsewhere"] = faults_other.load();
     return out;

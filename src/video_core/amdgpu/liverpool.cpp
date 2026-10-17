@@ -18,6 +18,7 @@
 #include "core/memory.h"
 #include "core/native_direct.h"
 #include "core/native_draw.h"
+#include "core/native_readbacks.h"
 #include "core/native_entry_dump.h"
 #include "core/native_resources.h"
 #include "core/platform.h"
@@ -870,8 +871,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         native_tag_pending.valid = false;
         if (rasterizer) {
             RasterRun(
-                [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr),
-                 bytes = draw.a1] { rasterizer->CopyBuffer(destination, source, bytes, false, false); },
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = static_cast<VAddr>(draw.extra_addr), bytes = draw.a1,
+                 staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
+                    rasterizer->CopyBuffer(destination, source, bytes, false, false, staging);
+                },
                 false, true);
         }
         return;
@@ -881,8 +884,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         native_tag_pending.valid = false;
         if (rasterizer) {
             RasterRun(
-                [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index] {
-                    rasterizer->CopyBuffer(destination, source, sizeof(u32), false, true);
+                [this, destination = static_cast<VAddr>(draw.args_addr), source = draw.start_index,
+                 staging = draw.dst_usage == 3 && Core::NativeReadbacks::ExplicitEnabled()] {
+                    rasterizer->CopyBuffer(destination, source, sizeof(u32), false, true, staging);
                 },
                 false, true);
         }

@@ -1981,7 +1981,7 @@ bool Rasterizer::TryCopyImages(VAddr dst, VAddr src, u32 num_bytes) {
     return true;
 }
 
-void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds, bool staging_readback) {
     if (!dst_gds && !src_gds && Core::NativeResources::ImageCopyEnabled() && TryCopyImages(dst, src, num_bytes)) {
         return;
     }
@@ -2004,9 +2004,18 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
         }
         return buffer_cache.ObtainBuffer(src, num_bytes, false, true);
     }();
+    // An explicit readback (a copy into a STAGING resource of the engine, bit 33554432): the bytes are downloaded in stream order below and
+    // the destination is not marked GPU modified, so no page of it is read protected.
+    const bool explicit_readback = staging_readback && !dst_gds && num_bytes <= VideoCore::BufferCache::MaxDmaDownload;
+    if (staging_readback) {
+        Core::NativeReadbacks::NoteExplicit(explicit_readback, num_bytes, dst_gds ? 0 : 1);
+    }
     const auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (dst_gds) {
             return {gds_buffer, dst};
+        }
+        if (explicit_readback) {
+            return buffer_cache.ObtainBufferForDownload(dst, num_bytes);
         }
         return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
     }();

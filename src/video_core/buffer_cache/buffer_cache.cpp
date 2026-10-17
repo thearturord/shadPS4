@@ -578,7 +578,6 @@ void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {
 
 void BufferCache::RecordDmaDownload(const Buffer* arena, VAddr dst, u32 size) {
     // The game's own readbacks are small lists and counters; a bigger copy is not one of them.
-    constexpr u32 MaxDmaDownload = 4_MB;
     if (size == 0 || size > MaxDmaDownload) {
         return;
     }
@@ -695,6 +694,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         *memo = {device_addr, size, is_written ? 1u : 0u, arena, offset, epoch_before, scheduler.CurrentTick()};
     }
     return {arena, offset};
+}
+
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferForDownload(VAddr device_addr, u32 size) {
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    last_upload_bytes = 0;
+    SynchronizeMemory(arena, device_addr, size, false, false);
+    Core::NativeResources::NoteBufferRequest(device_addr, size, false, Core::NativeResources::BufferPath::Arena, last_upload_bytes);
+    return {arena, arena->Offset(device_addr)};
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {

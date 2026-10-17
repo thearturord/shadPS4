@@ -3177,6 +3177,7 @@ bool TakeExecDraw(u64 seq, ExecDraw& out) {
     }
     out.fixed = slot.kind == 4 ? nullptr : slot.fixed;
     out.fixed_stale = slot.fixed_stale;
+    out.dst_usage = slot.kind == 9 || slot.kind == 10 ? slot.dst_usage : ~0u;
     return slot.seq.load(std::memory_order_acquire) == seq;
 }
 
@@ -4204,7 +4205,9 @@ u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64
         return 0;
     }
     reinterpret_cast<GuestFunction6>(original)(resource, out, a2, a3, a4, a5);
-    Core::NativeReadbacks::NoteMap(Rd<u64>(out, 0), Rd<u32>(out, 8), ret - ImageBase() + 0x1000000);
+    const u64 mapped = Rd<u64>(out, 0);
+    const u32 mapped_size = Rd<u32>(out, 8);
+    Core::NativeReadbacks::NoteMap(mapped, mapped_size, ret - ImageBase() + 0x1000000, mapped_size == sizeof(u32) ? Rd<u32>(mapped, 0) : 0);
     return 1;
 }
 

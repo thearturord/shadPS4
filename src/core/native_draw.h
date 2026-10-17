@@ -115,6 +115,7 @@ struct ExecDraw {
     u32 copy_bytes{};
     const Vulkan::FixedState* fixed{}; ///< draws: the fixed-function state built from the engine's objects (null: from the registers)
     u32 fixed_stale{};                 ///< FixedStateStale groups of `fixed` the hardware keeps from earlier draws
+    u32 dst_usage{~0u};                ///< copy and counter read-back records: Usage of the destination resource (3 staging)
 };
 
 /// Command processor: the index / vertex count the record's draw was called with (0xffffffff when the record is gone).

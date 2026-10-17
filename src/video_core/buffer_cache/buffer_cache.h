@@ -102,6 +102,13 @@ public:
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
 
+    /// The arena range of a copy destination that is downloaded in stream order (an explicit readback): the CPU's pending writes are
+    /// uploaded, the range is not marked GPU modified.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForDownload(VAddr device_addr, u32 size);
+
+    /// The largest copy RecordDmaDownload downloads.
+    static constexpr u32 MaxDmaDownload = 4_MB;
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 

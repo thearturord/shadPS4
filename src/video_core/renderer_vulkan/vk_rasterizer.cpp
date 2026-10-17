@@ -1962,7 +1962,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
-            // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            // Both buffers were not transferred to GPU yet. Can safely copy in host memory. The destination is
+            // invalidated as one range first: written page by page the copy would take a write fault per page.
+            InvalidateMemory(dst, num_bytes, false);
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
             buffer_cache.NoteCpGuestWrite(dst, num_bytes);
             return;

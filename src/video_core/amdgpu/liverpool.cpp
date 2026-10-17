@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/memory.h"
+#include "core/native_direct.h"
 #include "core/native_draw.h"
 #include "core/native_entry_dump.h"
 #include "core/native_resources.h"
@@ -1832,8 +1833,11 @@ void CountComputeQueueCommand(const PM4Header* header, PM4ItOpcode opcode) {
 }
 } // namespace
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(dcb_task_name);
+    if (direct) {
+        ++direct->depth;
+    }
 
     cblock.Reset();
 
@@ -1842,6 +1846,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8192) != 0) {
         // a small command buffer of register writes only (the game's default state, submitted every frame): its effect
         if (const auto* state = Core::NativeDraw::IndirectStateTemplate(dcb.data(), dcb.size())) {
+            if (direct) {
+                direct->WalkStateBuffer(reinterpret_cast<u64>(dcb.data()));
+            }
             ApplyStateTemplate(*state);
             dcb = {};
         }
@@ -1888,6 +1895,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 CountGameCommand(header, opcode, count);
             }
             entry_dump.Packet(header);
+            if (direct) {
+                direct->Walk(reinterpret_cast<const u32*>(header));
+            }
             if (shadow.Active()) {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
                 if (opcode != PM4ItOpcode::Nop) {
@@ -2641,12 +2651,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // a small buffer of register writes only (the game's default state, recorded once): its effect, not its packets
                     if (const auto* state =
                             Core::NativeDraw::IndirectStateTemplate(indirect_buffer->Address<const u32>(), indirect_buffer->ib_size)) {
+                        if (direct) {
+                            direct->WalkStateBuffer(reinterpret_cast<u64>(indirect_buffer->Address<const u32>()));
+                        }
                         ApplyStateTemplate(*state);
                         break;
                     }
                 }
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, direct);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -2711,6 +2724,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             RESUME_GFX(ce_task);
         }
         ce_task.handle.destroy();
+    }
+
+    if (direct && --direct->depth == 0) {
+        direct->Finish();
     }
 
     FIBER_EXIT;
@@ -3145,7 +3162,8 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
+    auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
+    auto task = ProcessGraphics(dcb, ccb, std::move(direct));
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

@@ -48,6 +48,9 @@ struct LiveCounters {
     /// hook left as written; tags the command processor executed, by kind
     std::array<std::atomic<u64>, 5> sync_converted{}, sync_exec{};
     std::atomic<u64> sync_converted_hook{}, sync_converted_sweep{}, sync_converted_submit{}, fence_packets_kept{};
+    /// direct submission, step 3a (bit 4194304): graphics buffers whose entry list was built, pure / mixed ones, entries listed, entries the walk
+    /// found in the list, entries that differ or are missing, buffers whose non-entry packets differ between list and walk, buffers whose list is incomplete (not compared)
+    std::atomic<u64> direct_built{}, direct_pure{}, direct_mixed{}, direct_entries{}, direct_matched{}, direct_entry_mismatch{}, direct_purity_mismatch{}, direct_incomplete{};
     std::atomic<u64> track_native{}, track_fce{}, track_game_second{}, track_game_depth{};
     /// fixed-function state of native draws: used from the engine's objects, compared with the registers, and the compares that differed
     std::atomic<u64> fixed_native{}, fixed_checked{}, fixed_diff{};

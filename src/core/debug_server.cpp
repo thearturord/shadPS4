@@ -135,6 +135,14 @@ nlohmann::json Native(const Params&) {
     j["sync_packets_kept"] = live.fence_packets_kept.load();
     j["sync_converted"] = {{"eop", live.sync_converted[1].load()}, {"release", live.sync_converted[2].load()}, {"wait", live.sync_converted[3].load()}, {"write", live.sync_converted[4].load()}};
     j["sync_exec"] = {{"eop", live.sync_exec[1].load()}, {"release", live.sync_exec[2].load()}, {"wait", live.sync_exec[3].load()}, {"write", live.sync_exec[4].load()}};
+    j["direct_built"] = live.direct_built.load();
+    j["direct_pure"] = live.direct_pure.load();
+    j["direct_mixed"] = live.direct_mixed.load();
+    j["direct_entries"] = live.direct_entries.load();
+    j["direct_matched"] = live.direct_matched.load();
+    j["direct_entry_mismatch"] = live.direct_entry_mismatch.load();
+    j["direct_purity_mismatch"] = live.direct_purity_mismatch.load();
+    j["direct_incomplete"] = live.direct_incomplete.load();
     j["shadow_anchors"] = live.shadow_anchors.load();
     j["shadow_spans"] = live.shadow_spans.load();
     j["shadow_pure"] = live.shadow_pure.load();

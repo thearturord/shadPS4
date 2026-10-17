@@ -270,6 +270,7 @@ void AddImmutable(const Resource& resource) {
     }
     immutables[entry->begin] = entry;
     immutable_by_object[entry->object] = entry;
+    immutable_epoch.fetch_add(1, std::memory_order_release);
 }
 
 void AddResource(const Resource& resource) {
@@ -605,36 +606,57 @@ bool ImmutableResidencyEnabled() {
 }
 
 ImmutableBuffer* FindImmutable(VAddr address, u32 size) {
+    // Two per thread caches, both dropped when a buffer is registered or destroyed. The positive one is indexed by the 1 KB unit of the address and
+    // holds the buffer that contained the last request there. The negative one is indexed by the 64 KB unit and holds the gap between two immutable
+    // buffers that contains the unit's first address: a request inside the gap needs no lookup (nearly every request is for another kind of buffer).
+    struct Positive {
+        u64 unit{};
+        ImmutableBuffer* buffer{};
+    };
+    struct Gap {
+        u64 unit{};
+        u64 begin{};
+        u64 end{};
+    };
     struct Cache {
         u64 epoch{};
-        std::array<ImmutableBuffer*, 512> entries{};
+        std::array<Positive, 512> positive{};
+        std::array<Gap, 1024> gaps{};
     };
     static thread_local Cache cache;
     const u64 epoch = immutable_epoch.load(std::memory_order_acquire);
     if (cache.epoch != epoch) {
-        cache.entries.fill(nullptr);
+        cache.positive.fill({});
+        cache.gaps.fill({});
         cache.epoch = epoch;
     }
     const auto contains = [&](const ImmutableBuffer* b) {
         return b != nullptr && address >= b->begin && address + size <= b->end && b->alive.load(std::memory_order_acquire);
     };
-    // the cache is indexed by the 1 KB unit of the address: the request's own unit, which lies inside its buffer
-    ImmutableBuffer*& slot = cache.entries[(address >> 10) & 511];
-    if (contains(slot)) {
-        return slot;
+    Positive& hit = cache.positive[(address >> 10) & 511];
+    if (hit.unit == (address >> 10) + 1 && contains(hit.buffer)) {
+        return hit.buffer;
+    }
+    const u64 gap_unit = (address >> 16) + 1; // 0 marks an empty entry
+    Gap& gap = cache.gaps[gap_unit & 1023];
+    if (gap.unit == gap_unit && address >= gap.begin && address + size <= gap.end) {
+        return nullptr;
     }
     std::shared_lock lock{immutable_mutex};
     auto it = immutables.upper_bound(address);
-    if (it == immutables.begin()) {
-        return nullptr;
+    ImmutableBuffer* previous = nullptr;
+    if (it != immutables.begin()) {
+        previous = std::prev(it)->second.get();
     }
-    --it;
-    ImmutableBuffer* buffer = it->second.get();
-    if (!contains(buffer)) {
-        return nullptr;
+    if (previous != nullptr && address < previous->end) {
+        if (!contains(previous)) {
+            return nullptr;
+        }
+        hit = {(address >> 10) + 1, previous};
+        return previous;
     }
-    slot = buffer;
-    return buffer;
+    gap = {gap_unit, previous != nullptr ? previous->end : 0, it != immutables.end() ? it->first : ~0ull};
+    return nullptr;
 }
 
 void ImmutableSynced(ImmutableBuffer& buffer, u32 generation) {

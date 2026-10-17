@@ -3625,9 +3625,87 @@ void PrepareDrawSideEffects(u64 ctx) {
     }
 }
 
+/// `native_sdk_strip` bit 2147483648: the first draw of a vertex shader that takes a fetch shader runs the game's own draw
+/// function (it creates the fetch object inside PrepareDraw); its record is built again afterwards (bit 262144 executes it).
+bool FetchRebuildEnabled() {
+    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 2147483648u) != 0;
+}
+
+bool FetchRebuildExecutes() {
+    return (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 262144u) != 0;
+}
+
+using GuestDraw6 = u64(PS4_SYSV_ABI*)(u64, u64, u64, u64, u64, u64);
+
+/// The record of a draw was flagged only because the fetch object of its vertex shader did not exist yet, and the tag is written. The game's
+/// draw function runs now (it creates the object and writes its packets after the tag); the record is built again from the state the
+/// draw started with, with the object in place, and the tag is patched to point at it. When the record is executed the packets the
+/// game wrote after the tag become one no-op. Returns the value of the skipped call, or 0 when nothing was done (the hook then runs the
+/// game's function as usual).
+u64 RebuildAfterGame(u64 ctx, u64 tag_address, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u32 kind, u64 caller) {
+    constexpr u32 SnapshotBytes = 0x13200;
+    constexpr u32 TagDwords = 2 + VideoCore::NativeTagPayloadDwords - 1;
+    const u64 original = Core::GuestHooks::OriginalEntry(kind == 0 ? "DrawIndexedCommon" : "DrawAuto");
+    if (original == 0) {
+        return 0;
+    }
+    static thread_local std::vector<u8> snapshot;
+    snapshot.resize(SnapshotBytes);
+    if (!Guarded([&] {
+            std::memcpy(snapshot.data(), reinterpret_cast<const void*>(ctx), SnapshotBytes);
+            return 1u;
+        })) {
+        return 0;
+    }
+    const u64 snapshot_ctx = reinterpret_cast<u64>(snapshot.data());
+    const u64 writer = ctx + 0x47c0;
+    const u64 base_before = Rd<u64>(writer, 0x0);
+    const u64 value = 0x8000000000000000ull | (reinterpret_cast<GuestDraw6>(original)(ctx, a1, a2, a3, a4, a5) & 0x7fffffffffffffffull);
+    auto& live = Live();
+    live.fetch_rebuild_tried.fetch_add(1, std::memory_order_relaxed);
+    const u64 span_begin = tag_address + TagDwords * sizeof(u32);
+    const u64 span_end = Rd<u64>(writer, 0x10);
+    if (Rd<u64>(writer, 0x0) != base_before || span_end < span_begin + 2 * sizeof(u32) || span_end > Rd<u64>(writer, 0x8)) {
+        live.fetch_rebuild_refused.fetch_add(1, std::memory_order_relaxed);
+        return value;
+    }
+    const u64 seq = Guarded([&] { return MakeRecord(snapshot_ctx, kind, a1, a2, a3, caller); });
+    if (seq == 0 || Slot(seq).flags != 0) {
+        live.fetch_rebuild_refused.fetch_add(1, std::memory_order_relaxed);
+        return value;
+    }
+    const bool exec = FetchRebuildExecutes() && ExecEligible(snapshot_ctx, seq, caller);
+    u32 words[TagDwords];
+    std::memcpy(words, reinterpret_cast<const void*>(tag_address), sizeof(words));
+    std::memcpy(&words[9], &seq, sizeof(u64));
+    if (exec) {
+        words[2] |= ExecFlag;
+    }
+    std::memcpy(reinterpret_cast<void*>(tag_address), words, sizeof(words));
+    NoteAnchor(tag_address, seq, kind);
+    live.fetch_rebuilt.fetch_add(1, std::memory_order_relaxed);
+    if (exec) {
+        u32 remaining = static_cast<u32>((span_end - span_begin) / sizeof(u32));
+        u64 at = span_begin;
+        while (remaining != 0) {
+            u32 count = std::min<u32>(remaining, 0x4001);
+            if (remaining - count == 1) {
+                --count;
+            }
+            Wr<u32>(at, 0, 0xC0000000u | ((count - 2) << 16) | (0x10u << 8));
+            at += count * sizeof(u32);
+            remaining -= count;
+        }
+        live.fetch_rebuild_exec.fetch_add(1, std::memory_order_relaxed);
+        live.gfx_exec.fetch_add(1, std::memory_order_relaxed);
+        exec_drawn.fetch_add(1, std::memory_order_relaxed);
+    }
+    return value;
+}
+
 /// `inline_draw`: the draw is an inlined copy of a draw function; PrepareDraw is what is hooked. With execution the hook
 /// skips PrepareDraw and makes the caller skip the draw (it does the counters the caller would have done).
-u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inline_draw = false) {
+u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inline_draw = false, u64 a4 = 0, u64 a5 = 0) {
     const auto& policy = VideoCore::ReadbackPolicy::Get();
     if (policy.native_draw_mode.load(std::memory_order_relaxed) == 0 || ctx == 0) {
         return 0;
@@ -3731,6 +3809,15 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
             ExecSideEffects(ctx, kind, a1, a2, a3);
             return 1;
         }
+        if (seq != 0 && kind <= 1 && !inline_draw && FetchRebuildEnabled() &&
+            Slot(seq).flags == (NoFetchObject | SpecialPipeline) && Slot(seq).reason == (ReasonNoFetchObject | ReasonUnsupportedInput)) {
+            const u64 cursor = Rd<u64>(ctx + 0x47c0, 0x10);
+            if (const u64 result = RebuildAfterGame(ctx, cursor - (2 + VideoCore::NativeTagPayloadDwords - 1) * sizeof(u32), a1, a2, a3,
+                                                    a4, a5, kind, ret);
+                result != 0) {
+                return result;
+            }
+        }
     } else {
         tags_failed.fetch_add(1, std::memory_order_relaxed);
     }
@@ -3795,7 +3882,7 @@ u64 PS4_SYSV_ABI RingDiscover(u64 allocator, u64 a1, u64 a2, u64 a3, u64 a4, u64
 }
 
 u64 PS4_SYSV_ABI TagIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0);
+    return Tag(ctx, a1, a2, a3, ret, 0, (a4 & 0xff) != 0, false, a4, a5);
 }
 bool ExecEligibleCompute(u64 ctx, u64 seq, u64 caller) {
     if (Slot(seq).flags != 0 || (Rd<u8>(ctx, 0x13009) & 1) != 0) {
@@ -5177,7 +5264,7 @@ u64 PS4_SYSV_ABI CueFlushHook(u64 cue, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 }
 
 u64 PS4_SYSV_ABI TagAuto(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
-    return Tag(ctx, a1, a2, a3, ret, 1, true);
+    return Tag(ctx, a1, a2, a3, ret, 1, true, false, a4, a5);
 }
 
 u64 PS4_SYSV_ABI ProbeIndexed(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {

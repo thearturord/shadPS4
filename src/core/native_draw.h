@@ -38,6 +38,8 @@ struct LiveCounters {
     std::atomic<u64> asc_exec{}, asc_packet{}, asc_no_record{}, fill_exec{}, mode_switch_exec{}, asc_barrier_exec{}, clear_exec{}, asc_begin_stripped{}, counter_readback{}, async_copy_exec{}, device_begin_stripped{};
     /// synchronization packets taken out of the stream: scratch barrier units (label, end of shader event, wait on the label,
     /// cache acquire), stand-alone cache acquires and no-op events
+    /// draws of a shader without a fetch object yet (`native_sdk_strip` bit 2147483648): the game's draw function ran, the record was built again afterwards
+    std::atomic<u64> fetch_rebuild_tried{}, fetch_rebuilt{}, fetch_rebuild_refused{}, fetch_rebuild_exec{};
     std::atomic<u64> sync_units_stripped{}, sync_acquires_stripped{}, sync_events_stripped{}, barrier_calls_skipped{};
     /// direct submission, step 1 (shadow index, `native_sdk_strip` bit 1048576): tags registered at their address, command
     /// buffer spans walked, spans without any packet besides entries ("pure") and with some ("mixed"), tags the walk found that

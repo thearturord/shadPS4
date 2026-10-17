@@ -336,7 +336,8 @@ std::unique_ptr<DrawPlan> Rasterizer::PlanDraw(const AmdGpu::DrawRegs& regs,
             live.fixed_checked.fetch_add(1, std::memory_order_relaxed);
             const std::string diff = DiffFixedState(*use, plan->fixed);
             if (!diff.empty() && live.fixed_diff.fetch_add(1, std::memory_order_relaxed) < 60) {
-                LOG_INFO(Render_Vulkan, "native fixed-function state differs from the registers in: {}", diff);
+                LOG_INFO(Render_Vulkan, "native fixed-function state differs from the registers in: {} (caller {:#x}, draw number {}, objects depth_clip {}, registers {} clipper {:#x})", diff, Core::NativeAudit::PlanCaller(),
+                         live.fixed_checked.load(std::memory_order_relaxed), use->depth_clip, plan->fixed.depth_clip, std::bit_cast<u32>(regs.clipper_control));
             }
         } else {
             plan->fixed = merged;

@@ -45,6 +45,7 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+union PM4Header;
 struct PM4CmdWaitRegMem;
 struct PM4CmdEventWriteEop;
 struct PM4DmaData;
@@ -237,6 +238,9 @@ private:
     Task DirectWait(const PM4CmdWaitRegMem& wait);
     void StartNativeTag(const u32* tag);
     void ExecuteDma(const PM4DmaData& dma);
+    void ExecuteSetShReg(const PM4Header* header);
+    void ExecuteDispatchDirect(const PM4Header* header, u64 base_addr);
+    void ExecuteWriteData(const PM4Header* header);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});

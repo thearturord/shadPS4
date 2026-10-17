@@ -73,6 +73,7 @@ struct State {
     std::atomic<s32> fence_shortcut_override{-1}; ///< readback_fence_wait_shortcut 0..3
     std::atomic<s32> stream_reuse_override{-1};   ///< readback_stream_reuse_enabled 0/1
     std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
+    std::atomic<s32> register_packets{1};         ///< SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA of the graphics queue are entries of a direct buffer (0: they make it mixed)
     std::atomic<s32> stage_reuse_override{-1};    ///< stage_lookup_reuse 0..2
 };
 

@@ -35,6 +35,12 @@ public:
     bool complete{true}; ///< the list holds every entry (false: the build gave up: constant engine buffer, bad packet, indirect buffer it cannot follow)
     u32 depth{}; ///< ProcessGraphics frames running over this buffer (the top one and the indirect buffers it calls)
     std::vector<Entry> entries;
+    std::vector<u32> pool; ///< the dwords of Packet entries longer than `Entry::words` (the entry's `seq` is the offset)
+
+    /// The dwords of a Packet entry.
+    const u32* PacketWords(const Entry& entry) const {
+        return entry.dwords > entry.words.size() ? pool.data() + entry.seq : entry.words.data();
+    }
     std::array<u32, 256> other{}; ///< packets by opcode that are not entries (index 0: a tag whose game packets follow, 1: a debug marker)
 
     /// The walk is at the type 3 packet `packet`.

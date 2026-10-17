@@ -773,7 +773,7 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
     using Core::NativeDirect::EntryKind;
     for (const auto& entry : direct->entries) {
         ProcessCommands();
-        entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
+        entry_dump.Packet(direct->PacketWords(entry), entry.address, entry.dwords != 0);
         switch (entry.kind) {
         case EntryKind::Tag:
             StartAscTag(entry.words.data(), reinterpret_cast<const void*>(entry.address), vqid);
@@ -2052,6 +2052,53 @@ Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
     FIBER_EXIT;
 }
 
+/// The graphics queue's SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA: the walk's cases, also run for the entries of a direct buffer.
+void Liverpool::ExecuteSetShReg(const PM4Header* header) {
+    const u32 count = header->type3.NumWords();
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (count - 1) * sizeof(u32);
+
+    if (set_data->reg_offset >= 0x200 && set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
+        ASSERT(set_size <= sizeof(ComputeProgram));
+        auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) + (set_data->reg_offset - 0x200);
+        std::memcpy(addr, header + 2, set_size);
+    } else {
+        std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset], header + 2, set_size);
+        MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset, set_size / sizeof(u32));
+    }
+}
+
+void Liverpool::ExecuteDispatchDirect(const PM4Header* header, u64 base_addr) {
+    const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+    auto& cs_program = GetCsRegs();
+    cs_program.dim_x = dispatch_direct->dim_x;
+    cs_program.dim_y = dispatch_direct->dim_y;
+    cs_program.dim_z = dispatch_direct->dim_z;
+    cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
+    if (DebugState.DumpingCurrentReg()) {
+        DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header), cs_program);
+    }
+    if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
+        return;
+    }
+    RasterCall call{};
+    call.kind = RasterCall::Kind::DispatchDirect;
+    call.marker = "gfx:{}:DispatchDirect";
+    call.cmd_address = header;
+    RasterDispatch(call);
+}
+
+void Liverpool::ExecuteWriteData(const PM4Header* header) {
+    const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+    ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
+    const u32 data_size = (header->type3.count.Value() - 2) * 4;
+    u64* address = write_data->Address<u64*>();
+    if (write_data->wr_one_addr.Value()) {
+        UNREACHABLE();
+    }
+    CpWriteData(address, write_data->data, data_size, GfxQueueId);
+}
+
 /// A pure graphics command buffer: the entries copied at submit (Core::NativeDirect::Build), executed in order. No packet is decoded;
 /// every entry runs the function the walk runs for its packet.
 Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct) {
@@ -2069,9 +2116,19 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         case EntryKind::Flip:
             RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
             break;
-        case EntryKind::Packet:
-            ExecuteDma(*reinterpret_cast<const PM4DmaData*>(entry.words.data()));
+        case EntryKind::Packet: {
+            const auto* packet = reinterpret_cast<const PM4Header*>(direct->PacketWords(entry));
+            if (entry.opcode == 0x76) {
+                ExecuteSetShReg(packet);
+            } else if (entry.opcode == 0x15) {
+                ExecuteDispatchDirect(packet, direct->begin);
+            } else if (entry.opcode == 0x37) {
+                ExecuteWriteData(packet);
+            } else {
+                ExecuteDma(*reinterpret_cast<const PM4DmaData*>(packet));
+            }
             break;
+        }
         case EntryKind::StateBuffer: {
             u64 pointer;
             std::memcpy(&pointer, &entry.seq, sizeof(pointer));
@@ -2334,21 +2391,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetShReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto set_size = (count - 1) * sizeof(u32);
-
-                if (set_data->reg_offset >= 0x200 &&
-                    set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4)) {
-                    ASSERT(set_size <= sizeof(ComputeProgram));
-                    auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
-                                 (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
-                } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
-                    MirrorRegs(Regs::ShRegWordOffset + set_data->reg_offset,
-                               set_size / sizeof(u32));
-                }
+                ExecuteSetShReg(header);
                 break;
             }
             case PM4ItOpcode::SetUconfigReg: {
@@ -2596,24 +2639,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DispatchDirect: {
-                const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
-                auto& cs_program = GetCsRegs();
-                cs_program.dim_x = dispatch_direct->dim_x;
-                cs_program.dim_y = dispatch_direct->dim_y;
-                cs_program.dim_z = dispatch_direct->dim_z;
-                cs_program.dispatch_initiator = dispatch_direct->dispatch_initiator;
-                if (DebugState.DumpingCurrentReg()) {
-                    DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
-                                                   cs_program);
-                }
-                if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
-                    break;
-                }
-                RasterCall call{};
-                call.kind = RasterCall::Kind::DispatchDirect;
-                call.marker = "gfx:{}:DispatchDirect";
-                call.cmd_address = header;
-                RasterDispatch(call);
+                ExecuteDispatchDirect(header, base_addr);
                 break;
             }
             case PM4ItOpcode::DispatchIndirect: {
@@ -2744,14 +2770,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WriteData: {
-                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-                ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-                const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                u64* address = write_data->Address<u64*>();
-                if (write_data->wr_one_addr.Value()) {
-                    UNREACHABLE();
-                }
-                CpWriteData(address, write_data->data, data_size, GfxQueueId);
+                ExecuteWriteData(header);
                 break;
             }
             case PM4ItOpcode::CopyData: {

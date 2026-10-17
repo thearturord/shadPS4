@@ -89,6 +89,8 @@ bool Set(std::string_view name, s64 value) {
         s.rt_reuse_override = static_cast<s32>(value);
     } else if (name == "stage_reuse") {
         s.stage_reuse_override = static_cast<s32>(value);
+    } else if (name == "register_packets") {
+        s.register_packets = static_cast<s32>(value);
     } else {
         return false;
     }
@@ -128,6 +130,7 @@ nlohmann::json Dump() {
             {"stream_reuse", s.stream_reuse_override.load()},
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
+            {"register_packets", s.register_packets.load()},
             {"note", "fence kinds: 1 gfx EOP, 2 gfx EOS, 4 compute release, 8 held write, "
                      "16 submit end"}};
 }

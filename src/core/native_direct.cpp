@@ -35,6 +35,10 @@ constexpr u32 OtherIndirect = 3;     ///< an indirect buffer that cannot be foll
 constexpr u32 OtherConstantBuffer = 4; ///< the submission has a constant engine buffer
 constexpr u32 BuildOnlyLimit = 5;    ///< indices below this (and above 1) are only found by the build
 
+bool RegisterPacketsOn() {
+    return VideoCore::ReadbackPolicy::Get().register_packets.load(std::memory_order_relaxed) != 0;
+}
+
 Classified Classify(const u32* packet, bool markers, u32 queue) {
     const u32 header = packet[0];
     const u32 count = (header >> 16) & 0x3fff;
@@ -45,6 +49,16 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
     }
     if (opcode == 0x50 && queue == 0 && dwords == 7) {
         return {Class::Packet, opcode, dwords}; // a CP DMA of the graphics queue: self-contained, no register state
+    }
+    if (queue == 0 && RegisterPacketsOn()) {
+        // SET_SH_REG and DISPATCH_DIRECT (the game's own compute helpers, such as the texture map) and a CPU style write to memory: the
+        // walk's cases, run from the list
+        if (opcode == 0x76 || (opcode == 0x15 && dwords == 5)) {
+            return {Class::Packet, opcode, dwords};
+        }
+        if (opcode == 0x37 && dwords >= 4 && (packet[1] & 0x10000) == 0 && (((packet[1] >> 8) & 0xf) == 2 || ((packet[1] >> 8) & 0xf) == 5)) {
+            return {Class::Packet, opcode, dwords};
+        }
     }
     if (opcode != 0x10) {
         return {Class::Other, opcode, dwords};
@@ -101,10 +115,16 @@ void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64
     Entry entry;
     entry.kind = kind;
     entry.opcode = opcode;
-    entry.dwords = std::min<u32>(dwords, entry.words.size());
     entry.address = address;
-    for (u32 i = 0; i < entry.dwords; ++i) {
-        entry.words[i] = packet[i];
+    if (kind == EntryKind::Packet && dwords > entry.words.size()) {
+        entry.dwords = dwords;
+        entry.seq = buffer.pool.size();
+        buffer.pool.insert(buffer.pool.end(), packet, packet + dwords);
+    } else {
+        entry.dwords = std::min<u32>(dwords, entry.words.size());
+        for (u32 i = 0; i < entry.dwords; ++i) {
+            entry.words[i] = packet[i];
+        }
     }
     if (kind == EntryKind::Tag) {
         entry.seq = packet[9] | static_cast<u64>(packet[10]) << 32;

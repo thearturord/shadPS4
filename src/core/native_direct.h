@@ -14,11 +14,11 @@
 // builds the list and compares it with what the packet walk finds; nothing executes from it yet.
 namespace Core::NativeDirect {
 
-enum class EntryKind : u8 { Tag, Sync, Flip, StateBuffer };
+enum class EntryKind : u8 { Tag, Sync, Flip, StateBuffer, Packet };
 
 struct Entry {
     EntryKind kind{};
-    u32 opcode{};  ///< Sync: the packet the tag stands for (0x47, 0x49, 0x3c, 0x37)
+    u32 opcode{};  ///< Sync: the packet the tag stands for (0x47, 0x49, 0x3c, 0x37); Packet: its opcode
     u32 dwords{};  ///< dwords copied into `words`
     u64 address{}; ///< where it sits in the game's buffer (StateBuffer: the buffer)
     u64 seq{};     ///< Tag: the record

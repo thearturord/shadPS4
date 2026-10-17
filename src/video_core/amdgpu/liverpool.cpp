@@ -777,6 +777,7 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
             break;
         case EntryKind::Flip:
         case EntryKind::StateBuffer:
+        case EntryKind::Packet:
             break;
         case EntryKind::Sync: {
             std::array<u32, 8> restored;
@@ -802,6 +803,36 @@ Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::
     *queue.read_addr += direct->dwords;
     *queue.read_addr %= queue.ring_size_dw;
     FIBER_EXIT;
+}
+
+void Liverpool::ExecuteDma(const PM4DmaData& dma_packet) {
+    const auto* dma_data = &dma_packet;
+    if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
+        return;
+    }
+    ASSERT(dma_data->command.das == 0);
+    RasterRun(
+        [this, dma = *dma_data] {
+            const auto* dma_data = &dma;
+            if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+                rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data, true);
+            } else if ((dma_data->src_sel == DmaDataSrc::Memory || dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                       dma_data->dst_sel == DmaDataDst::Gds) {
+                rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(), true, false);
+            } else if (dma_data->src_sel == DmaDataSrc::Data &&
+                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), dma_data->data, false);
+            } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo, dma_data->NumBytes(), false, true);
+            } else if ((dma_data->src_sel == DmaDataSrc::Memory || dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+                       (dma_data->dst_sel == DmaDataDst::Memory || dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+                rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(), false, false);
+            } else {
+                UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel), u32(dma_data->dst_sel));
+            }
+        },
+        false, true);
 }
 
 void Liverpool::StartNativeTag(const u32* tag) {
@@ -2032,6 +2063,9 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
         case EntryKind::Flip:
             RasterRun([] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); });
             break;
+        case EntryKind::Packet:
+            ExecuteDma(*reinterpret_cast<const PM4DmaData*>(entry.words.data()));
+            break;
         case EntryKind::StateBuffer: {
             u64 pointer;
             std::memcpy(&pointer, &entry.seq, sizeof(pointer));
@@ -2700,45 +2734,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::DmaData: {
-                const auto* dma_data = reinterpret_cast<const PM4DmaData*>(header);
-                if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
-                    break;
-                }
-                ASSERT(dma_data->command.das == 0);
-                RasterRun([this, dma = *dma_data] {
-                    const auto* dma_data = &dma;
-                    if (dma_data->src_sel == DmaDataSrc::Data &&
-                        dma_data->dst_sel == DmaDataDst::Gds) {
-                        rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                               dma_data->data, true);
-                    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                               dma_data->dst_sel == DmaDataDst::Gds) {
-                        rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                               dma_data->NumBytes(), true, false);
-                    } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                               (dma_data->dst_sel == DmaDataDst::Memory ||
-                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                        rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                               dma_data->data, false);
-                    } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                               (dma_data->dst_sel == DmaDataDst::Memory ||
-                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                               dma_data->src_addr_lo, dma_data->NumBytes(), false,
-                                               true);
-                    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                               (dma_data->dst_sel == DmaDataDst::Memory ||
-                                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                        rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                               dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                               false, false);
-                    } else {
-                        UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}",
-                                        u32(dma_data->src_sel), u32(dma_data->dst_sel));
-                    }
-                }, false, true);
+                ExecuteDma(*reinterpret_cast<const PM4DmaData*>(header));
                 break;
             }
             case PM4ItOpcode::WriteData: {

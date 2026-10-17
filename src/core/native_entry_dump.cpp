@@ -97,6 +97,11 @@ std::string DescribePacket(const PM4Header* header, PM4ItOpcode opcode, u32 dwor
         const auto* indirect = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
         return fmt::format("INDIRECT address={:#x} dwords={}", reinterpret_cast<u64>(indirect->Address<u8>()), indirect->ib_size.Value());
     }
+    case PM4ItOpcode::DmaData: {
+        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
+        return fmt::format("DMA src_sel={} dst_sel={} src={:#x} dst={:#x} bytes={}", static_cast<u32>(dma->src_sel), static_cast<u32>(dma->dst_sel),
+                           dma->SrcAddress<u64>(), dma->DstAddress<u64>(), dma->NumBytes());
+    }
     default:
         return fmt::format("PACKET opcode={:#x} dwords={}", static_cast<u32>(opcode), dwords);
     }

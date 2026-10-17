@@ -46,6 +46,7 @@ namespace AmdGpu {
 
 struct PM4CmdWaitRegMem;
 struct PM4CmdEventWriteEop;
+struct PM4DmaData;
 struct PM4CmdReleaseMem;
 
 struct Liverpool {
@@ -234,6 +235,7 @@ private:
     Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct);
     Task DirectWait(const PM4CmdWaitRegMem& wait);
     void StartNativeTag(const u32* tag);
+    void ExecuteDma(const PM4DmaData& dma);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});

@@ -20,7 +20,7 @@ namespace {
 
 using AmdGpu::PM4CmdNop;
 
-enum class Class : u8 { Inert, Tag, Sync, Flip, Indirect, Other };
+enum class Class : u8 { Inert, Tag, Sync, Flip, Indirect, Packet, Other };
 
 struct Classified {
     Class cls;
@@ -42,6 +42,9 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
     const u32 dwords = count + 2;
     if (opcode == 0x3f) {
         return {Class::Indirect, opcode, dwords};
+    }
+    if (opcode == 0x50 && queue == 0 && dwords == 7) {
+        return {Class::Packet, opcode, dwords}; // a CP DMA of the graphics queue: self-contained, no register state
     }
     if (opcode != 0x10) {
         return {Class::Other, opcode, dwords};
@@ -145,6 +148,9 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
             break;
         case Class::Flip:
             AddEntry(buffer, EntryKind::Flip, at, packet.dwords, address, 0);
+            break;
+        case Class::Packet:
+            AddEntry(buffer, EntryKind::Packet, at, packet.dwords, address, packet.opcode);
             break;
         case Class::Other:
             ++buffer.other[packet.opcode & 255];
@@ -306,6 +312,9 @@ void Buffer::Walk(const u32* packet) {
         break;
     case Class::Flip:
         Expect(EntryKind::Flip, address, 0, 0);
+        break;
+    case Class::Packet:
+        Expect(EntryKind::Packet, address, found.opcode, 0);
         break;
     case Class::Other:
         ++walk_other[found.opcode & 255];

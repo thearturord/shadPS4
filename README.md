@@ -32,6 +32,24 @@ SPDX-License-Identifier: GPL-2.0-or-later
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
 | ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
 
+# About this fork
+
+This is an experimental fork of shadPS4 (based on 0.20) that works on one thing: rendering **The Last Guardian** (CUSA03627) from the game's own engine objects, instead of emulating the PS4 GPU command layer.
+
+The stock emulator receives the game's GPU commands as PM4 packets, keeps a copy of the GPU register file and tracks guest memory pages to find out what the GPU should see. This fork takes the game's draw, dispatch, copy, clear and synchronization calls from its engine and executes them directly as native records:
+
+- **Draws and compute** are built from the engine's state objects (blend, rasterizer, depth/stencil, render targets, shader user data) and executed from records. No PM4 packet is parsed for them in steady state.
+- **Synchronization** (fences, labels, waits, flips) are tags in the command buffers, rebuilt and executed by the command processor, and command buffers are submitted to the GPU threads as an entry list instead of being walked packet by packet.
+- **Fixed-function state** of a draw comes only from the engine's objects, not from the register file.
+- **Readbacks** the game really uses (its staging resources) are explicit, ordered downloads; engine buffers that never change stay resident on the GPU.
+- Anything the native path cannot build safely falls back to the normal packet path.
+
+Left as in upstream: the GCN shader translation, the Vulkan backend and the CPU side of the emulation (kernel, threads, audio, input).
+
+The fork also has a debug server (`debug_server_port` in the game's config; JSON endpoints such as `/status`, `/native`, `/profile`) with live counters, a stack sampler and audits that check the native path against the emulated one. The native paths are switched with the `native_*` settings in the per-game configuration.
+
+Status: work in progress and specific to one game, so it is not meant for upstream and not supported by the shadPS4 team. It is only tested on Windows with an NVIDIA GPU. The upstream README follows unchanged.
+
 # General information
 
 **shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.

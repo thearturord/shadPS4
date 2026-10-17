@@ -59,13 +59,13 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
     }
     std::array<u32, 8> restored;
     if (const u32 sync = Core::NativeDraw::RestoreSyncTag(packet, restored, false)) {
-        if (queue == 0 && sync == 0x49) {
-            return {Class::Other, sync, dwords}; // a release memory write belongs to the async queues
+        if ((queue == 0 && sync == 0x49) || (queue != 0 && sync == 0x47)) {
+            return {Class::Other, sync, dwords}; // release memory belongs to the async queues, end-of-pipe to the graphics queue
         }
         return {Class::Sync, sync, dwords};
     }
     if (magic == PM4CmdNop::PayloadType::PatchedFlip) {
-        return {Class::Flip, 0, dwords};
+        return {queue == 0 ? Class::Flip : Class::Inert, 0, dwords};
     }
     if (markers && (magic == PM4CmdNop::PayloadType::DebugMarkerPush || magic == PM4CmdNop::PayloadType::DebugColorMarkerPush ||
                     magic == PM4CmdNop::PayloadType::DebugMarkerPop)) {
@@ -109,7 +109,9 @@ void AddEntry(Buffer& buffer, EntryKind kind, const u32* packet, u32 dwords, u64
     buffer.entries.push_back(entry);
 }
 
-void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool markers, bool templates) {
+u32 carry_dwords[64]; ///< per async queue: dwords of a packet that began at the end of the previous window
+
+void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool markers, bool templates, u32* carry_out = nullptr) {
     const u32 queue = buffer.queue;
     const u32* at = begin;
     const u32* const end = begin + dwords;
@@ -126,6 +128,9 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
         const Classified packet = Classify(at, markers, queue);
         if (at + packet.dwords > end) {
             ++buffer.other[OtherBadPacket];
+            if (carry_out != nullptr) {
+                *carry_out = static_cast<u32>(at + packet.dwords - end);
+            }
             return;
         }
         const u64 address = reinterpret_cast<u64>(at);
@@ -182,6 +187,9 @@ bool Enabled() {
 
 std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_constant_buffer, bool markers) {
     if (!Enabled() || dcb == nullptr || dwords == 0) {
+        if (queue != 0 && dwords != 0) {
+            carry_dwords[(queue - 1) & 63] = 0;
+        }
         return nullptr;
     }
     auto buffer = std::make_shared<Buffer>();
@@ -198,6 +206,21 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
         entry.address = reinterpret_cast<u64>(dcb);
         entry.seq = reinterpret_cast<u64>(state);
         buffer->entries.push_back(entry);
+    } else if (queue != 0) {
+        // an async window: the ring may split a packet between two windows (the walk keeps the first part); such windows stay on the walk
+        u32& carry = carry_dwords[(queue - 1) & 63];
+        const u32 skip = carry;
+        carry = 0;
+        if (skip >= dwords) {
+            carry = skip - dwords;
+            ++buffer->other[OtherBadPacket];
+        } else {
+            buffer->entries.reserve(dwords / 8);
+            AddSpan(*buffer, dcb + skip, dwords - skip, 0, markers, false, &carry);
+            if (skip != 0) {
+                ++buffer->other[OtherBadPacket];
+            }
+        }
     } else {
         buffer->entries.reserve(dwords / 8);
         AddSpan(*buffer, dcb, dwords, 0, markers, templates);

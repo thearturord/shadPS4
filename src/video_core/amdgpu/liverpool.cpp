@@ -685,6 +685,125 @@ void Liverpool::SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop) {
                               GfxQueueId, VideoCore::FenceGfxEop);
 }
 
+void Liverpool::StartAscTag(const u32* tag, const void* address, u32 vqid) {
+    native_tag_pending.valid = true;
+    native_tag_pending.meta = tag[2];
+    std::memcpy(&native_tag_pending.k1, &tag[3], sizeof(u64));
+    std::memcpy(&native_tag_pending.k2, &tag[5], sizeof(u64));
+    std::memcpy(&native_tag_pending.k3, &tag[7], sizeof(u64));
+    std::memcpy(&native_tag_pending.seq, &tag[9], sizeof(u64));
+    if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
+        ExecuteNativeDraw(address, vqid);
+    }
+}
+
+void Liverpool::SignalComputeRelease(const PM4CmdReleaseMem& release_mem, u32 vqid, u32 pipe_id) {
+    // The packet is copied: the signal may run after the command buffer is reused.
+    auto signal = [this, release = release_mem, pipe_id] {
+        const auto irq = [pipe_id] { Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id)); };
+        const auto gds_to_mem = [this](VAddr dst, u16 gds_index, u16 num_dwords) {
+            rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+        };
+        RunFenceSignal(
+            *this, gpu_id,
+            [&] {
+                bool backed = true;
+                release.SignalFence(
+                    [&](void* address, u64 data, u32 num_bytes) { backed &= TryWriteFenceOffThread(rasterizer, address, data, num_bytes); },
+                    [] {}, [](VAddr, u16, u16) {});
+                if (backed) {
+                    release.SignalFence(NoFenceWrite, irq, [](VAddr, u16, u16) {});
+                }
+                return backed;
+            },
+            [release, irq, gds_to_mem] { release.SignalFence(WriteFenceMemory, irq, gds_to_mem); });
+    };
+    // Copying from GDS records GPU work, which must happen on the raster thread.
+    const auto release_data_sel = release_mem.data_sel.Value();
+    const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32) : release_data_sel == DataSelect::Data64 ? sizeof(u64) : 0;
+    SignalFenceAfterReadbacks(std::move(signal), release_data_sel == DataSelect::GdsMemStore, release_mem.Address<VAddr>(), release_mem.DataQWord(),
+                              release_bytes, vqid + 1, VideoCore::FenceComputeRelease);
+}
+
+/// The async queue's wait on a memory label (the walk's WaitRegMem case for a tag).
+Liverpool::Task Liverpool::DirectWaitAsc(const PM4CmdWaitRegMem& wait_packet, u32 vqid) {
+    FIBER_ENTER(acb_task_name[vqid]);
+    const PM4CmdWaitRegMem* wait_reg_mem = &wait_packet;
+    ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+    if (!wait_reg_mem->Test(regs.reg_array)) {
+        using VideoCore::ReadbackStats::WaitClass;
+        const u64 wait_start = VideoCore::ReadbackStats::NowNs();
+        bool reported = false;
+        bool blocked = false;
+        bool held_back = false;
+        WaitClass wait_class{};
+        while (true) {
+            const FenceMatch match = MatchRecordedFence(*wait_reg_mem);
+            if (match.satisfied && FenceShortcutEnabled(true)) {
+                OnWaitPassedOnFence(*wait_reg_mem, match, vqid + 1);
+                wait_class = blocked ? WaitClass::Producer : WaitClass::FencePass;
+                break;
+            }
+            held_back |= match.satisfied;
+            if (wait_reg_mem->Test(regs.reg_array)) {
+                wait_class = held_back ? WaitClass::FenceBlocked : WaitClass::Memory;
+                break;
+            }
+            blocked = true;
+            ReportLongWait(*wait_reg_mem, "compute", wait_start, reported);
+            VideoCore::ReadbackStats::CpWaitYield(false);
+            YIELD_ASC(vqid);
+        }
+        if (VideoCore::ReadbackStats::IsEnabled()) {
+            VideoCore::ReadbackStats::OnCommandWait(true, wait_reg_mem->Address<VAddr>(), wait_class,
+                                                    blocked ? VideoCore::ReadbackStats::NowNs() - wait_start : 0);
+        }
+    }
+    FIBER_EXIT;
+}
+
+/// A pure window of an async compute queue: the entries copied at submit, executed in order (see ProcessDirect).
+Liverpool::Task Liverpool::ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid) {
+    FIBER_ENTER(acb_task_name[vqid]);
+    auto& queue = asc_queues[{vqid}];
+    Core::EntryDump::Span entry_dump{vqid + 1, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
+    using Core::NativeDirect::EntryKind;
+    for (const auto& entry : direct->entries) {
+        ProcessCommands();
+        entry_dump.Packet(entry.words.data(), entry.address, entry.dwords != 0);
+        switch (entry.kind) {
+        case EntryKind::Tag:
+            StartAscTag(entry.words.data(), reinterpret_cast<const void*>(entry.address), vqid);
+            break;
+        case EntryKind::Flip:
+        case EntryKind::StateBuffer:
+            break;
+        case EntryKind::Sync: {
+            std::array<u32, 8> restored;
+            const u32 opcode = Core::NativeDraw::RestoreSyncTag(entry.words.data(), restored);
+            if (opcode == 0x49) {
+                SignalComputeRelease(*reinterpret_cast<const PM4CmdReleaseMem*>(restored.data()), vqid, queue.pipe_id);
+            } else if (opcode == 0x37) {
+                const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(restored.data());
+                CpWriteData(write_data->Address<void*>(), write_data->data, (write_data->header.count.Value() - 2) * 4, vqid + 1);
+            } else if (opcode == 0x3c) {
+                auto task = DirectWaitAsc(*reinterpret_cast<const PM4CmdWaitRegMem*>(restored.data()), vqid);
+                RESUME_ASC(task, vqid);
+                while (!task.handle.done()) {
+                    YIELD_ASC(vqid);
+                    RESUME_ASC(task, vqid);
+                }
+                task.handle.destroy();
+            }
+            break;
+        }
+        }
+    }
+    *queue.read_addr += direct->dwords;
+    *queue.read_addr %= queue.ring_size_dw;
+    FIBER_EXIT;
+}
+
 void Liverpool::StartNativeTag(const u32* tag) {
     native_tag_pending.valid = true;
     native_tag_pending.meta = tag[2];
@@ -2826,9 +2945,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 }
 
 template <bool is_indirect>
-Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
+    if (direct) {
+        ++direct->depth;
+    }
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -2887,6 +3009,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         VideoCore::ReadbackStats::CpPacket(vqid + 1, static_cast<u32>(opcode));
         CountComputeQueueCommand(header, opcode);
         entry_dump.Packet(header);
+        if (direct) {
+            direct->Walk(reinterpret_cast<const u32*>(header));
+        }
         if (shadow.Active()) {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
             if (opcode != PM4ItOpcode::Nop) {
@@ -2913,15 +3038,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
             if (nop->header.count.Value() != 0 && nop->data_block[0] == PM4CmdNop::PayloadType::NativeDrawTag &&
                 nop->header.count.Value() + 1 >= VideoCore::NativeTagPayloadDwords) {
-                native_tag_pending.valid = true;
-                native_tag_pending.meta = nop->data_block[1];
-                std::memcpy(&native_tag_pending.k1, &nop->data_block[2], sizeof(u64));
-                std::memcpy(&native_tag_pending.k2, &nop->data_block[4], sizeof(u64));
-                std::memcpy(&native_tag_pending.k3, &nop->data_block[6], sizeof(u64));
-                std::memcpy(&native_tag_pending.seq, &nop->data_block[8], sizeof(u64));
-                if ((native_tag_pending.meta & VideoCore::NativeTagExecFlag) != 0) {
-                    ExecuteNativeDraw(header, vqid);
-                }
+                StartAscTag(reinterpret_cast<const u32*>(header), header, vqid);
             }
             break;
         }
@@ -2929,7 +3046,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             shadow.Indirect(reinterpret_cast<u64>(indirect_buffer->Address<const u32>()), indirect_buffer->ib_size);
             auto task = ProcessCompute<true>(
-                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid, direct);
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -3155,43 +3272,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
-            const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
-            // The packet is copied: the signal may run after the command buffer is reused.
-            auto signal = [this, release = *release_mem, pipe_id = queue.pipe_id] {
-                const auto irq = [pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                };
-                const auto gds_to_mem = [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                };
-                RunFenceSignal(
-                    *this, gpu_id,
-                    [&] {
-                        bool backed = true;
-                        release.SignalFence(
-                            [&](void* address, u64 data, u32 num_bytes) {
-                                backed &=
-                                    TryWriteFenceOffThread(rasterizer, address, data, num_bytes);
-                            },
-                            [] {}, [](VAddr, u16, u16) {});
-                        if (backed) {
-                            release.SignalFence(NoFenceWrite, irq, [](VAddr, u16, u16) {});
-                        }
-                        return backed;
-                    },
-                    [release, irq, gds_to_mem] {
-                        release.SignalFence(WriteFenceMemory, irq, gds_to_mem);
-                    });
-            };
-            // Copying from GDS records GPU work, which must happen on the raster thread.
-            const auto release_data_sel = release_mem->data_sel.Value();
-            const u32 release_bytes = release_data_sel == DataSelect::Data32Low ? sizeof(u32)
-                                      : release_data_sel == DataSelect::Data64  ? sizeof(u64)
-                                                                                : 0;
-            SignalFenceAfterReadbacks(std::move(signal),
-                                      release_data_sel == DataSelect::GdsMemStore,
-                                      release_mem->Address<VAddr>(), release_mem->DataQWord(),
-                                      release_bytes, vqid + 1, VideoCore::FenceComputeRelease);
+            SignalComputeRelease(*reinterpret_cast<const PM4CmdReleaseMem*>(header), vqid, queue.pipe_id);
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -3209,6 +3290,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             *queue.read_addr += next_dw_off;
             *queue.read_addr %= queue.ring_size_dw;
         }
+    }
+
+    if (direct && --direct->depth == 0) {
+        direct->Finish();
     }
 
     FIBER_EXIT;
@@ -3273,7 +3358,10 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
-    const auto& task = ProcessCompute(acb, vqid);
+    auto direct = Core::NativeDirect::Build(gnm_vqid, acb.data(), static_cast<u32>(acb.size()), false, guest_markers_enabled);
+    const bool run_direct = direct && direct->pure && Core::NativeDirect::ExecuteEnabled();
+    const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
+    Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);

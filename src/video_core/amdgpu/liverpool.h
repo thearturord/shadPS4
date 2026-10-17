@@ -46,6 +46,7 @@ namespace AmdGpu {
 
 struct PM4CmdWaitRegMem;
 struct PM4CmdEventWriteEop;
+struct PM4CmdReleaseMem;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -235,7 +236,11 @@ private:
     void StartNativeTag(const u32* tag);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
-    Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+    Task ProcessCompute(std::span<const u32> acb, u32 vqid, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
+    Task ProcessDirectAsc(std::shared_ptr<Core::NativeDirect::Buffer> direct, u32 vqid);
+    Task DirectWaitAsc(const PM4CmdWaitRegMem& wait, u32 vqid);
+    void StartAscTag(const u32* tag, const void* address, u32 vqid);
+    void SignalComputeRelease(const PM4CmdReleaseMem& release, u32 vqid, u32 pipe_id);
 
     void ProcessCommands();
     void Process(std::stop_token stoken);

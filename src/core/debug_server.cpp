@@ -144,6 +144,7 @@ nlohmann::json Native(const Params&) {
     j["direct_purity_mismatch"] = live.direct_purity_mismatch.load();
     j["direct_incomplete"] = live.direct_incomplete.load();
     j["direct_executed"] = live.direct_executed.load();
+    j["direct_executed_asc"] = live.direct_executed_asc.load();
     j["shadow_anchors"] = live.shadow_anchors.load();
     j["shadow_spans"] = live.shadow_spans.load();
     j["shadow_pure"] = live.shadow_pure.load();

@@ -21,6 +21,7 @@
 #include "core/memory.h"
 #include "core/native_draw.h"
 #include "core/native_entry_dump.h"
+#include "core/native_readbacks.h"
 #include "video_core/readback_policy.h"
 #include "video_core/thread_profiler.h"
 #include "video_core/thread_usage.h"
@@ -391,6 +392,8 @@ void RegisterBuiltins() {
     Register("/", "list of endpoints", Index);
     Register("/status", "uptime, presented frames, fps", Status);
     Register("/native", "native renderer counters (cumulative)", Native);
+    Register("/readbacks", "explicit readbacks, step 1: destinations of the engine's copy / counter read-back records, AsyncMap ranges, CPU read faults",
+             [](const Params&) { return Core::NativeReadbacks::Report(); });
     Register("/entrydump",
              "?frames=1: dump the next frames of the command stream as entries to log/entry_dump.txt (without frames: the state of the last request)",
              EntryDumpEndpoint);

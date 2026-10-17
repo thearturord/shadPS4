@@ -674,6 +674,11 @@ void NoteImmutableSync() {
     immutable_syncs.fetch_add(1, std::memory_order_relaxed);
 }
 
+u32 ResourceUsage(u64 object) {
+    Resource resource;
+    return ReadResource(object, resource) ? resource.usage : ~0u;
+}
+
 void Start() {
     if (started.exchange(true)) {
         return;

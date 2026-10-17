@@ -72,6 +72,9 @@ bool ImageCopyEnabled();
 /// image of the fill's size, 2 the pattern is not one texel or the format is not handled).
 void NoteImageClear(bool done, u32 reason);
 
+/// Usage of a JsBuffer / JsTexture object (0 default, 1 immutable, 2 dynamic, 3 staging), ~0u when it cannot be read.
+u32 ResourceUsage(u64 object);
+
 void Start();
 nlohmann::json Report();
 

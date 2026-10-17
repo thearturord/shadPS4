@@ -26,6 +26,7 @@
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "video_core/native_draw_tag.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -764,6 +765,7 @@ struct NativeRecord {
     u64 copy_source{};
     u32 copy_bytes{};
     u32 fixed_stale{}; ///< FixedStateStale groups the draw does not write (the hardware keeps what it holds)
+    u32 dst_usage{~0u}; ///< copy and counter read-back records: Usage of the destination resource (3 staging), ~0u unknown
     const Vulkan::FixedState* fixed{}; ///< draw records: the fixed-function state built from the engine's objects (null: from the registers)
     u32 unsupported_inputs{}; ///< input usage types the builder does not know
     u32 unsupported_mask{};   ///< those types, bit per type
@@ -4055,6 +4057,8 @@ u64 PS4_SYSV_ABI TagAscCounterReadback(u64 jcc, u64 buffer, u64 view, u64 a3, u6
         record.a1 = 1;
         record.a2 = static_cast<u32>(Rd<u32>(jcc, 0x22f8) + slot * 4ull); // GDS byte offset
         record.args_addr = memory;
+        record.dst_usage = Core::NativeResources::ResourceUsage(buffer);
+        Core::NativeReadbacks::NoteDestination(memory, sizeof(u32), record.dst_usage, 9, ret - ImageBase() + 0x1000000);
         record.seq.store(seq, std::memory_order_release);
         u32 words[2 + VideoCore::NativeTagPayloadDwords];
         words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -4101,6 +4105,8 @@ u64 PublishAscMemoryCopy(u64 jcc, u64 destination, u64 source, u64 to, u64 from,
     record.a1 = static_cast<u32>(bytes);
     record.args_addr = to;
     record.extra_addr = from;
+    record.dst_usage = destination != 0 ? Core::NativeResources::ResourceUsage(destination) : ~0u;
+    Core::NativeReadbacks::NoteDestination(to, bytes, record.dst_usage, 10, ret - ImageBase() + 0x1000000);
     record.seq.store(seq, std::memory_order_release);
     u32 words[2 + VideoCore::NativeTagPayloadDwords];
     words[0] = 0xC0000000u | ((VideoCore::NativeTagPayloadDwords - 1) << 16) | (0x10u << 8); // PM4 NOP
@@ -4183,6 +4189,23 @@ u64 PS4_SYSV_ABI TagFenceSignal(u64 ctx, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
         Live().fence_packets_kept.fetch_add(1, std::memory_order_relaxed);
     }
     return label | (1ull << 63);
+}
+
+/// JsComputeContext::AsyncMap (FUN_02473600): the engine hands out the CPU address of a resource the async queue computed. The game's
+/// function runs; the range it returns is noted (explicit readbacks, step 1: measurement only).
+u64 PS4_SYSV_ABI NoteAsyncMap(u64 resource, u64 out, u64 a2, u64 a3, u64 a4, u64 a5, u64 ret) {
+    static std::atomic<u64> original_entry{0};
+    u64 original = original_entry.load(std::memory_order_relaxed);
+    if (original == 0) {
+        original = Core::GuestHooks::OriginalEntry("AsyncMap");
+        original_entry.store(original, std::memory_order_relaxed);
+    }
+    if (original == 0 || resource == 0 || out == 0) {
+        return 0;
+    }
+    reinterpret_cast<GuestFunction6>(original)(resource, out, a2, a3, a4, a5);
+    Core::NativeReadbacks::NoteMap(Rd<u64>(out, 0), Rd<u32>(out, 8), ret - ImageBase() + 0x1000000);
+    return 1;
 }
 
 /// FUN_024826c0(draw context): the reset at the start of a frame. It sets the engine fields, has the driver write the hardware
@@ -5298,6 +5321,9 @@ u64 FindHandler(const std::string& name) {
     if (name == "tag_auto") {
         return reinterpret_cast<u64>(&TagAuto);
     }
+    if (name == "asyncmap_note") {
+        return reinterpret_cast<u64>(&NoteAsyncMap);
+    }
     if (name == "tag_fence") {
         return reinterpret_cast<u64>(&TagFenceSignal);
     }
@@ -5664,10 +5690,10 @@ std::string DescribeEntry(const void* header) {
         text += fmt::format(" dst={:#x}{} dwords={} value={:#x}", slot.args_addr, kind == 8 ? "(gds)" : "", slot.a1, slot.a2);
         break;
     case 9:
-        text += fmt::format(" dst={:#x} gds={:#x} dwords={}", slot.args_addr, slot.a2, slot.a1);
+        text += fmt::format(" dst={:#x} gds={:#x} dwords={} dst_usage={}", slot.args_addr, slot.a2, slot.a1, static_cast<s32>(slot.dst_usage));
         break;
     case 10:
-        text += fmt::format(" dst={:#x} src={:#x} bytes={}", slot.args_addr, slot.extra_addr, slot.a1);
+        text += fmt::format(" dst={:#x} src={:#x} bytes={} dst_usage={}", slot.args_addr, slot.extra_addr, slot.a1, static_cast<s32>(slot.dst_usage));
         break;
     case 7:
         if (u32 base; find(ContextBase + 0x14, base)) {

@@ -1014,6 +1014,8 @@ if (ARCHITECTURE STREQUAL "x86_64")
              src/core/guest_hooks.h
              src/core/native_draw.cpp
              src/core/native_direct.cpp
+             src/core/native_readbacks.cpp
+             src/core/native_readbacks.h
              src/core/native_direct.h
              src/core/native_entry_dump.cpp
              src/core/native_entry_dump.h

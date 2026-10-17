@@ -9,6 +9,7 @@
 #include "core/debug_server.h"
 #include "core/guest_hooks.h"
 #include "core/native_draw.h"
+#include "core/native_readbacks.h"
 #include "core/native_resources.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -2048,6 +2049,7 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    Core::NativeReadbacks::NoteReadFault(addr, size);
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
 }

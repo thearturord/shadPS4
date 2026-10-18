@@ -162,9 +162,6 @@ struct Liverpool::RasterOp {
     u32 write_line{}; ///< Source line of the RasterRun call that queued a writes_memory closure.
     RasterCall call{};
     Common::UniqueFunction<void> closure{};
-    std::vector<u32> deltas{}; ///< Register writes to apply first: {offset, count, data...}.
-    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
-    CbDbExtent db_extent{};
     ComputeProgram cs{};
     std::unique_ptr<Vulkan::DrawPlan> draw_plan{};
     std::unique_ptr<Vulkan::DispatchPlan> dispatch_plan{};
@@ -172,7 +169,6 @@ struct Liverpool::RasterOp {
 
 struct Liverpool::RasterSplit {
     static constexpr size_t MaxQueued = 256;
-    static constexpr u32 SetDefaultsMarker = 0xFFFFFFFFu;
 
     std::jthread thread;
     std::jthread housekeeping; ///< Slow periodic work that must not stall the raster thread.
@@ -180,7 +176,6 @@ struct Liverpool::RasterSplit {
     std::condition_variable_any work_cv; ///< Raster thread: work arrived.
     std::condition_variable_any done_cv; ///< Front: space in the queue or operations done.
     std::vector<RasterOp> queue; // swapped with the raster thread's batch: no per-op allocation
-    std::vector<std::vector<u32>> free_deltas;
     std::atomic<u64> pushed{};
     std::atomic<u64> done{};
     std::atomic<u32> pending_writes{}; ///< Queued closures with writes_memory.
@@ -229,13 +224,7 @@ struct Liverpool::RasterSplit {
     u64 ns_other_closures{};
     u64 ns_callbacks{};
     u64 stat_last_log_ns{};
-    std::vector<u32> pending; ///< Front only: register writes not attached to an operation yet.
-    bool verify{};
-    u32 verify_reports{};
-
-    DrawRegs state{}; ///< the draw state the raster thread reads
-    std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
-    CbDbExtent db_extent{};
+    bool verify{}; ///< cp_split_mode 2: every operation is waited for (synchronous)
 };
 
 void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
@@ -245,9 +234,6 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         split_active = false;
         StopRasterSplit();
         direct_state = front_state;
-        raster_state = &direct_state;
-        raster_cb_extent = &last_cb_extent;
-        raster_db_extent = &last_db_extent;
         split.reset();
     }
     rasterizer = rasterizer_;
@@ -260,12 +246,6 @@ void Liverpool::StartRasterSplit() {
     split = std::make_unique<RasterSplit>();
     auto& sp = *split;
     sp.verify = EmulatorSettings.GetCpSplitMode() >= 2;
-    sp.state = front_state;
-    sp.cb_extent = last_cb_extent;
-    sp.db_extent = last_db_extent;
-    raster_state = &sp.state;
-    raster_cb_extent = &sp.cb_extent;
-    raster_db_extent = &sp.db_extent;
     split_active = true;
     sp.thread = std::jthread{std::bind_front(&Liverpool::RasterMain, this)};
     sp.housekeeping = std::jthread{[](std::stop_token stoken) {
@@ -294,7 +274,7 @@ void Liverpool::StartRasterSplit() {
         }
     }};
     LOG_INFO(Render, "Command processor split: raster thread started{}",
-             sp.verify ? " (verify mode, synchronous)" : "");
+             sp.verify ? " (synchronous)" : "");
 }
 
 void Liverpool::StopRasterSplit() {
@@ -318,10 +298,6 @@ void Liverpool::WakeRaster() {
     }
 }
 
-DrawRegs& Liverpool::RasterRegs() noexcept {
-    Core::NativeDraw::Live().mirror_reads.fetch_add(1, std::memory_order_relaxed);
-    return *raster_state;
-}
 
 void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
     if (!overlay.list.empty()) {
@@ -330,17 +306,6 @@ void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
     MirrorRegsRaw(dword_offset, count);
 }
 
-void Liverpool::PushDelta(u32 index, u32 value) {
-    if (!split_active || VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) == 0) {
-        return;
-    }
-    auto& pending = split->pending;
-    const size_t old_size = pending.size();
-    pending.resize(old_size + 3);
-    pending[old_size] = index;
-    pending[old_size + 1] = 1;
-    pending[old_size + 2] = value;
-}
 
 void Liverpool::ApplyStateTemplate(const Core::NativeDraw::StateTemplate& state) {
     using Core::NativeDraw::StateWrite;
@@ -404,13 +369,11 @@ void Liverpool::OverlaySet(u32 index, u32 value) {
         if (overlay.list.size() > 32768) {
             // duplicates pile up only when packets keep rewriting overlaid registers: start over from the register file
             *word = value;
-            PushDelta(index, value);
             OverlayRestore();
             return;
         }
     }
     *word = value;
-    PushDelta(index, value);
 }
 
 void Liverpool::OverlayRestore() {
@@ -420,7 +383,6 @@ void Liverpool::OverlayRestore() {
             bits &= ~(1ull << (index & 63));
             u32* const word = front_state.Word(index);
             *word = regs.reg_array[index]; // what the command packets wrote
-            PushDelta(index, *word);
         }
     }
     overlay.list.clear();
@@ -443,19 +405,7 @@ void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
     for (u32 k = 0; k < count; ++k) {
         front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
     }
-    if (!split_active || count == 0 || VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) == 0) {
-        return;
-    }
-    ASSERT(dword_offset + count <= Regs::NumRegs);
-    auto& pending = split->pending;
-    const size_t old_size = pending.size();
-    pending.resize(old_size + 2 + count);
-    u32* const out = pending.data() + old_size;
-    out[0] = dword_offset;
-    out[1] = count;
-    std::memcpy(out + 2, regs.reg_array.data() + dword_offset, count * sizeof(u32));
 }
-
 void Liverpool::MirrorObject(const void* object, size_t size) {
     if (!split_active) {
         return;
@@ -471,12 +421,7 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 void Liverpool::MirrorSetDefaults() {
     OverlayForgetAll(); // the registers were reset to their defaults
     front_state.SetDefaults();
-    if (split_active && VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) != 0) {
-        split->pending.push_back(RasterSplit::SetDefaultsMarker);
-        split->pending.push_back(0);
-    }
 }
-
 void Liverpool::DrainRaster() {
     if (!split_active) {
         return;
@@ -492,8 +437,6 @@ void Liverpool::DrainRaster() {
 
 void Liverpool::RasterPush(RasterOp&& op, bool wait) {
     auto& sp = *split;
-    op.deltas = std::move(sp.pending);
-    sp.pending.clear();
     if (op.writes_memory) {
         sp.pending_writes.fetch_add(1, std::memory_order_acq_rel);
         sp.last_write_line = op.write_line;
@@ -514,10 +457,6 @@ void Liverpool::RasterPush(RasterOp&& op, bool wait) {
         sp.queue.push_back(std::move(op));
         target = sp.pushed.fetch_add(1, std::memory_order_acq_rel) + 1;
         sp.work_cv.notify_all();
-        if (!sp.free_deltas.empty()) {
-            sp.pending = std::move(sp.free_deltas.back());
-            sp.free_deltas.pop_back();
-        }
         if (wait || sp.verify) {
             sp.done_cv.wait(lk, [&] { return sp.done.load(std::memory_order_acquire) >= target; });
         }
@@ -623,13 +562,10 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     ++sp.stat_calls;
     if (call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) {
         ++sp.stat_draws;
-        sp.stat_draws_no_reg_change += sp.pending.empty();
     }
     RasterOp op;
     op.has_call = true;
     op.call = call;
-    op.cb_extent = last_cb_extent;
-    op.db_extent = last_db_extent;
     if (call.kind == RasterCall::Kind::DispatchDirect ||
         call.kind == RasterCall::Kind::DispatchIndirect) {
         op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
@@ -651,26 +587,6 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         }
     }
     RasterPush(std::move(op), false);
-    if (sp.verify && sp.verify_reports < 20 && std::memcmp(&sp.state, &front_state, sizeof(DrawRegs)) != 0) {
-        // The operation is done: everything the command processor wrote so far is in the mirror, so the two draw
-        // states must be identical.
-        const auto* a = reinterpret_cast<const u32*>(&sp.state);
-        const auto* b = reinterpret_cast<const u32*>(&front_state);
-        u32 first = 0;
-        u32 count = 0;
-        for (u32 i = 0; i < sizeof(DrawRegs) / sizeof(u32); ++i) {
-            if (a[i] != b[i]) {
-                if (count++ == 0) {
-                    first = i;
-                }
-            }
-        }
-        ++sp.verify_reports;
-        LOG_ERROR(Render,
-                  "CP split verify: raster draw state mirror differs from the command processor's in {} dwords, first at "
-                  "dword {:#x} (mirror {:#x}, command processor {:#x}); a register write is not mirrored",
-                  count, first, a[first], b[first]);
-    }
 }
 
 void Liverpool::SignalGraphicsEop(const PM4CmdEventWriteEop& event_eop) {
@@ -933,8 +849,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         }
         RasterRun(
             [this, extent = draw.db_extent, inputs = Vulkan::MakeDrawInputs(front_state)] {
-                RasterDbExtent().raw = extent;
-                rasterizer->ClearDepthStencilTarget(inputs, RasterDbExtent());
+                CbDbExtent db_extent;
+                db_extent.raw = extent;
+                rasterizer->ClearDepthStencilTarget(inputs, db_extent);
             },
             false, false);
         OverlayRestore();
@@ -1178,7 +1095,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
     VideoCore::ReadbackStats::MarkCpThread();
     auto& sp = *split;
     std::vector<RasterOp> batch;
-    std::vector<std::vector<u32>> recycled;
     while (true) {
         // cp_raster_core can be changed live (debug server /set?name=raster_core&value=N).
         if (const s32 wanted = VideoCore::ReadbackPolicy::Get().raster_core.load();
@@ -1225,31 +1141,14 @@ void Liverpool::RasterMain(std::stop_token stoken) {
                 sp.ns_callbacks += VideoCore::ReadbackStats::NowNs() - callback_start;
             }
             const u64 op_start = VideoCore::ReadbackStats::NowNs();
-            const u32* p = op.deltas.data();
-            const u32* end = p + op.deltas.size();
-            while (p < end) {
-                const u32 offset = p[0];
-                const u32 count = p[1];
-                p += 2;
-                if (offset == RasterSplit::SetDefaultsMarker) {
-                    sp.state.SetDefaults();
-                    continue;
-                }
-                for (u32 k = 0; k < count; ++k) {
-                    sp.state.Set(offset + k, p[k]);
-                }
-                p += count;
-            }
             if (op.has_call) {
-                sp.cb_extent = op.cb_extent;
-                sp.db_extent = op.db_extent;
                 ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
                 const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
                 if (op.call.kind == RasterCall::Kind::Draw ||
                     op.call.kind == RasterCall::Kind::DrawIndirect) {
                     sp.ns_draws += op_ns;
                     ++sp.n_draws;
-                    if (op.draw_plan ? op.draw_plan->fixed.NoColorTargets() : sp.state.color_target_mask.raw == 0) {
+                    if (op.draw_plan && op.draw_plan->fixed.NoColorTargets()) {
                         sp.ns_depth_only_draws += op_ns;
                         ++sp.n_depth_only_draws;
                     }
@@ -1270,8 +1169,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             op.closure = {};
             rasterizer->RecyclePlan(std::move(op.draw_plan));
             rasterizer->RecyclePlan(std::move(op.dispatch_plan));
-            op.deltas.clear();
-            recycled.push_back(std::move(op.deltas));
         }
         if (num_commands != 0) {
             ProcessCommands();
@@ -1415,15 +1312,9 @@ void Liverpool::RasterMain(std::stop_token stoken) {
         }
         {
             std::scoped_lock lk{sp.mutex};
-            for (auto& v : recycled) {
-                if (sp.free_deltas.size() < 64) {
-                    sp.free_deltas.push_back(std::move(v));
-                }
-            }
             sp.done.fetch_add(count, std::memory_order_acq_rel);
             sp.done_cv.notify_all();
         }
-        recycled.clear();
         if (RasterIdle()) {
             std::scoped_lock lk{submit_mutex};
             submit_cv.notify_all();

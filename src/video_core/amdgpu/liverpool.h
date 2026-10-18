@@ -95,12 +95,14 @@ public:
     /// What the rasterizer reads while it executes draws and dispatches. Without the command
     /// processor split (cp_split_mode) these are the command processor's own registers; with it
     /// they are the raster thread's mirror, kept in sync through the operation queue.
-    [[nodiscard]] DrawRegs& RasterRegs() noexcept;
+    [[nodiscard]] DrawRegs& RasterRegs() noexcept {
+        return direct_state;
+    }
     [[nodiscard]] std::array<CbDbExtent, NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
-        return *raster_cb_extent;
+        return last_cb_extent;
     }
     [[nodiscard]] CbDbExtent& RasterDbExtent() noexcept {
-        return *raster_db_extent;
+        return last_db_extent;
     }
     /// True while the raster thread runs the rasterizer (cp_split_mode): the pipeline lookup is
     /// then done by the command processor thread.
@@ -303,7 +305,6 @@ private:
     u64 native_fixed_draws{};
     const Vulkan::FixedState* native_fixed{}; ///< fixed-function state of the draw being dispatched, from the engine's objects (null: from the registers)
     void OverlaySet(u32 index, u32 value);
-    void PushDelta(u32 index, u32 value);
     void OverlayRestore();
     void OverlayForget(u32 dword_offset, u32 count);
     void OverlayForgetAll();
@@ -443,9 +444,6 @@ private:
     /// without the split (rebuilt from `regs` before each operation) and the raster thread's own with it.
     DrawRegs front_state{};
     DrawRegs direct_state{};
-    DrawRegs* raster_state{&direct_state};
-    std::array<CbDbExtent, NUM_COLOR_BUFFERS>* raster_cb_extent{&last_cb_extent};
-    CbDbExtent* raster_db_extent{&last_db_extent};
     bool split_active{};
     std::unique_ptr<RasterSplit> split;
     const u32 fence_wait_shortcut;

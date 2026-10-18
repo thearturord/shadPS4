@@ -73,7 +73,6 @@ struct State {
     std::atomic<s32> fence_shortcut_override{-1}; ///< readback_fence_wait_shortcut 0..3
     std::atomic<s32> stream_reuse_override{-1};   ///< readback_stream_reuse_enabled 0/1
     std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
-    std::atomic<s32> raster_mirror{0};            ///< the command processor sends its register writes to the raster thread's draw state mirror (0: it does not; nothing reads the mirror in the split mode)
     std::atomic<s32> cs_zero_base{1};             ///< record dispatches run on the record alone on a zeroed compute program (0: the record applied to the queue's state)
     std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
     std::atomic<s32> map_native{0};               ///< the texture map helper's upload dispatch as a record: 0 off, 1 verify (tag + game packets), 2 execute

@@ -219,19 +219,6 @@ bool Rasterizer::FilterDraw(const DrawPlan* plan) {
     } else {
         classified = ClassifyDraw(liverpool->RasterRegs(), nullptr);
     }
-    if (plan != nullptr && VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
-        // the plan is made from the command processor's state; the mirror holds the same state: the two must agree
-        auto& live = Core::NativeDraw::Live();
-        live.class_audit_draws.fetch_add(1, std::memory_order_relaxed);
-        const auto mirror = ClassifyDraw(liverpool->RasterRegs(), plan->executed ? &plan->fixed : nullptr);
-        if (mirror.kind != classified.kind || (plan->op_class != 0xff && (mirror.depth_copy != classified.depth_copy || mirror.stencil_copy != classified.stencil_copy))) {
-            live.class_audit_differ.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (plan->op_class != 0xff && (std::memcmp(plan->cb_extent.data(), liverpool->RasterCbExtents().data(), sizeof(plan->cb_extent)) != 0 ||
-                                       plan->db_extent.raw != liverpool->RasterDbExtent().raw)) {
-            live.extent_audit_differ.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
     {
         // how often the game's own transition draws (fast clear eliminate, fmask, resolve, depth copy) occur
         static std::array<u64, 12> class_counts{};

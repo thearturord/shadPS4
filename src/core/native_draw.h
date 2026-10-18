@@ -41,10 +41,6 @@ struct LiveCounters {
     /// draws of a shader without a fetch object yet (`native_sdk_strip` bit 2147483648): the game's draw function ran, the record was built again afterwards
     /// the texture map helper's upload dispatch (`map_native`): calls seen, records patched into the tag, refused, executed
     /// compute program audit (`cs_audit`): record dispatches seen, those whose program (queue state plus record) differs from the record alone on a zeroed program, and the dwords that differ
-    /// operation classification and extents made from the plan against the register mirror (`cs_audit`): draws compared, classes that differ, extents that differ
-    std::atomic<u64> class_audit_draws{}, class_audit_differ{}, extent_audit_differ{};
-    /// reads of the raster thread's draw state mirror (Liverpool::RasterRegs)
-    std::atomic<u64> mirror_reads{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};
     std::atomic<u64> map_tried{}, map_patched{}, map_refused{}, map_exec{};

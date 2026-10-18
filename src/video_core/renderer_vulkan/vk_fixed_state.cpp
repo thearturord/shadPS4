@@ -307,6 +307,8 @@ DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs) {
     in.index_base_address = regs.index_base_address;
     in.index_buffer_type = regs.index_buffer_type;
     in.max_index_size = regs.max_index_size;
+    in.ta_bc_base = regs.ta_bc_base;
+    in.clip_user_data = regs.clip_user_data;
     return in;
 }
 
@@ -330,6 +332,8 @@ std::string DiffDrawInputs(const DrawInputs& a, const DrawInputs& b) {
     note(std::bit_cast<u32>(a.depth_clear) != std::bit_cast<u32>(b.depth_clear), "depth_clear");
     note(a.stencil_clear != b.stencil_clear, "stencil_clear");
     note(a.num_indices != b.num_indices, "num_indices");
+    note(bytes(a.ta_bc_base, b.ta_bc_base), "ta_bc_base");
+    note(bytes(a.clip_user_data, b.clip_user_data), "clip_user_data");
     note(bytes(a.num_instances, b.num_instances), "num_instances");
     note(a.index_offset != b.index_offset, "index_offset");
     note(a.vgt_instance_step_rate_0 != b.vgt_instance_step_rate_0, "step_rate_0");

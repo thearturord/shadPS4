@@ -90,6 +90,8 @@ bool Set(std::string_view name, s64 value) {
         s.rt_reuse_override = static_cast<s32>(value);
     } else if (name == "stage_reuse") {
         s.stage_reuse_override = static_cast<s32>(value);
+    } else if (name == "raster_mirror") {
+        s.raster_mirror = static_cast<s32>(value);
     } else if (name == "cs_zero_base") {
         s.cs_zero_base = static_cast<s32>(value);
     } else if (name == "cs_audit") {
@@ -137,6 +139,7 @@ nlohmann::json Dump() {
             {"stream_reuse", s.stream_reuse_override.load()},
             {"rt_reuse", s.rt_reuse_override.load()},
             {"stage_reuse", s.stage_reuse_override.load()},
+            {"raster_mirror", s.raster_mirror.load()},
             {"cs_zero_base", s.cs_zero_base.load()},
             {"cs_audit", s.cs_audit.load()},
             {"map_native", s.map_native.load()},

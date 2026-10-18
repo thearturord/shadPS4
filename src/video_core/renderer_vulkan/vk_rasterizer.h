@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/readback_policy.h"
 
 #include "video_core/amdgpu/draw_state.h"
@@ -75,7 +76,7 @@ public:
                                                      DrawIndirectParams params,
                                                      const FixedState* native = nullptr,
                                                      u32 native_stale = 0, bool verify = true);
-    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs);
+    [[nodiscard]] std::unique_ptr<DispatchPlan> PlanDispatch(const AmdGpu::ComputeProgram& cs, const AmdGpu::BorderColorBuffer& ta_bc_base);
 
     /// Raster thread: hands a finished plan back for reuse. Allocating a plan for every draw on
     /// one thread and freeing it on another made them fight over the heap lock.
@@ -132,7 +133,7 @@ public:
     /// The memory copy of two images that live on the GPU with the same layout is an image copy.
     bool TryCopyImages(VAddr dst, VAddr src, u32 num_bytes);
     /// Clears the depth / stencil target the registers describe (native depth clear record).
-    void ClearDepthStencilTarget();
+    void ClearDepthStencilTarget(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
 
@@ -192,11 +193,11 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline, const FixedState& fixed);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
-    void Resolve();
-    void DepthStencilCopy(bool is_depth, bool is_stencil);
-    void EliminateFastClear();
+    void Resolve(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0, const AmdGpu::CbDbExtent& cb1);
+    void DepthStencilCopy(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent, bool is_depth, bool is_stencil);
+    void EliminateFastClear(const DrawInputs& inputs, const AmdGpu::CbDbExtent& cb0);
     /// Clears the bound depth / stencil target to the clear values of the registers (native replacement of the SDK's clear quad).
-    void ClearDepthTarget();
+    void ClearDepthTarget(const DrawInputs& inputs, const AmdGpu::CbDbExtent& db_extent);
 
     const FixedState& FixedFor(const DrawPlan* plan, FixedState& storage) const;
     /// The draw inputs of the draw being recorded: the plan's, or built from the register mirror without a plan.
@@ -235,6 +236,10 @@ private:
     /// switch looks at it.
     static DrawClassification ClassifyDraw(const AmdGpu::DrawRegs& regs,
                                            const FixedState* executed = nullptr);
+    /// The part of ClassifyDraw that finds the game's own transition operations; true and `out` set when the draw is one.
+    static bool ClassifyOperation(const AmdGpu::DrawRegs& regs, DrawClassification& out);
+    /// What is left for a draw that is not such an operation, from the plan only (the shadow skip switch).
+    static DrawClassification ClassifyRemaining(const DrawInputs& inputs, const FixedState& fixed);
 
     void ProcessReadbacksSync();
 
@@ -271,6 +276,9 @@ private:
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
     AmdGpu::Liverpool* liverpool;
+    const std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS>* current_cb_extent{}; ///< The extent hints of the targets of the draw being recorded.
+    const AmdGpu::CbDbExtent* current_db_extent{};
+    const AmdGpu::BorderColorBuffer* current_bc_base{}; ///< The border colour table of the draw or dispatch being recorded.
     const AmdGpu::ComputeProgram* current_cs{}; ///< The compute program of the dispatch being recorded (its plan's, or the queue's without a plan).
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;

@@ -31,6 +31,7 @@
 #include "core/debug_server.h"
 #include "video_core/thread_usage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_fixed_state.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -317,6 +318,11 @@ void Liverpool::WakeRaster() {
     }
 }
 
+DrawRegs& Liverpool::RasterRegs() noexcept {
+    Core::NativeDraw::Live().mirror_reads.fetch_add(1, std::memory_order_relaxed);
+    return *raster_state;
+}
+
 void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
     if (!overlay.list.empty()) {
         OverlayForget(dword_offset, count); // the command packets wrote the truth for these registers
@@ -325,7 +331,7 @@ void Liverpool::MirrorRegs(u32 dword_offset, u32 count) {
 }
 
 void Liverpool::PushDelta(u32 index, u32 value) {
-    if (!split_active) {
+    if (!split_active || VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) == 0) {
         return;
     }
     auto& pending = split->pending;
@@ -437,7 +443,7 @@ void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
     for (u32 k = 0; k < count; ++k) {
         front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
     }
-    if (!split_active || count == 0) {
+    if (!split_active || count == 0 || VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) == 0) {
         return;
     }
     ASSERT(dword_offset + count <= Regs::NumRegs);
@@ -465,7 +471,7 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 void Liverpool::MirrorSetDefaults() {
     OverlayForgetAll(); // the registers were reset to their defaults
     front_state.SetDefaults();
-    if (split_active) {
+    if (split_active && VideoCore::ReadbackPolicy::Get().raster_mirror.load(std::memory_order_relaxed) != 0) {
         split->pending.push_back(RasterSplit::SetDefaultsMarker);
         split->pending.push_back(0);
     }
@@ -600,6 +606,11 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
             native_tag_skips = 0;
         }
     }
+    if ((call.kind == RasterCall::Kind::Draw || call.kind == RasterCall::Kind::DrawIndirect) && call.tag.valid && call.tag.seq != 0 &&
+        (call.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
+        // a draw that runs on the game's packets: the record is compared with the state those packets made (verification only)
+        Core::NativeDraw::VerifyRecord(call.tag.seq, front_state);
+    }
     if (!split_active) {
         direct_state = front_state;
         ExecRasterCall(call, nullptr, nullptr);
@@ -623,7 +634,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         call.kind == RasterCall::Kind::DispatchIndirect) {
         op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
-        op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
+        op.dispatch_plan = rasterizer->PlanDispatch(op.cs, front_state.ta_bc_base);
     } else {
         const Vulkan::DrawIndirectParams params =
             call.kind == RasterCall::Kind::DrawIndirect
@@ -634,6 +645,10 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
         Core::NativeAudit::SetPlanCaller(call.tag.valid ? Core::NativeDraw::RecordCaller(call.tag.seq) : 0);
         op.draw_plan = rasterizer->PlanDraw(front_state, params, native_fixed, native_fixed_stale,
                                                   native_fixed_verify);
+        if (op.draw_plan) {
+            op.draw_plan->cb_extent = last_cb_extent;
+            op.draw_plan->db_extent = last_db_extent;
+        }
     }
     RasterPush(std::move(op), false);
     if (sp.verify && sp.verify_reports < 20 && std::memcmp(&sp.state, &front_state, sizeof(DrawRegs)) != 0) {
@@ -917,9 +932,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
             direct_state = front_state;
         }
         RasterRun(
-            [this, extent = draw.db_extent] {
+            [this, extent = draw.db_extent, inputs = Vulkan::MakeDrawInputs(front_state)] {
                 RasterDbExtent().raw = extent;
-                rasterizer->ClearDepthStencilTarget();
+                rasterizer->ClearDepthStencilTarget(inputs, RasterDbExtent());
             },
             false, false);
         OverlayRestore();
@@ -1116,9 +1131,6 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         break;
     case RasterCall::Kind::DrawIndirect:
         rasterizer->NativeInvalidate();
-        if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
-            Core::NativeDraw::VerifyRecord(c.tag.seq, RasterRegs());
-        }
         run([&] {
             rasterizer->DrawIndirect(c.indexed, c.args_addr, c.offset, c.stride, c.max_count,
                                      c.count_addr, c.vertex_sgpr_offset, c.instance_sgpr_offset,

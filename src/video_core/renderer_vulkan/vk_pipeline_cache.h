@@ -107,12 +107,17 @@ struct DrawPlan {
     FixedState fixed{};
     DrawInputs inputs{};
     bool executed{}; ///< the draw was executed from a record: no register based classification
+    u8 op_class{0xff}; ///< not 0xff: one of the game's own transition operations (Rasterizer::DrawClass) that the raster thread performs from this plan, no pipeline
+    bool depth_copy{}, stencil_copy{};
+    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{}; ///< the extent hints of the targets when the draw was recorded
+    AmdGpu::CbDbExtent db_extent{};
     std::array<StagePlan, MaxShaderStages> stages{};
 };
 
 struct DispatchPlan {
     const ComputePipeline* pipeline{}; ///< Null if the pipeline lookup failed.
     AmdGpu::ComputeProgram cs{};       ///< The compute program of this dispatch: the rasterizer reads it from here.
+    AmdGpu::BorderColorBuffer ta_bc_base{}; ///< The custom border colour table the dispatch's samplers use.
     StagePlan stage{};
 };
 

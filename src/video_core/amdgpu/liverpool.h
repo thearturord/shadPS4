@@ -95,9 +95,7 @@ public:
     /// What the rasterizer reads while it executes draws and dispatches. Without the command
     /// processor split (cp_split_mode) these are the command processor's own registers; with it
     /// they are the raster thread's mirror, kept in sync through the operation queue.
-    [[nodiscard]] DrawRegs& RasterRegs() noexcept {
-        return *raster_state;
-    }
+    [[nodiscard]] DrawRegs& RasterRegs() noexcept;
     [[nodiscard]] std::array<CbDbExtent, NUM_COLOR_BUFFERS>& RasterCbExtents() noexcept {
         return *raster_cb_extent;
     }

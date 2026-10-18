@@ -143,6 +143,8 @@ nlohmann::json Native(const Params&) {
             }
         }
         audit["differing_dwords"] = dwords;
+        audit["classification"] = {{"draws", live.class_audit_draws.load()}, {"class_differs", live.class_audit_differ.load()}, {"extent_differs", live.extent_audit_differ.load()}};
+        audit["mirror_reads"] = live.mirror_reads.load();
         j["cs_audit"] = audit;
     }
     j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};

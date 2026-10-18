@@ -134,6 +134,8 @@ struct DrawInputs {
     AmdGpu::IndexBufferBase index_base_address;
     AmdGpu::IndexBufferType index_buffer_type;
     u32 max_index_size;
+    AmdGpu::BorderColorBuffer ta_bc_base;
+    std::array<AmdGpu::ClipUserData, AmdGpu::NUM_CLIP_PLANES> clip_user_data;
 };
 
 DrawInputs MakeDrawInputs(const AmdGpu::DrawRegs& regs);

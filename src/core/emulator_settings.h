@@ -496,7 +496,7 @@ struct GPUSettings {
     // with its record (the safety net that notices a state the builder does not know). 0 = never.
     Setting<u32> native_audit_every{64};
     Setting<u32> native_map{0};
-    Setting<u32> native_packet_path{1};
+    Setting<u32> native_packet_path{0};
     // With native execution: the packets of SDK helper calls the command processor has no use for are replaced by one NOP
     // (bit 0: depth transition quads of the render target tracking, bit 1: resource tracking, bit 2: copies).
     Setting<u32> native_sdk_strip{0};

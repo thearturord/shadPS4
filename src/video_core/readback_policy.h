@@ -69,7 +69,7 @@ struct State {
     std::atomic<s32> rt_reuse_override{-1};       ///< rt_lookup_reuse_enabled 0/1
     /// Diagnostics: draw call sites (Ghidra addresses of the return address) that are not executed natively; /set?exclude_caller=<address> adds one, 0 clears the list
     std::array<std::atomic<u32>, 32> exclude_callers{};
-    std::atomic<s32> packet_path{1};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
+    std::atomic<s32> packet_path{0};              ///< 0: the packet walk is off: a command buffer runs from its entries only, the packets that are not entries are not executed (logged as errors)
     std::atomic<s32> cs_zero_base{1};             ///< record dispatches run on the record alone on a zeroed compute program (0: the record applied to the queue's state)
     std::atomic<s32> cs_audit{0};                 ///< audit: a record dispatch's compute program against the record alone on a zeroed program (counters in /native)
     std::atomic<s32> map_native{0};               ///< the texture map helper's upload dispatch as a record: 0 off, 1 verify (tag + game packets), 2 execute

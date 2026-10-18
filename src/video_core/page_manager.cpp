@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <utility>
 #include "common/adaptive_mutex.h"
@@ -13,6 +14,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "core/debug_server.h"
 #include "core/emulator_settings.h"
 #include "core/guest_hooks.h"
 #include "core/memory.h"
@@ -482,7 +484,12 @@ struct SignalImpl : public PageManager::Impl {
                                               stack_words);
             }
 #endif
+            const auto started = std::chrono::steady_clock::now();
             const bool handled = rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            Core::DebugServer::NoteWriteFaultTime(
+                addr, static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::steady_clock::now() - started)
+                                           .count()));
 #ifdef ARCH_X86_64
             Core::GuestHooks::SetFaultRip(0);
 #endif

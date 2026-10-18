@@ -52,6 +52,8 @@ std::array<std::atomic<u64>, TimeRing> present_times{};
 
 constexpr u64 FaultRegions = 1u << 14; // 4 MB regions, aliased above 64 GB
 std::array<std::atomic<u32>, FaultRegions> fault_regions{};
+std::array<std::atomic<u64>, FaultRegions> fault_ns{};
+std::atomic<u64> faults_read_at_ns{0};
 
 u64 NowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -321,21 +323,34 @@ nlohmann::json Faults(const Params& params) {
     const u64 top = std::min<u64>(ParseNumber(params, "top", 15), 100);
     std::vector<std::pair<u32, u32>> counts; // {count, region}
     u64 total = 0;
+    u64 total_ns = 0;
+    std::array<u64, FaultRegions> region_ns{};
     for (u32 i = 0; i < FaultRegions; ++i) {
         const u32 count = fault_regions[i].exchange(0, std::memory_order_relaxed);
+        region_ns[i] = fault_ns[i].exchange(0, std::memory_order_relaxed);
+        total_ns += region_ns[i];
         if (count != 0) {
             counts.emplace_back(count, i);
             total += count;
         }
     }
+    const u64 now = NowNs();
+    const u64 previous = faults_read_at_ns.exchange(now, std::memory_order_relaxed);
+    const double seconds = previous == 0 ? 0.0 : static_cast<double>(now - previous) / 1e9;
     std::ranges::sort(counts, std::greater<>{});
     nlohmann::json j;
     j["note"] = "CPU write faults on tracked pages since the previous call, by 4 MB region";
     j["total"] = total;
+    j["seconds_since_previous_call"] = seconds;
+    j["handler_ms_total"] = static_cast<double>(total_ns) / 1e6;
+    j["handler_cores"] = seconds > 0.0 ? static_cast<double>(total_ns) / 1e9 / seconds : 0.0;
+    j["handler_us_per_fault"] = total != 0 ? static_cast<double>(total_ns) / 1e3 / static_cast<double>(total) : 0.0;
+    j["faults_per_second"] = seconds > 0.0 ? static_cast<double>(total) / seconds : 0.0;
     auto& list = j["top_regions"] = nlohmann::json::array();
     for (size_t i = 0; i < counts.size() && i < top; ++i) {
         list.push_back({{"addr", fmt::format("{:#x}", static_cast<u64>(counts[i].second) << 22)},
-                        {"faults", counts[i].first}});
+                        {"faults", counts[i].first},
+                        {"handler_ms", static_cast<double>(region_ns[counts[i].second]) / 1e6}});
     }
     return j;
 }
@@ -523,6 +538,10 @@ void NotePresent() {
 
 void NoteWriteFault(VAddr address) {
     fault_regions[(address >> 22) & (FaultRegions - 1)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteWriteFaultTime(VAddr address, u64 nanoseconds) {
+    fault_ns[(address >> 22) & (FaultRegions - 1)].fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
 void Start(u16 port) {

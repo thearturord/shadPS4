@@ -62,4 +62,7 @@ void NotePresent();
 /// Called for every CPU write to a page the emulator tracks. Cheap, any thread.
 void NoteWriteFault(VAddr address);
 
+/// Time the fault handler spent on that fault.
+void NoteWriteFaultTime(VAddr address, u64 nanoseconds);
+
 } // namespace Core::DebugServer

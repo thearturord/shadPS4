@@ -43,6 +43,9 @@ struct LiveCounters {
     /// compute program audit (`cs_audit`): record dispatches seen, those whose program (queue state plus record) differs from the record alone on a zeroed program, and the dwords that differ
     /// `native_packet_path` 0: command buffers that are not pure and the packets of them that were not executed
     std::atomic<u64> packet_path_skipped_buffers{}, packet_path_skipped_packets{};
+    /// register values the native records apply to the command processor's draw state (OverlaySet): offered, not covered by any member, equal to the held value, changed
+    std::array<std::atomic<u32>, 65536> overlay_changed_by_index{};
+    std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};
     std::atomic<u64> map_tried{}, map_patched{}, map_refused{}, map_exec{};

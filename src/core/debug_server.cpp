@@ -146,6 +146,21 @@ nlohmann::json Native(const Params&) {
         j["cs_audit"] = audit;
     }
     j["packet_path_skipped"] = {{"buffers", live.packet_path_skipped_buffers.load()}, {"packets", live.packet_path_skipped_packets.load()}};
+    j["overlay"] = {{"records", live.overlay_records.load()}, {"offered", live.overlay_offered.load()}, {"unmapped", live.overlay_unmapped.load()}, {"same", live.overlay_same.load()}, {"changed", live.overlay_changed.load()}};
+    {
+        std::vector<std::pair<u32, u32>> top;
+        for (u32 i = 0; i < live.overlay_changed_by_index.size(); ++i) {
+            if (const u32 c = live.overlay_changed_by_index[i].load(std::memory_order_relaxed); c != 0) {
+                top.emplace_back(c, i);
+            }
+        }
+        std::sort(top.rbegin(), top.rend());
+        nlohmann::json list = nlohmann::json::array();
+        for (size_t i = 0; i < top.size() && i < 60; ++i) {
+            list.push_back({{"index", fmt::format("{:#x}", top[i].second)}, {"changed", top[i].first}});
+        }
+        j["overlay_changed_top"] = list;
+    }
     j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();

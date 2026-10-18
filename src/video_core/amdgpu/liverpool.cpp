@@ -356,6 +356,21 @@ static bool IsFixedStateRegister(u32 index) {
 
 void Liverpool::OverlaySet(u32 index, u32 value) {
     u32* const word = front_state.Word(index);
+    const bool audit = VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0;
+    if (audit) {
+        auto& live = Core::NativeDraw::Live();
+        live.overlay_offered.fetch_add(1, std::memory_order_relaxed);
+        if (word == nullptr) {
+            live.overlay_unmapped.fetch_add(1, std::memory_order_relaxed);
+        } else if (*word == value) {
+            live.overlay_same.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            live.overlay_changed.fetch_add(1, std::memory_order_relaxed);
+            if (index < live.overlay_changed_by_index.size()) {
+                live.overlay_changed_by_index[index].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     if (word == nullptr || *word == value) {
         return; // no member of the draw state covers the register, or it already holds the value
     }
@@ -960,6 +975,9 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (draw.fixed) {
         const u64 n = native_fixed_draws++;
         native_fixed_verify = n < 200000 || (n & 255) == 0;
+    }
+    if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
+        Core::NativeDraw::Live().overlay_records.fetch_add(1, std::memory_order_relaxed);
     }
     for (u32 i = 0; i < draw.count; ++i) {
         if (!native_fixed_verify && IsFixedStateRegister(draw.regs[i].index)) {

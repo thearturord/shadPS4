@@ -75,6 +75,7 @@ std::ofstream args_file;
 std::ofstream deref_file;
 std::ofstream snap_file;
 std::ofstream fault_file;
+bool log_csv = false; ///< "log_csv" in the hook file: write the per frame csv files (large, for investigations)
 std::atomic<u64> frame_index{0};
 
 // Write faults seen by the fault handler: {frame, address}, drained once per frame.
@@ -356,6 +357,7 @@ void InstallForEboot(VAddr base, u64 image_size) {
         const u64 ghidra_base = config.contains("ghidra_image_base")
                                     ? ParseHex(config.at("ghidra_image_base"))
                                     : 0x1000000;
+        log_csv = config.value("log_csv", false);
         u64 ring_entries = config.value("ring_entries", u64{16384});
         if (ring_entries < 16 || (ring_entries & (ring_entries - 1)) != 0 ||
             ring_entries > (1u << 24)) {
@@ -456,6 +458,9 @@ void InstallForEboot(VAddr base, u64 image_size) {
     if (hooks.empty()) {
         return;
     }
+    if (!log_csv) {
+        return;
+    }
     const auto log_dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
     counts_file.open(log_dir / "guest_hooks.csv", std::ios::trunc);
     counts_file << "frame,name,calls,total\n";
@@ -522,7 +527,7 @@ void OnFrame() {
     }
     const u64 frame = frame_index.fetch_add(1, std::memory_order_relaxed) + 1;
     // Write faults of the frame that just ended, one line per page.
-    {
+    if (fault_ring) {
         const u64 head = fault_head.load(std::memory_order_acquire);
         if (head - fault_tail > FaultRingSize) {
             fault_tail = head - FaultRingSize;
@@ -554,7 +559,7 @@ void OnFrame() {
         const u64 total = hook->counter()->load(std::memory_order_relaxed);
         const u64 delta = total - hook->last_count;
         published_calls[hook->name] = {{"calls_last_frame", delta}, {"total", total}};
-        if (delta != 0) {
+        if (delta != 0 && counts_file.is_open()) {
             counts_file << frame << ',' << hook->name << ',' << delta << ',' << total << '\n';
         }
         if ((hook->mode == Mode::Args || hook->mode == Mode::Snap) && args_file.is_open() && delta != 0) {
@@ -622,7 +627,7 @@ void OnFrame() {
                      hook->counter()->load(std::memory_order_relaxed));
         }
     }
-    if (frame % 60 == 0) {
+    if (frame % 60 == 0 && counts_file.is_open()) {
         counts_file.flush();
         if (args_file.is_open()) {
             args_file.flush();

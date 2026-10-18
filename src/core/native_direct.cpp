@@ -56,6 +56,14 @@ Classified Classify(const u32* packet, bool markers, u32 queue) {
         if (opcode == 0x76 || (opcode == 0x15 && dwords == 5)) {
             return {Class::Packet, opcode, dwords};
         }
+        // the graphics side of the constant engine's synchronization (increment the draw engine counter, wait on the constant engine counter)
+        // context register writes (the extent hints of the targets follow them in the buffer) and event writes: the walk's cases
+        if (opcode == 0x69 || opcode == 0x46) {
+            return {Class::Packet, opcode, dwords};
+        }
+        if ((opcode == 0x85 && dwords == 2) || (opcode == 0x86 && dwords == 2)) {
+            return {Class::Packet, opcode, dwords};
+        }
         if (opcode == 0x37 && dwords >= 4 && (packet[1] & 0x10000) == 0 && (((packet[1] >> 8) & 0xf) == 2 || ((packet[1] >> 8) & 0xf) == 5)) {
             return {Class::Packet, opcode, dwords};
         }
@@ -170,6 +178,16 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
             AddEntry(buffer, EntryKind::Flip, at, packet.dwords, address, 0);
             break;
         case Class::Packet:
+            if (packet.opcode == 0x69) {
+                // the walk reads the NOP packet with the extent hint of a target that follows the register write (up to 22 dwords after it)
+                constexpr u32 HintDwords = 24;
+                if (at + packet.dwords + HintDwords > end) {
+                    ++buffer.other[0x69];
+                    break;
+                }
+                AddEntry(buffer, EntryKind::Packet, at, packet.dwords + HintDwords, address, packet.opcode);
+                break;
+            }
             AddEntry(buffer, EntryKind::Packet, at, packet.dwords, address, packet.opcode);
             break;
         case Class::Other:
@@ -224,9 +242,9 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
     buffer->dwords = dwords;
     buffer->markers = markers;
     const bool templates = StateTemplatesOn();
-    if (has_constant_buffer) {
-        ++buffer->other[OtherConstantBuffer];
-    } else if (const auto* state = dwords <= 256 && templates ? Core::NativeDraw::IndirectStateTemplate(dcb, dwords) : nullptr) {
+    // A submission with a constant engine buffer is scanned like any other: the engine's counters are entries and the buffer runs next to its own
+    // constant engine task (ProcessDirect); only a state template (a small buffer of register writes) cannot have one.
+    if (const auto* state = !has_constant_buffer && dwords <= 256 && templates ? Core::NativeDraw::IndirectStateTemplate(dcb, dwords) : nullptr) {
         Entry entry;
         entry.kind = EntryKind::StateBuffer;
         entry.address = reinterpret_cast<u64>(dcb);

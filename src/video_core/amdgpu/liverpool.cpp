@@ -1972,6 +1972,113 @@ Liverpool::Task Liverpool::DirectWait(const PM4CmdWaitRegMem& wait_packet) {
     FIBER_EXIT;
 }
 
+void Liverpool::ExecuteSetContextReg(const PM4Header* header) {
+    const u32 count = header->type3.NumWords();
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
+    const auto* payload = reinterpret_cast<const u32*>(header + 2);
+
+    std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+    MirrorRegs(reg_addr, count - 1);
+
+    // In the case of HW, render target memory has alignment as color block operates on
+    // tiles. There is no information of actual resource extents stored in CB context
+    // regs, so any deduction of it from slices/pitch will lead to a larger surface
+    // created. The same applies to the depth targets. Fortunately, the guest always
+    // sends a trailing NOP packet right after the context regs setup, so we can use the
+    // heuristic below and extract the hint to determine actual resource dims.
+
+    switch (reg_addr) {
+    case ContextRegs::CbColor0Base:
+    case ContextRegs::CbColor1Base:
+    case ContextRegs::CbColor2Base:
+    case ContextRegs::CbColor3Base:
+    case ContextRegs::CbColor4Base:
+    case ContextRegs::CbColor5Base:
+    case ContextRegs::CbColor6Base:
+    case ContextRegs::CbColor7Base: {
+        const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
+                                (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+        } else {
+            last_cb_extent[col_buf_id].raw = 0;
+        }
+        break;
+    }
+    case ContextRegs::CbColor0Cmask:
+    case ContextRegs::CbColor1Cmask:
+    case ContextRegs::CbColor2Cmask:
+    case ContextRegs::CbColor3Cmask:
+    case ContextRegs::CbColor4Cmask:
+    case ContextRegs::CbColor5Cmask:
+    case ContextRegs::CbColor6Cmask:
+    case ContextRegs::CbColor7Cmask: {
+        const auto col_buf_id =
+            (reg_addr - ContextRegs::CbColor0Cmask) /
+            (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
+        ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
+
+        const auto nop_offset = header->type3.count;
+        if (nop_offset == 0x04) {
+            ASSERT_MSG(payload[nop_offset] == 0xc0001000,
+                       "NOP hint is missing in CB setup sequence");
+            last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
+        }
+        break;
+    }
+    case ContextRegs::DbZInfo: {
+        if (header->type3.count == 8) {
+            ASSERT_MSG(payload[20] == 0xc0001000,
+                       "NOP hint is missing in DB setup sequence");
+            last_db_extent.raw = payload[21];
+        } else {
+            last_db_extent.raw = 0;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void Liverpool::ExecuteEventWrite(const PM4Header* header) {
+    const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+    LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
+              magic_enum::enum_name(event->event_type.Value()),
+              magic_enum::enum_name(event->event_index.Value()));
+    if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
+        // TODO: handle proper synchronization, for now signal that update is done
+        // immediately
+        regs.cp_strmout_cntl.offset_update_done = 1;
+        MirrorObject(&regs.cp_strmout_cntl, sizeof(regs.cp_strmout_cntl));
+    } else if (event->event_index.Value() == EventIndex::ZpassDone) {
+        if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+            static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
+            static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
+            u64* results = event->Address<u64*>();
+            const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
+            const s32 pairs = num_counter_pairs;
+            RasterRun([this, results, counter_value, pairs] {
+                if (rasterizer) {
+                    rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
+                                                 pairs * 16);
+                }
+                u64* out = results;
+                for (s32 i = 0; i < pairs; ++i, out += 2) {
+                    *out = counter_value;
+                }
+            });
+            pixel_counter += OcclusionCounterStep;
+        }
+    }
+}
+
 /// The graphics queue's SET_SH_REG, DISPATCH_DIRECT and WRITE_DATA: the walk's cases, also run for the entries of a direct buffer.
 void Liverpool::ExecuteSetShReg(const PM4Header* header) {
     const u32 count = header->type3.NumWords();
@@ -2021,9 +2128,15 @@ void Liverpool::ExecuteWriteData(const PM4Header* header) {
 
 /// A pure graphics command buffer: the entries copied at submit (Core::NativeDirect::Build), executed in order. No packet is decoded;
 /// every entry runs the function the walk runs for its packet.
-Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct) {
+Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
     cblock.Reset();
+    // the constant engine buffer of the submission runs as its own task next to the entries, as in the walk
+    Task ce_task{};
+    if (!ccb.empty()) {
+        ce_task = ProcessCeUpdate(ccb);
+        RESUME_GFX(ce_task);
+    }
     Core::EntryDump::Span entry_dump{0, reinterpret_cast<const u32*>(direct->begin), direct->dwords};
     using Core::NativeDirect::EntryKind;
     for (const auto& entry : direct->entries) {
@@ -2040,6 +2153,16 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             const auto* packet = reinterpret_cast<const PM4Header*>(direct->PacketWords(entry));
             if (entry.opcode == 0x76) {
                 ExecuteSetShReg(packet);
+            } else if (entry.opcode == 0x69) {
+                ExecuteSetContextReg(packet);
+            } else if (entry.opcode == 0x46) {
+                ExecuteEventWrite(packet);
+            } else if (entry.opcode == 0x85) {
+                ++cblock.de_count;
+            } else if (entry.opcode == 0x86) {
+                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                    RESUME_GFX(ce_task);
+                }
             } else if (entry.opcode == 0x15) {
                 ExecuteDispatchDirect(packet, direct->begin);
             } else if (entry.opcode == 0x37) {
@@ -2075,6 +2198,12 @@ Liverpool::Task Liverpool::ProcessDirect(std::shared_ptr<Core::NativeDirect::Buf
             break;
         }
         }
+    }
+    if (ce_task.handle) {
+        while (!ce_task.handle.done()) {
+            RESUME_GFX(ce_task);
+        }
+        ce_task.handle.destroy();
     }
     FIBER_EXIT;
 }
@@ -2237,77 +2366,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
-                const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
-                const auto* payload = reinterpret_cast<const u32*>(header + 2);
-
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                MirrorRegs(reg_addr, count - 1);
-
-                // In the case of HW, render target memory has alignment as color block operates on
-                // tiles. There is no information of actual resource extents stored in CB context
-                // regs, so any deduction of it from slices/pitch will lead to a larger surface
-                // created. The same applies to the depth targets. Fortunately, the guest always
-                // sends a trailing NOP packet right after the context regs setup, so we can use the
-                // heuristic below and extract the hint to determine actual resource dims.
-
-                switch (reg_addr) {
-                case ContextRegs::CbColor0Base:
-                case ContextRegs::CbColor1Base:
-                case ContextRegs::CbColor2Base:
-                case ContextRegs::CbColor3Base:
-                case ContextRegs::CbColor4Base:
-                case ContextRegs::CbColor5Base:
-                case ContextRegs::CbColor6Base:
-                case ContextRegs::CbColor7Base: {
-                    const auto col_buf_id = (reg_addr - ContextRegs::CbColor0Base) /
-                                            (ContextRegs::CbColor1Base - ContextRegs::CbColor0Base);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x0e || nop_offset == 0x0d || nop_offset == 0x0b) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    } else {
-                        last_cb_extent[col_buf_id].raw = 0;
-                    }
-                    break;
-                }
-                case ContextRegs::CbColor0Cmask:
-                case ContextRegs::CbColor1Cmask:
-                case ContextRegs::CbColor2Cmask:
-                case ContextRegs::CbColor3Cmask:
-                case ContextRegs::CbColor4Cmask:
-                case ContextRegs::CbColor5Cmask:
-                case ContextRegs::CbColor6Cmask:
-                case ContextRegs::CbColor7Cmask: {
-                    const auto col_buf_id =
-                        (reg_addr - ContextRegs::CbColor0Cmask) /
-                        (ContextRegs::CbColor1Cmask - ContextRegs::CbColor0Cmask);
-                    ASSERT(col_buf_id < NUM_COLOR_BUFFERS);
-
-                    const auto nop_offset = header->type3.count;
-                    if (nop_offset == 0x04) {
-                        ASSERT_MSG(payload[nop_offset] == 0xc0001000,
-                                   "NOP hint is missing in CB setup sequence");
-                        last_cb_extent[col_buf_id].raw = payload[nop_offset + 1];
-                    }
-                    break;
-                }
-                case ContextRegs::DbZInfo: {
-                    if (header->type3.count == 8) {
-                        ASSERT_MSG(payload[20] == 0xc0001000,
-                                   "NOP hint is missing in DB setup sequence");
-                        last_db_extent.raw = payload[21];
-                    } else {
-                        last_db_extent.raw = 0;
-                    }
-                    break;
-                }
-                default:
-                    break;
-                }
+                ExecuteSetContextReg(header);
                 break;
             }
             case PM4ItOpcode::SetShReg: {
@@ -2610,35 +2669,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::EventWrite: {
-                const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
-                LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
-                          magic_enum::enum_name(event->event_type.Value()),
-                          magic_enum::enum_name(event->event_index.Value()));
-                if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
-                    // TODO: handle proper synchronization, for now signal that update is done
-                    // immediately
-                    regs.cp_strmout_cntl.offset_update_done = 1;
-                    MirrorObject(&regs.cp_strmout_cntl, sizeof(regs.cp_strmout_cntl));
-                } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                    if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        const u64 counter_value = pixel_counter | OcclusionCounterValidMask;
-                        const s32 pairs = num_counter_pairs;
-                        RasterRun([this, results, counter_value, pairs] {
-                            if (rasterizer) {
-                                rasterizer->NoteCpGuestWrite(reinterpret_cast<VAddr>(results),
-                                                             pairs * 16);
-                            }
-                            u64* out = results;
-                            for (s32 i = 0; i < pairs; ++i, out += 2) {
-                                *out = counter_value;
-                            }
-                        });
-                        pixel_counter += OcclusionCounterStep;
-                    }
-                }
+                ExecuteEventWrite(header);
                 break;
             }
             case PM4ItOpcode::EventWriteEos: {
@@ -3282,7 +3313,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
 
     auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
     const bool run_direct = direct && direct->pure && Core::NativeDirect::ExecuteEnabled();
-    auto task = run_direct ? ProcessDirect(direct) : ProcessGraphics(dcb, ccb, std::move(direct));
+    auto task = run_direct ? ProcessDirect(direct, ccb) : ProcessGraphics(dcb, ccb, std::move(direct));
     Core::NativeDraw::Live().direct_executed.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
         std::scoped_lock lock{queue.m_access};

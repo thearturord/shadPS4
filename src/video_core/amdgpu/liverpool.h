@@ -231,11 +231,13 @@ private:
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, std::shared_ptr<Core::NativeDirect::Buffer> direct = {});
-    Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct);
+    Task ProcessDirect(std::shared_ptr<Core::NativeDirect::Buffer> direct, std::span<const u32> ccb = {});
     Task DirectWait(const PM4CmdWaitRegMem& wait);
     void StartNativeTag(const u32* tag);
     void ExecuteDma(const PM4DmaData& dma);
     void ExecuteSetShReg(const PM4Header* header);
+    void ExecuteSetContextReg(const PM4Header* header);
+    void ExecuteEventWrite(const PM4Header* header);
     void ExecuteDispatchDirect(const PM4Header* header, u64 base_addr);
     void ExecuteWriteData(const PM4Header* header);
     Task ProcessCeUpdate(std::span<const u32> ccb);

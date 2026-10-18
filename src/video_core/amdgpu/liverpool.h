@@ -104,9 +104,6 @@ public:
     [[nodiscard]] CbDbExtent& RasterDbExtent() noexcept {
         return *raster_db_extent;
     }
-    [[nodiscard]] ComputeProgram& RasterCsRegs() noexcept {
-        return raster_cs ? *raster_cs : GetCsRegs();
-    }
     /// True while the raster thread runs the rasterizer (cp_split_mode): the pipeline lookup is
     /// then done by the command processor thread.
     [[nodiscard]] bool SplitActive() const noexcept {
@@ -451,7 +448,6 @@ private:
     DrawRegs* raster_state{&direct_state};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS>* raster_cb_extent{&last_cb_extent};
     CbDbExtent* raster_db_extent{&last_db_extent};
-    ComputeProgram* raster_cs{};
     bool split_active{};
     std::unique_ptr<RasterSplit> split;
     const u32 fence_wait_shortcut;

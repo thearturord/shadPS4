@@ -234,7 +234,6 @@ struct Liverpool::RasterSplit {
     DrawRegs state{}; ///< the draw state the raster thread reads
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
     CbDbExtent db_extent{};
-    ComputeProgram cs{};
 };
 
 void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
@@ -247,7 +246,6 @@ void Liverpool::BindRasterizer(Vulkan::Rasterizer* rasterizer_) {
         raster_state = &direct_state;
         raster_cb_extent = &last_cb_extent;
         raster_db_extent = &last_db_extent;
-        raster_cs = nullptr;
         split.reset();
     }
     rasterizer = rasterizer_;
@@ -263,11 +261,9 @@ void Liverpool::StartRasterSplit() {
     sp.state = front_state;
     sp.cb_extent = last_cb_extent;
     sp.db_extent = last_db_extent;
-    sp.cs = mapped_queues[GfxQueueId].cs_state;
     raster_state = &sp.state;
     raster_cb_extent = &sp.cb_extent;
     raster_db_extent = &sp.db_extent;
-    raster_cs = &sp.cs;
     split_active = true;
     sp.thread = std::jthread{std::bind_front(&Liverpool::RasterMain, this)};
     sp.housekeeping = std::jthread{[](std::stop_token stoken) {
@@ -955,6 +951,26 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
                 dwords[dword] = draw.regs[i].value;
             }
         }
+        if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
+            ComputeProgram alone{};
+            auto* alone_dwords = reinterpret_cast<u32*>(&alone);
+            for (u32 i = 0; i < draw.count; ++i) {
+                const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
+                if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
+                    alone_dwords[dword] = draw.regs[i].value;
+                }
+            }
+            auto& live = Core::NativeDraw::Live();
+            live.cs_audit_dispatches.fetch_add(1, std::memory_order_relaxed);
+            bool differs = false;
+            for (u32 i = 0; i < sizeof(ComputeProgram) / sizeof(u32) && i < live.cs_audit_dword.size(); ++i) {
+                if (dwords[i] != alone_dwords[i]) {
+                    live.cs_audit_dword[i].fetch_add(1, std::memory_order_relaxed);
+                    differs = true;
+                }
+            }
+            live.cs_audit_differing.fetch_add(differs ? 1 : 0, std::memory_order_relaxed);
+        }
         RasterCall dispatch{};
         dispatch.kind = RasterCall::Kind::DispatchDirect;
         if (draw.fill_dwords != 0 && asc_vqid == ~0u && Core::NativeResources::ImageCopyEnabled()) {
@@ -1088,6 +1104,7 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
             rasterizer->ScopeMarker(c.marker, fmt::make_format_args(cmd_address), body);
         }
     };
+    const ComputeProgram& cs_program = dispatch_plan ? dispatch_plan->cs : GetCsRegs();
     switch (c.kind) {
     case RasterCall::Kind::Draw:
         rasterizer->SetNativeTag(c.tag);
@@ -1113,19 +1130,19 @@ void Liverpool::ExecRasterCall(const RasterCall& c, const Vulkan::DrawPlan* draw
         if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
             static u32 compute_debug = 0;
             if (compute_debug++ < 6) {
-                const auto& program = RasterCsRegs();
+                const auto& program = cs_program;
                 LOG_INFO(Render, "native compute verify: marker {} initiator {:#x} dims {} {} {} address {:#x} split {}",
                          c.marker, program.dispatch_initiator, program.dim_x, program.dim_y, program.dim_z,
                          static_cast<u64>(program.address), split_active);
             }
-            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&RasterCsRegs()));
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&cs_program));
         }
         run([&] { rasterizer->DispatchDirect(dispatch_plan); });
         break;
     case RasterCall::Kind::DispatchIndirect:
         rasterizer->NativeInvalidate();
         if (c.tag.valid && c.tag.seq != 0 && (c.tag.meta & VideoCore::NativeTagExecFlag) == 0) {
-            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&RasterCsRegs()));
+            Core::NativeDraw::VerifyComputeRecord(c.tag.seq, reinterpret_cast<const u32*>(&cs_program));
         }
         run([&] {
             rasterizer->DispatchIndirect(c.args_addr, c.offset, c.dispatch_size, dispatch_plan);
@@ -1210,10 +1227,6 @@ void Liverpool::RasterMain(std::stop_token stoken) {
             if (op.has_call) {
                 sp.cb_extent = op.cb_extent;
                 sp.db_extent = op.db_extent;
-                if (op.call.kind == RasterCall::Kind::DispatchDirect ||
-                    op.call.kind == RasterCall::Kind::DispatchIndirect) {
-                    sp.cs = op.cs;
-                }
                 ExecRasterCall(op.call, op.draw_plan.get(), op.dispatch_plan.get());
                 const u64 op_ns = VideoCore::ReadbackStats::NowNs() - op_start;
                 if (op.call.kind == RasterCall::Kind::Draw ||

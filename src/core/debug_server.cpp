@@ -132,6 +132,19 @@ nlohmann::json Native(const Params&) {
     j["sync_acquires_stripped"] = live.sync_acquires_stripped.load();
     j["sync_events_stripped"] = live.sync_events_stripped.load();
     j["barrier_calls_skipped"] = live.barrier_calls_skipped.load();
+    {
+        nlohmann::json audit;
+        audit["dispatches"] = live.cs_audit_dispatches.load();
+        audit["differing"] = live.cs_audit_differing.load();
+        nlohmann::json dwords = nlohmann::json::object();
+        for (size_t i = 0; i < live.cs_audit_dword.size(); ++i) {
+            if (const u64 count = live.cs_audit_dword[i].load(); count != 0) {
+                dwords[std::to_string(i)] = count;
+            }
+        }
+        audit["differing_dwords"] = dwords;
+        j["cs_audit"] = audit;
+    }
     j["map_native"] = {{"tried", live.map_tried.load()}, {"patched", live.map_patched.load()}, {"refused", live.map_refused.load()}, {"executed", live.map_exec.load()}};
     j["fetch_rebuild"] = {{"tried", live.fetch_rebuild_tried.load()}, {"rebuilt", live.fetch_rebuilt.load()}, {"refused", live.fetch_rebuild_refused.load()}, {"executed", live.fetch_rebuild_exec.load()}};
     j["sync_converted_hook"] = live.sync_converted_hook.load();

@@ -383,7 +383,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     VideoCore::ReadbackStats::CpTimer timer{VideoCore::ReadbackStats::CpTime::PipelineLookup};
     if (!lookup_regs_pinned) {
         lookup_regs = &liverpool->RasterRegs();
-        lookup_cs = &liverpool->RasterCsRegs();
+        lookup_cs = &liverpool->GetCsRegs();
     }
     if (!RefreshComputeKey()) {
         return nullptr;

@@ -112,6 +112,7 @@ struct DrawPlan {
 
 struct DispatchPlan {
     const ComputePipeline* pipeline{}; ///< Null if the pipeline lookup failed.
+    AmdGpu::ComputeProgram cs{};       ///< The compute program of this dispatch: the rasterizer reads it from here.
     StagePlan stage{};
 };
 

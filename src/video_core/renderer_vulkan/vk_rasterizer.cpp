@@ -427,6 +427,7 @@ std::unique_ptr<DispatchPlan> Rasterizer::PlanDispatch(const AmdGpu::ComputeProg
         plan = std::make_unique<DispatchPlan>();
     }
     pipeline_cache.PlanCompute(cs, *plan);
+    plan->cs = cs;
     return plan;
 }
 
@@ -787,7 +788,8 @@ void Rasterizer::DispatchDirect(const DispatchPlan* plan) {
         return;
     }
 
-    const auto& cs_program = liverpool->RasterCsRegs();
+    current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
+    const auto& cs_program = *current_cs;
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
@@ -823,7 +825,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Dis
 
     scheduler.PopPendingOperations();
 
-    const auto& cs_program = liverpool->RasterCsRegs();
+    current_cs = plan ? &plan->cs : &liverpool->GetCsRegs();
     const ComputePipeline* pipeline = ResolveDispatchPipeline(plan);
     if (!pipeline) {
         return;
@@ -1213,7 +1215,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->RasterCsRegs();
+    const auto& cs_pgm = *current_cs;
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() < 2 || info.buffers.size() > 3 ||
         !info.images.empty()) {
@@ -1270,7 +1272,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->RasterCsRegs();
+    const auto& cs_pgm = *current_cs;
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() < 2 || info.buffers.size() > 3 ||
         !info.images.empty()) {
@@ -1373,7 +1375,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
-                const auto& cs_program = liverpool->RasterCsRegs();
+                const auto& cs_program = *current_cs;
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);

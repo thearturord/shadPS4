@@ -136,6 +136,7 @@ struct Liverpool::RasterCall {
     bool no_marker{}; ///< Run without a ScopeMarker.
     u32 vqid{};
     const void* cmd_address{}; ///< Only printed in markers, never dereferenced.
+    const ComputeProgram* cs_override{}; ///< Dispatch: this program instead of the queue's (valid until RasterDispatch returns).
     const char* marker{};      ///< Format string literal.
     bool indexed{};
     u32 index_offset{};
@@ -620,7 +621,7 @@ void Liverpool::RasterDispatch(const RasterCall& call_in) {
     op.db_extent = last_db_extent;
     if (call.kind == RasterCall::Kind::DispatchDirect ||
         call.kind == RasterCall::Kind::DispatchIndirect) {
-        op.cs = GetCsRegs();
+        op.cs = call.cs_override ? *call.cs_override : GetCsRegs();
         // The pipeline lookup runs here, on the command processor thread (stage 2 of the split).
         op.dispatch_plan = rasterizer->PlanDispatch(op.cs);
     } else {
@@ -942,24 +943,24 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     }
     if (draw.kind == 3 || draw.kind == 11) {
         // dispatch (kind 11: indirect, the group counts are read from the argument buffer): the record holds dwords of the compute program (user data, dimensions); applied for this dispatch only
+        // The dispatch runs on the program the record describes alone (a zeroed program with the record's dwords); `cs_zero_base` 0 applies the record to the
+        // queue's state instead, as before.
         ComputeProgram& program = GetCsRegs();
         const ComputeProgram saved_program = program;
+        const bool zero_base = split_active && VideoCore::ReadbackPolicy::Get().cs_zero_base.load(std::memory_order_relaxed) != 0;
+        ComputeProgram alone{};
+        auto* alone_dwords = reinterpret_cast<u32*>(&alone);
         auto* dwords = reinterpret_cast<u32*>(&program);
         for (u32 i = 0; i < draw.count; ++i) {
             const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
             if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
-                dwords[dword] = draw.regs[i].value;
-            }
-        }
-        if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
-            ComputeProgram alone{};
-            auto* alone_dwords = reinterpret_cast<u32*>(&alone);
-            for (u32 i = 0; i < draw.count; ++i) {
-                const u32 dword = draw.regs[i].index - Core::NativeDraw::ComputeRegisterBase;
-                if (dword < sizeof(ComputeProgram) / sizeof(u32)) {
-                    alone_dwords[dword] = draw.regs[i].value;
+                alone_dwords[dword] = draw.regs[i].value;
+                if (!zero_base) {
+                    dwords[dword] = draw.regs[i].value;
                 }
             }
+        }
+        if (!zero_base && VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
             auto& live = Core::NativeDraw::Live();
             live.cs_audit_dispatches.fetch_add(1, std::memory_order_relaxed);
             bool differs = false;
@@ -993,7 +994,10 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
         } else {
             dispatch.marker = "gfx:{}:NativeDispatch";
         }
-        if ((program.dispatch_initiator & 1) != 0) {
+        if (zero_base) {
+            dispatch.cs_override = &alone;
+        }
+        if (((zero_base ? alone : program).dispatch_initiator & 1) != 0) {
             RasterDispatch(dispatch);
         }
         program = saved_program;

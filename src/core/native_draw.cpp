@@ -1903,6 +1903,19 @@ u64 MakeRecord(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3, u64 caller) {
                 slot.regs[n++] = {UconfigBase + 0x24c, static_cast<u32>(a1)};
             }
             slot.regs[n++] = {UconfigBase + 0x24d, inline_instances != 0 ? inline_instances : 1u}; // DrawIndexedCommon and DrawAuto reset the instance count
+            // PrepareDraw hands the first vertex (base vertex of an indexed draw) and the first instance to the vertex shader in the
+            // user data registers its block names (bytes 0xe8 / 0xe9 of the block, 0 = not used)
+            if (vertex_shader != 0) {
+                const u32 vertex_location = Rd<u8>(vertex_shader + 0x30, 0xe8);
+                const u32 instance_location = Rd<u8>(vertex_shader + 0x30, 0xe9);
+                if (vertex_location != 0) {
+                    const u32 first_vertex = inline_instances != 0 ? Rd<u32>(ctx, 0x479c) : static_cast<u32>(kind == 0 ? a3 : a2);
+                    slot.regs[n++] = {ShBase + 0x4c + vertex_location, first_vertex};
+                }
+                if (instance_location != 0) {
+                    slot.regs[n++] = {ShBase + 0x4c + instance_location, inline_instances != 0 ? Rd<u32>(ctx, 0x47a0) : 0u};
+                }
+            }
         }
         if (kind == 2) {
             // indirect indexed draw: the argument buffer, the index buffer view and the registers that receive the
@@ -3564,6 +3577,30 @@ void ApplyTargetSideEffects(u64 ctx) {
     }
 }
 
+/// The shadow copies PrepareDraw keeps of the first vertex / first instance registers of the vertex stage (stage 2 of a
+/// vertex and pixel pipeline), so that the game's own draws after an executed one write what the hardware lacks.
+void FirstVertexShadows(u64 ctx) {
+    constexpr u32 Stage = 2;
+    const u64 vertex_shader = Rd<u64>(ctx, Ctx::VertexShader);
+    if (vertex_shader == 0) {
+        return;
+    }
+    const u32 vertex_location = Rd<u8>(vertex_shader + 0x30, 0xe8);
+    const u32 instance_location = Rd<u8>(vertex_shader + 0x30, 0xe9);
+    if (vertex_location == 0) {
+        Wr<u32>(ctx, 0x4764 + Stage * 4, 0);
+    } else {
+        Wr<u32>(ctx, 0x472c + Stage * 4, Rd<u32>(ctx, 0x479c));
+        Wr<u32>(ctx, 0x4764 + Stage * 4, vertex_location);
+    }
+    if (instance_location == 0) {
+        Wr<u32>(ctx, 0x4780 + Stage * 4, 0);
+    } else {
+        Wr<u32>(ctx, 0x4748 + Stage * 4, Rd<u32>(ctx, 0x47a0));
+        Wr<u32>(ctx, 0x4780 + Stage * 4, instance_location);
+    }
+}
+
 /// What the game's draw functions and PrepareDraw leave in the engine's objects besides command packets.
 void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     if (kind == 2) {
@@ -3583,6 +3620,7 @@ void ExecSideEffects(u64 ctx, u32 kind, u64 a1, u64 a2, u64 a3) {
     }
     Wr<u32>(ctx, 0x479c, static_cast<u32>(kind == 0 ? a3 : a2));
     Wr<u32>(ctx, 0x47a0, 0);
+    FirstVertexShadows(ctx);
     Wr<u32>(ctx, 0x30, Rd<u32>(ctx, 0x30) + 1);
     Wr<u32>(ctx, 0x38, Rd<u32>(ctx, 0x38) + static_cast<u32>(a1));
     const u32 stamp = Rd<u32>(ctx, 0x47ac);
@@ -3612,6 +3650,7 @@ thread_local bool skip_cue_flush = false;
 /// What PrepareDraw itself leaves in the engine's objects (the draw function around it does its own counters).
 void PrepareDrawSideEffects(u64 ctx) {
     Wr<u32>(ctx, 0x47a0, 0);
+    FirstVertexShadows(ctx);
     const u32 stamp = Rd<u32>(ctx, 0x47ac);
     for (const u64 object : {Rd<u64>(ctx, Ctx::VertexShader), Rd<u64>(ctx, Ctx::PixelShader), Rd<u64>(ctx, Ctx::BlendState),
                              Rd<u64>(ctx, Ctx::RasterizerState), Rd<u64>(ctx, Ctx::DepthStencilState)}) {
@@ -3720,6 +3759,14 @@ u64 Tag(u64 ctx, u64 a1, u64 a2, u64 a3, u64 ret, u32 kind, bool track, bool inl
     if (((policy.native_draw_classes.load(std::memory_order_relaxed) >> cls) & 1) == 0) {
         tags_skipped_class.fetch_add(1, std::memory_order_relaxed);
         return 0;
+    }
+    if (policy.exclude_callers[0].load(std::memory_order_relaxed) != 0) {
+        const u32 site = static_cast<u32>(ret - ImageBase() + 0x1000000);
+        for (const auto& excluded : policy.exclude_callers) {
+            if (excluded.load(std::memory_order_relaxed) == site) {
+                return 0;
+            }
+        }
     }
     // The game's resource tracking runs first (as it does at the start of PrepareDraw): it may update view descriptors
     // and write barrier packets or draw internal quads, which then come before the tag.

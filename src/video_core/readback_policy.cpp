@@ -91,6 +91,19 @@ bool Set(std::string_view name, s64 value) {
         s.rt_reuse_override = static_cast<s32>(value);
     } else if (name == "stage_reuse") {
         s.stage_reuse_override = static_cast<s32>(value);
+    } else if (name == "exclude_caller") {
+        if (value == 0) {
+            for (auto& c : s.exclude_callers) {
+                c = 0;
+            }
+        } else {
+            for (auto& c : s.exclude_callers) {
+                u32 expected = 0;
+                if (c.compare_exchange_strong(expected, static_cast<u32>(value)) || expected == static_cast<u32>(value)) {
+                    break;
+                }
+            }
+        }
     } else if (name == "packet_path") {
         s.packet_path = static_cast<s32>(value);
     } else if (name == "cs_zero_base") {

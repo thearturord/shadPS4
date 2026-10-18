@@ -7,9 +7,11 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 #include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
@@ -283,6 +285,7 @@ bool InstallHook(Hook& hook, u8* image_base, u64 image_size) {
     }
     u8 original[MaxDisplacedBytes];
     std::memcpy(original, entry, displaced);
+    LOG_INFO(Core, "guest hook '{}' code bytes {}", hook.name, fmt::format("{:02x}", fmt::join(std::span<const u8>{entry, 8}, "")));
 
     const u64 storage_size =
         RingHeaderSize +
@@ -363,6 +366,31 @@ void InstallForEboot(VAddr base, u64 image_size) {
             ring_entries > (1u << 24)) {
             LOG_WARNING(Core, "guest hooks: ring_entries must be a power of two in 16..16M, using 16384");
             ring_entries = 16384;
+        }
+
+        // The hook file is made for one build of the game's code: where an entry names the bytes the code must have, all of them must match.
+        u32 mismatches = 0;
+        for (const auto& item : config.at("hooks")) {
+            if (!item.contains("expect")) {
+                continue;
+            }
+            const auto address = item.contains("ghidra") ? ParseHex(item.at("ghidra")) - ghidra_base : ParseHex(item.at("offset"));
+            const auto expect = item.at("expect").get<std::string>();
+            std::string found;
+            if (address + expect.size() / 2 <= image_size) {
+                found = fmt::format("{:02x}", fmt::join(std::span<const u8>{reinterpret_cast<const u8*>(base) + address, expect.size() / 2}, ""));
+            }
+            if (found != expect) {
+                if (mismatches++ < 3) {
+                    LOG_ERROR(Core, "guest hooks: '{}' expects the code bytes {} at {:#x}, the game has {}", item.value("name", std::string()),
+                              expect, address, found);
+                }
+            }
+        }
+        if (mismatches != 0) {
+            LOG_ERROR(Core, "guest hooks: {} hooks do not match this build of the game (the hook file is made for The Last Guardian 1.03): no hook is installed",
+                      mismatches);
+            return;
         }
 
         u32 installed = 0;

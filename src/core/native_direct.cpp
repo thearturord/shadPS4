@@ -8,6 +8,7 @@
 #include <string>
 #include <fmt/format.h>
 #include "common/logging/log.h"
+#include "core/guest_hooks.h"
 #include "core/native_direct.h"
 #include "core/native_draw.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -220,7 +221,8 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
 } // namespace
 
 bool PacketPathOff() {
-    return VideoCore::ReadbackPolicy::Get().packet_path.load(std::memory_order_relaxed) == 0;
+    // Without the game's hooks no draw is a record: the packets are all there is.
+    return VideoCore::ReadbackPolicy::Get().packet_path.load(std::memory_order_relaxed) == 0 && GuestHooks::IsActive();
 }
 
 bool ExecuteEnabled() {

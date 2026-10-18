@@ -6,6 +6,8 @@
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/signal_context.h"
+#include "core/linker.h"
+#include "core/module.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
@@ -172,6 +174,33 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
                 }
             }
             LOG_CRITICAL(Debug, "stack top: {}", frames);
+            // where the code and the values on the stack are: module, offset in it (and the address in the Ghidra project for the eboot)
+            if (auto* linker = Common::Singleton<Core::Linker>::Instance()) {
+                const auto describe = [&](u64 value) -> std::string {
+                    if (const auto* module = linker->FindByAddress(value)) {
+                        const u64 offset = value - module->GetBaseAddress();
+                        const std::string name = module->file.filename().string();
+                        return fmt::format("{}+{:#x}{}", name, offset, name == "eboot.bin" ? fmt::format(" (ghidra {:#x})", offset + 0x1000000) : std::string{});
+                    }
+                    return "-";
+                };
+                std::string where = fmt::format("rip {}", describe(c.Rip));
+                if (!IsBadReadPtr(stack, 8 * 12)) {
+                    for (int i = 0; i < 12; ++i) {
+                        if (const std::string d = describe(stack[i]); d != "-") {
+                            where += fmt::format("; stack[{}] {}", i, d);
+                        }
+                    }
+                }
+                LOG_CRITICAL(Debug, "code at: {}", where);
+                std::string modules;
+                for (s32 i = 0; i < 64; ++i) {
+                    if (const auto* module = linker->GetModule(i)) {
+                        modules += fmt::format("{} {:#x}+{:#x}; ", module->file.filename().string(), module->GetBaseAddress(), module->aligned_base_size);
+                    }
+                }
+                LOG_CRITICAL(Debug, "modules: {}", modules);
+            }
         }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }

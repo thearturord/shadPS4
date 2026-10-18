@@ -41,6 +41,8 @@ struct LiveCounters {
     /// draws of a shader without a fetch object yet (`native_sdk_strip` bit 2147483648): the game's draw function ran, the record was built again afterwards
     /// the texture map helper's upload dispatch (`map_native`): calls seen, records patched into the tag, refused, executed
     /// compute program audit (`cs_audit`): record dispatches seen, those whose program (queue state plus record) differs from the record alone on a zeroed program, and the dwords that differ
+    /// `native_packet_path` 0: command buffers that are not pure and the packets of them that were not executed
+    std::atomic<u64> packet_path_skipped_buffers{}, packet_path_skipped_packets{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};
     std::atomic<u64> map_tried{}, map_patched{}, map_refused{}, map_exec{};

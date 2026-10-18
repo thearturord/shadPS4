@@ -62,6 +62,9 @@ private:
 /// Pure graphics buffers run from the list (bit 8388608 of `native_sdk_strip`, needs the bit above).
 bool ExecuteEnabled();
 
+/// Setting `native_packet_path` 0 (live `/set?packet_path=0`): the packet walk is off. A buffer that is not pure runs from its entries; its other packets are not executed.
+bool PacketPathOff();
+
 /// Direct submission is on: execution, the sync tags and the setting for it (bit 4194304 of `native_sdk_strip`).
 bool Enabled();
 

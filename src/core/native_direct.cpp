@@ -219,6 +219,10 @@ void AddSpan(Buffer& buffer, const u32* begin, u32 dwords, u32 depth, bool marke
 
 } // namespace
 
+bool PacketPathOff() {
+    return VideoCore::ReadbackPolicy::Get().packet_path.load(std::memory_order_relaxed) == 0;
+}
+
 bool ExecuteEnabled() {
     return Enabled() && (VideoCore::ReadbackPolicy::Get().native_sdk_strip.load(std::memory_order_relaxed) & 8388608) != 0;
 }
@@ -280,6 +284,18 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
         }
     }
     buffer->pure = other_total == 0;
+    if (!buffer->pure && PacketPathOff()) {
+        auto& live_off = Core::NativeDraw::Live();
+        live_off.packet_path_skipped_buffers.fetch_add(1, std::memory_order_relaxed);
+        live_off.packet_path_skipped_packets.fetch_add(other_total, std::memory_order_relaxed);
+        static std::mutex off_mutex;
+        static std::set<std::string> off_signatures;
+        std::scoped_lock off_lock{off_mutex};
+        if (off_signatures.size() < 64 && off_signatures.insert(key).second) {
+            LOG_ERROR(Core, "packet path is off: {} packets of a command buffer (queue {}, {} dwords) are not executed (opcode:count):{}", other_total, queue, dwords,
+                      signature);
+        }
+    }
     buffer->complete = buffer->other[OtherBadPacket] == 0 && buffer->other[OtherIndirect] == 0 && buffer->other[OtherConstantBuffer] == 0;
     auto& live = Core::NativeDraw::Live();
     live.direct_built.fetch_add(1, std::memory_order_relaxed);

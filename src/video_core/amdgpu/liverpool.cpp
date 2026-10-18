@@ -3312,7 +3312,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     auto direct = Core::NativeDirect::Build(0, dcb.data(), static_cast<u32>(dcb.size()), !ccb.empty(), guest_markers_enabled);
-    const bool run_direct = direct && direct->pure && Core::NativeDirect::ExecuteEnabled();
+    const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
     auto task = run_direct ? ProcessDirect(direct, ccb) : ProcessGraphics(dcb, ccb, std::move(direct));
     Core::NativeDraw::Live().direct_executed.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {
@@ -3331,7 +3331,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     auto direct = Core::NativeDirect::Build(gnm_vqid, acb.data(), static_cast<u32>(acb.size()), false, guest_markers_enabled);
-    const bool run_direct = direct && direct->pure && Core::NativeDirect::ExecuteEnabled();
+    const bool run_direct = direct && (direct->pure || Core::NativeDirect::PacketPathOff()) && Core::NativeDirect::ExecuteEnabled();
     const auto& task = run_direct ? ProcessDirectAsc(direct, vqid) : ProcessCompute(acb, vqid, std::move(direct));
     Core::NativeDraw::Live().direct_executed_asc.fetch_add(run_direct ? 1 : 0, std::memory_order_relaxed);
     {

@@ -914,7 +914,6 @@ void Rasterizer::OnSubmit() {
     }
     buffer_cache.TickFrame();
     ProcessDownloadImages();
-    buffer_cache.AdvanceHotEpoch();
     texture_cache.RunGarbageCollector();
     runtime.TickFrame();
 }
@@ -940,7 +939,7 @@ void Rasterizer::ProcessReadbacksSync() {
     constexpr u64 MaxBatchBytes = 256_MB;
     VideoCore::ReadbackBatch batch{scheduler, MaxBatchBytes};
     texture_cache.RecordImageDownloads(batch);
-    buffer_cache.PrefetchHotRanges(batch);
+    buffer_cache.ApplyPendingUnmarks();
 }
 
 void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::FenceKind kind,
@@ -968,7 +967,7 @@ void Rasterizer::OnFence(Common::UniqueFunction<void>&& signal, VideoCore::Fence
     constexpr u64 MaxBatchBytes = 256_MB;
     VideoCore::ReadbackBatch batch{scheduler, MaxBatchBytes};
     texture_cache.RecordImageDownloads(batch, kind);
-    buffer_cache.PrefetchHotRanges(batch, true, kind);
+    buffer_cache.ApplyPendingUnmarks();
     const bool has_copies = !batch.Empty();
     // Async image copies are written to the guest by the priority thread once the GPU runs them;
     // the fence does not wait for them but their command buffer must reach the GPU soon.

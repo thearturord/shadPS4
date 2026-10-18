@@ -25,7 +25,6 @@ bool IsEmulatorThread() {
 
 void InitFromSettings() {
     auto& s = Get();
-    s.prefetch_lifetime = EmulatorSettings.GetReadbackPrefetchLifetime();
     s.full_fence_kinds = EmulatorSettings.GetCpFullFenceKinds();
     s.images_async = EmulatorSettings.IsReadbackLinearImagesAsync();
     s.dma_async = EmulatorSettings.IsReadbackDmaAsync();
@@ -43,14 +42,8 @@ void InitFromSettings() {
 
 bool Set(std::string_view name, s64 value) {
     auto& s = Get();
-    if (name == "prefetch_kinds_mask") {
-        s.prefetch_kinds_mask = static_cast<u32>(value);
-    } else if (name == "image_download_kinds_mask") {
+    if (name == "image_download_kinds_mask") {
         s.image_download_kinds_mask = static_cast<u32>(value);
-    } else if (name == "prefetch_mode_override") {
-        s.prefetch_mode_override = static_cast<s32>(value);
-    } else if (name == "prefetch_lifetime") {
-        s.prefetch_lifetime = static_cast<u32>(value);
     } else if (name == "full_fence_kinds") {
         s.full_fence_kinds = static_cast<u32>(value);
     } else if (name == "images_async") {
@@ -133,10 +126,7 @@ nlohmann::json Dump() {
     return {{"skip_shadows", s.skip_shadows.load()},
             {"skipped_draws", s.skipped_draws.load()},
             {"depth_only_draws_by_target", hist},
-            {"prefetch_kinds_mask", s.prefetch_kinds_mask.load()},
             {"image_download_kinds_mask", s.image_download_kinds_mask.load()},
-            {"prefetch_mode_override", s.prefetch_mode_override.load()},
-            {"prefetch_lifetime", s.prefetch_lifetime.load()},
             {"full_fence_kinds", s.full_fence_kinds.load()},
             {"images_async", s.images_async.load()},
             {"dma_async", s.dma_async.load()},

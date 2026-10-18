@@ -136,16 +136,6 @@ public:
         return async_recorded.exchange(0, std::memory_order_acq_rel) != 0;
     }
 
-    /// Records downloads of recently read back ranges that are GPU modified again.
-    /// With deferred_unmark the write backs may run outside the GPU thread.
-    void PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark = false,
-                           u32 fence_kind = ~0u);
-
-    /// Advances the fence counter used to expire hot ranges.
-    void AdvanceHotEpoch() {
-        ++hot_epoch;
-    }
-
     /// A guest memory write by the command processor (WriteData, occlusion results, DMA...).
     /// Drops reusable stream copies it overlaps.
     void NoteCpGuestWrite(VAddr device_addr, u64 size) {
@@ -192,11 +182,6 @@ private:
         u64 bytes{};
     };
 
-    struct HotRange {
-        VAddr end;
-        u64 last_fault_epoch;
-    };
-
     using DownloadCopies = boost::container::small_vector<vk::BufferCopy, 1>;
 
     DownloadResult DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
@@ -226,14 +211,9 @@ private:
     void FinishFaultReadback(VAddr device_addr, u64 size, bool is_write, VAddr window_start,
                              u64 window_size, u64& bytes);
 
-    void NoteHotRange(VAddr window_start, VAddr window_end, bool is_write);
-
     /// Unprotects the pages in the range that the GPU didn't write again since their data was
     /// downloaded. Must run on the GPU thread.
     void UnmarkSettledPages(VAddr device_addr, u64 size);
-
-    void LoadHotFile();
-    void SaveHotFile();
 
     /// Drops the reusable stream copies if a guest memory write overlaps them.
     void InvalidateStreamReuse(VAddr device_addr, u64 size);
@@ -298,27 +278,13 @@ private:
         const s32 override_mode = VideoCore::ReadbackPolicy::Get().stream_reuse_override.load(std::memory_order_relaxed);
         return override_mode >= 0 ? override_mode != 0 : stream_reuse_enabled;
     }
-    /// readback_prefetch_mode: 0 = no prefetch, 1 = read and write faults, 2 = read faults only.
-    const u32 prefetch_mode;
     /// readback_async_guest_faults: guest threads wait for their readbacks themselves.
     const bool async_guest_faults;
-    /// readback_prefetch_lifetime: fences a hot range stays prefetched after its last fault.
-    const u32 prefetch_lifetime;
     tsl::robin_map<u64, u64, Common::U64Hash> stream_reuse;
     u64 stream_reuse_tick{};
     u64 stream_reuse_wraps{};
     VAddr stream_reuse_min{~0ULL};
     VAddr stream_reuse_max{};
-
-    /// readback_hot_file: windows the game read (learned from read faults), loaded at start as
-    /// permanent prefetch ranges and written back when new ones are learned.
-    std::string hot_file;
-    std::map<VAddr, VAddr> hot_file_windows; // start -> end
-    std::unordered_set<VAddr> seeded_windows;
-    bool hot_file_dirty{};
-    u64 hot_file_last_write_ns{};
-    std::unordered_map<VAddr, HotRange> hot_ranges;
-    u64 hot_epoch{};
 
     /// Asynchronous downloads recorded but not landed in guest memory yet.
     struct InflightDownload {

@@ -16,14 +16,8 @@ namespace VideoCore::ReadbackPolicy {
 /// so with nothing changed the behavior is the one of the settings. All values are plain atomics read
 /// on the hot paths.
 struct State {
-    /// Fence kinds (bit mask, see FenceKind) whose fences prefetch the hot buffer ranges.
-    std::atomic<u32> prefetch_kinds_mask{~0u};
     /// Fence kinds whose fences download the bound linear images.
     std::atomic<u32> image_download_kinds_mask{~0u};
-    /// -1 = readback_prefetch_mode setting, otherwise 0 (off), 1 or 2.
-    std::atomic<s32> prefetch_mode_override{-1};
-    /// Fences a hot range stays prefetched after its last fault (readback_prefetch_lifetime).
-    std::atomic<u32> prefetch_lifetime{600};
     /// cp_full_fence_kinds.
     std::atomic<u32> full_fence_kinds{31};
     /// readback_linear_images_async.

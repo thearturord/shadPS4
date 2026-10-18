@@ -86,9 +86,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       stream_reuse_enabled{EmulatorSettings.IsReadbackStreamReuseEnabled()},
-      prefetch_mode{EmulatorSettings.GetReadbackPrefetchMode()},
       async_guest_faults{EmulatorSettings.IsReadbackAsyncGuestFaultsEnabled()},
-      prefetch_lifetime{EmulatorSettings.GetReadbackPrefetchLifetime()},
       memory_semaphore{instance} {
     const vk::BufferCreateInfo probe_ci = {
         .flags =
@@ -125,7 +123,6 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
         runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
-    LoadHotFile();
     Core::NativeReadbacks::SetLandingGate(
         [this](VAddr address, u64 size, u32 timeout_ms) { return WaitForExplicitDownloads(address, size, timeout_ms); });
 }
@@ -146,39 +143,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
     });
 }
 
-void BufferCache::LoadHotFile() {
-    hot_file = EmulatorSettings.GetReadbackHotFile();
-    if (hot_file.empty()) {
-        return;
-    }
-    std::ifstream in{hot_file};
-    unsigned long long start{}, end{};
-    while (in >> std::hex >> start >> end) {
-        if (end <= start) {
-            continue;
-        }
-        hot_file_windows[start] = end;
-        seeded_windows.insert(start);
-        hot_ranges[start].end = end;
-        hot_ranges[start].last_fault_epoch = 0;
-    }
-    LOG_INFO(Render_Vulkan, "readback_hot_file: {} windows loaded from {}", hot_file_windows.size(),
-             hot_file);
-}
-
 static u64 SteadyNowNs() {
     return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
                                 .count());
-}
-
-void BufferCache::SaveHotFile() {
-    hot_file_dirty = false;
-    hot_file_last_write_ns = SteadyNowNs();
-    std::ofstream out{hot_file, std::ios::trunc};
-    for (const auto& [start, end] : hot_file_windows) {
-        out << std::hex << start << ' ' << end << "\n";
-    }
 }
 
 std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr device_addr,
@@ -191,24 +159,6 @@ std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr d
     const VAddr window_end =
         std::min<VAddr>(std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
     return {window_start, window_end};
-}
-
-void BufferCache::NoteHotRange(VAddr window_start, VAddr window_end, bool is_write) {
-    const s32 mode_override = ReadbackPolicy::Get().prefetch_mode_override.load();
-    const u32 mode = mode_override >= 0 ? static_cast<u32>(mode_override) : prefetch_mode;
-    if (mode == 1 || (mode == 2 && !is_write)) {
-        // Remember ranges the CPU reads back so they can be prefetched at the next fence.
-        auto& hot_range = hot_ranges[window_start];
-        hot_range.end = window_end;
-        hot_range.last_fault_epoch = hot_epoch;
-        if (!is_write && !hot_file.empty()) {
-            auto& known_end = hot_file_windows[window_start];
-            if (known_end < window_end) {
-                known_end = window_end;
-                hot_file_dirty = true;
-            }
-        }
-    }
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
@@ -236,9 +186,6 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             ApplyPendingUnmarks();
         }
         FinishFaultReadback(device_addr, size, is_write, window_start, window_size, result.bytes);
-        if (result.bytes != 0) {
-            NoteHotRange(window_start, window_end, is_write);
-        }
     };
     if (assume_locks) {
         flush_request();
@@ -345,9 +292,6 @@ void BufferCache::ReadMemoryForGuest(VAddr device_addr, u64 size, bool is_write)
             if (scheduler.PriorityOperationsNeedSubmit()) {
                 scheduler.Flush();
             }
-        }
-        if (bytes != 0) {
-            NoteHotRange(window_start, window_start + window_size, is_write);
         }
     });
 
@@ -518,58 +462,6 @@ void BufferCache::UnmarkSettledPages(VAddr device_addr, u64 size) {
             memory_tracker->UnmarkRegionAsGpuModified(page_start, page_end - page_start, false);
         }
     });
-}
-
-void BufferCache::PrefetchHotRanges(ReadbackBatch& batch, bool deferred_unmark, u32 fence_kind) {
-    // Ranges that stop faulting are prefetched until they expire, then re-learned on the next
-    // fault. Expiry keeps ranges the game no longer reads from costing downloads forever.
-    ApplyPendingUnmarks();
-    if (ReadbackPolicy::ReadbacksMode() == 0) {
-        return;
-    }
-    const auto& policy = ReadbackPolicy::Get();
-    if (!(policy.prefetch_kinds_mask.load(std::memory_order_relaxed) & fence_kind) ||
-        policy.prefetch_mode_override.load(std::memory_order_relaxed) == 0) {
-        return;
-    }
-    const u32 lifetime = policy.prefetch_lifetime.load(std::memory_order_relaxed);
-    if (hot_file_dirty && SteadyNowNs() - hot_file_last_write_ns > 5'000'000'000ULL) {
-        SaveHotFile();
-    }
-    for (auto it = hot_ranges.begin(); it != hot_ranges.end();) {
-        if (seeded_windows.contains(it->first)) {
-            it->second.last_fault_epoch = hot_epoch;
-        } else if (hot_epoch - it->second.last_fault_epoch > lifetime) {
-            it = hot_ranges.erase(it);
-            continue;
-        }
-        const VAddr range_start = it->first;
-        const VAddr range_end = it->second.end;
-        ++it;
-        // Prefetched at every fence where the range is GPU modified again. Limiting this to once
-        // per frame made later writes in the frame fault, each costing a synchronous GPU wait.
-        if (!IsRegionGpuModified(range_start, range_end - range_start)) {
-            continue;
-        }
-        const Buffer* arena = address_space[range_start >> ARENA_PAGE_BITS];
-        if (!arena) {
-            continue;
-        }
-        const VAddr start = std::max(arena->cpu_addr, range_start);
-        const VAddr end = std::min(arena->cpu_addr + arena->size_bytes, range_end);
-        if (start >= end) {
-            continue;
-        }
-        DownloadCopies copies;
-        const u64 total_size_bytes = CollectDownloadCopies(arena, start, end - start, copies);
-        if (total_size_bytes == 0) {
-            continue;
-        }
-        batch.Reserve(total_size_bytes);
-        batch.Add(total_size_bytes, false,
-                  RecordDownloadCopies(arena, start, end - start, std::move(copies),
-                                       total_size_bytes, deferred_unmark));
-    }
 }
 
 void BufferCache::InvalidateStreamReuse(VAddr device_addr, u64 size) {

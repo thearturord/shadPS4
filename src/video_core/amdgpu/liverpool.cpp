@@ -374,6 +374,7 @@ void Liverpool::OverlaySet(u32 index, u32 value) {
     if (word == nullptr || *word == value) {
         return; // no member of the draw state covers the register, or it already holds the value
     }
+    InvalidateRegisterGroup(index);
     if (overlay.bits.empty()) {
         overlay.bits.assign((Regs::NumRegs + 63) / 64, 0);
     }
@@ -398,9 +399,106 @@ void Liverpool::OverlayRestore() {
             bits &= ~(1ull << (index & 63));
             u32* const word = front_state.Word(index);
             *word = regs.reg_array[index]; // what the command packets wrote
+            InvalidateRegisterGroup(index);
         }
     }
     overlay.list.clear();
+}
+
+namespace {
+constexpr u32 GroupOther = 0, GroupArguments = 1, GroupVsProgram = 2, GroupVsUserData = 3, GroupPsProgram = 4, GroupPsUserData = 5, GroupInterpolants = 6,
+              GroupTargets = 7;
+
+/// The group of a register of the draw state (only the grouping of the records' values; anything not listed is "other").
+const std::array<u8, Regs::NumRegs>& RegisterGroupTable() {
+    static const auto table = [] {
+        std::array<u8, Regs::NumRegs> t{};
+        const auto set = [&](u32 base, u32 first, u32 last, u32 group) {
+            for (u32 r = first; r <= last; ++r) {
+                t[base + r] = static_cast<u8>(group);
+            }
+        };
+        constexpr u32 Ctx = Regs::ContextRegWordOffset, Sh = Regs::ShRegWordOffset, Uc = Regs::UconfigRegWordOffset;
+        set(Uc, 0x24c, 0x24d, GroupArguments);
+        for (const u32 r : {0x29eu, 0x1f9u, 0x1fau, 0x102u}) {
+            t[Ctx + r] = GroupArguments;
+        }
+        set(Sh, 0x48, 0x4b, GroupVsProgram);
+        for (const u32 r : {0x207u, 0x1b1u, 0x1c3u, 0x2a8u, 0x2a9u}) {
+            t[Ctx + r] = GroupVsProgram;
+        }
+        set(Sh, 0x4c, 0x5b, GroupVsUserData);
+        set(Sh, 0x08, 0x0b, GroupPsProgram);
+        for (const u32 r : {0x1c4u, 0x1c5u, 0x1b3u, 0x1b4u, 0x1b6u, 0x1b8u, 0x203u, 0x8fu}) {
+            t[Ctx + r] = GroupPsProgram;
+        }
+        set(Sh, 0x0c, 0x1b, GroupPsUserData);
+        set(Ctx, 0x191, 0x1b0, GroupInterpolants);
+        set(Ctx, 0x000, 0x01f, GroupTargets);
+        set(Ctx, 0x318, 0x38f, GroupTargets);
+        return t;
+    }();
+    return table;
+}
+} // namespace
+
+void Liverpool::InvalidateRegisterGroup(u32 index) {
+    if (index < Regs::NumRegs) {
+        group_applied_valid[RegisterGroupTable()[index]] = false;
+    }
+}
+
+void Liverpool::InvalidateRegisterGroups() {
+    group_applied_valid.fill(false);
+}
+
+/// Applies the register values of a record to the draw state. The values come in groups; one that equals what the last record applied for the group, with nothing
+/// written to the group's registers since (every other write invalidates), is already in the state and is skipped.
+void Liverpool::ApplyRecordRegisters(const Core::NativeDraw::ExecRegister* record, u32 count, bool skip_fixed) {
+    const auto& table = RegisterGroupTable();
+    std::array<u64, NumRegisterGroups> hash;
+    hash.fill(0xcbf29ce484222325ull);
+    for (u32 i = 0; i < count; ++i) {
+        const u32 index = record[i].index;
+        if (skip_fixed && IsFixedStateRegister(index)) {
+            continue;
+        }
+        const u32 group = index < Regs::NumRegs ? table[index] : GroupOther;
+        u64& h = hash[group];
+        h = (h ^ index) * 0x100000001b3ull;
+        h = (h ^ record[i].value) * 0x100000001b3ull;
+    }
+    std::array<bool, NumRegisterGroups> skip;
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        skip[g] = group_applied_valid[g] && group_applied_hash[g] == hash[g];
+    }
+    const bool audit = VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 index = record[i].index;
+        if (skip_fixed && IsFixedStateRegister(index)) {
+            continue;
+        }
+        const u32 group = index < Regs::NumRegs ? table[index] : GroupOther;
+        if (skip[group]) {
+            if (audit) {
+                // the state must hold the value the group skip says it holds
+                const u32* const word = front_state.Word(index);
+                auto& live = Core::NativeDraw::Live();
+                live.overlay_group_checked.fetch_add(1, std::memory_order_relaxed);
+                if (word != nullptr && *word != record[i].value) {
+                    live.overlay_group_violations.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            continue;
+        }
+        OverlaySet(index, record[i].value);
+    }
+    for (u32 g = 0; g < NumRegisterGroups; ++g) {
+        if (!skip[g]) {
+            group_applied_hash[g] = hash[g];
+            group_applied_valid[g] = true;
+        }
+    }
 }
 
 void Liverpool::OverlayForget(u32 dword_offset, u32 count) {
@@ -419,6 +517,7 @@ void Liverpool::OverlayForgetAll() {
 void Liverpool::MirrorRegsRaw(u32 dword_offset, u32 count) {
     for (u32 k = 0; k < count; ++k) {
         front_state.Set(dword_offset + k, regs.reg_array[dword_offset + k]);
+        InvalidateRegisterGroup(dword_offset + k);
     }
 }
 void Liverpool::MirrorObject(const void* object, size_t size) {
@@ -436,6 +535,7 @@ void Liverpool::MirrorObject(const void* object, size_t size) {
 void Liverpool::MirrorSetDefaults() {
     OverlayForgetAll(); // the registers were reset to their defaults
     front_state.SetDefaults();
+    InvalidateRegisterGroups();
 }
 void Liverpool::DrainRaster() {
     if (!split_active) {
@@ -979,12 +1079,7 @@ void Liverpool::ExecuteNativeDraw(const void* header, u32 asc_vqid, u32 index_co
     if (VideoCore::ReadbackPolicy::Get().cs_audit.load(std::memory_order_relaxed) != 0) {
         Core::NativeDraw::Live().overlay_records.fetch_add(1, std::memory_order_relaxed);
     }
-    for (u32 i = 0; i < draw.count; ++i) {
-        if (!native_fixed_verify && IsFixedStateRegister(draw.regs[i].index)) {
-            continue;
-        }
-        OverlaySet(draw.regs[i].index, draw.regs[i].value);
-    }
+    ApplyRecordRegisters(draw.regs.data(), draw.count, !native_fixed_verify);
     OverlaySet(static_cast<u32>(&regs.draw_initiator - regs.reg_array.data()), 0);
     if (index_count != ~0u) {
         OverlaySet(static_cast<u32>(&regs.num_indices - regs.reg_array.data()), index_count);

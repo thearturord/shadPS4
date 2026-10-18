@@ -301,6 +301,14 @@ private:
         std::vector<u32> list;
     };
     NativeOverlay overlay;
+    /// The registers of a record come in groups (targets, the two stage programs, their user data, the interpolants, the draw arguments, the rest). A group
+    /// whose values are the ones the last record applied, and that nothing has written since, is not applied again (front thread only).
+    static constexpr u32 NumRegisterGroups = 8;
+    std::array<u64, NumRegisterGroups> group_applied_hash{};
+    std::array<bool, NumRegisterGroups> group_applied_valid{};
+    void ApplyRecordRegisters(const Core::NativeDraw::ExecRegister* regs, u32 count, bool skip_fixed);
+    void InvalidateRegisterGroup(u32 index);
+    void InvalidateRegisterGroups();
     bool native_exec_scope{}; ///< the draw being dispatched is an executed record
     u32 native_fixed_stale{};
     bool native_fixed_verify{};

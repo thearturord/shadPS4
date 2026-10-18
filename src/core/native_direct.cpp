@@ -318,7 +318,7 @@ std::shared_ptr<Buffer> Build(u32 queue, const u32* dcb, u32 dwords, bool has_co
 void Buffer::Expect(EntryKind kind, u64 address, u32 opcode, u64 seq) {
     if (cursor < entries.size()) {
         const Entry& entry = entries[cursor];
-        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && (kind == EntryKind::StateBuffer || entry.seq == seq)) {
+        if (entry.kind == kind && entry.address == address && entry.opcode == opcode && (kind == EntryKind::StateBuffer || kind == EntryKind::Packet || entry.seq == seq)) {
             ++cursor;
             ++matched;
             return;

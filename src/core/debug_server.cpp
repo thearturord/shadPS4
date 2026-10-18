@@ -146,7 +146,7 @@ nlohmann::json Native(const Params&) {
         j["cs_audit"] = audit;
     }
     j["packet_path_skipped"] = {{"buffers", live.packet_path_skipped_buffers.load()}, {"packets", live.packet_path_skipped_packets.load()}};
-    j["overlay"] = {{"records", live.overlay_records.load()}, {"offered", live.overlay_offered.load()}, {"unmapped", live.overlay_unmapped.load()}, {"same", live.overlay_same.load()}, {"changed", live.overlay_changed.load()}};
+    j["overlay"] = {{"records", live.overlay_records.load()}, {"offered", live.overlay_offered.load()}, {"unmapped", live.overlay_unmapped.load()}, {"same", live.overlay_same.load()}, {"changed", live.overlay_changed.load()}, {"group_skipped_values_checked", live.overlay_group_checked.load()}, {"group_skip_violations", live.overlay_group_violations.load()}};
     {
         std::vector<std::pair<u32, u32>> top;
         for (u32 i = 0; i < live.overlay_changed_by_index.size(); ++i) {

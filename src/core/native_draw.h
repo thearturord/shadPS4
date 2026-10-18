@@ -45,6 +45,7 @@ struct LiveCounters {
     std::atomic<u64> packet_path_skipped_buffers{}, packet_path_skipped_packets{};
     /// register values the native records apply to the command processor's draw state (OverlaySet): offered, not covered by any member, equal to the held value, changed
     std::array<std::atomic<u32>, 65536> overlay_changed_by_index{};
+    std::atomic<u64> overlay_group_checked{}, overlay_group_violations{};
     std::atomic<u64> overlay_offered{}, overlay_unmapped{}, overlay_same{}, overlay_changed{}, overlay_records{};
     std::atomic<u64> cs_audit_dispatches{}, cs_audit_differing{};
     std::array<std::atomic<u64>, 128> cs_audit_dword{};
